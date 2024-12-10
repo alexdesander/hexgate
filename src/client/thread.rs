@@ -229,10 +229,12 @@ impl ClientThreadState {
         let now = Instant::now();
         let mut batch_size = self.congestion.allowed_to_send_this_batch();
         while batch_size > 0 {
-            match self
-                .channels
-                .pop(&mut self.congestion, &self.crypto, &mut self.buf)
-            {
+            match self.channels.pop(
+                &self.channel_config,
+                &mut self.congestion,
+                &self.crypto,
+                &mut self.buf,
+            ) {
                 Either::Left(size) => {
                     self.last_sent = now;
                     self.socket.send(&self.buf[..size])?;

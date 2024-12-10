@@ -54,6 +54,33 @@ impl UnreliableOrderedChannel {
         });
     }
 
+    pub fn peek_size(&self) -> usize {
+        let Some(to_send) = self.to_send.front() else {
+            return 0;
+        };
+        let len = to_send.payload.len();
+        if len <= UNRELIABLE_ORDERED_STANDALONE_PAYLOAD_MAX_PAYLOAD_SIZE {
+            UnreliablePayload::OrderedStandalone {
+                channel_id: self.channel_id,
+                message_id: self.next_message_id,
+                payload: &to_send.payload,
+            }
+            .serialized_size()
+        } else {
+            let payload_size =
+                (len - to_send.sent).min(UNRELIABLE_ORDERED_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE);
+            let is_last = to_send.sent + payload_size == len;
+            UnreliablePayload::OrderedFragmented {
+                channel_id: self.channel_id,
+                message_id: self.next_message_id,
+                fragment_id: self.next_fragment_id,
+                is_last,
+                payload: &to_send.payload[to_send.sent..to_send.sent + payload_size],
+            }
+            .serialized_size()
+        }
+    }
+
     pub fn pop(&mut self, crypto: &Crypto, buf: &mut [u8]) -> usize {
         let Some(to_send) = self.to_send.front_mut() else {
             return 0;

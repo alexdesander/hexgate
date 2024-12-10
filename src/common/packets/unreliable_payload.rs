@@ -39,6 +39,52 @@ pub enum UnreliablePayload<'a> {
 }
 
 impl<'a> UnreliablePayload<'a> {
+    pub fn serialized_size(&self) -> usize {
+        match self {
+            UnreliablePayload::Standalone {
+                payload,
+                message_id,
+            } => {
+                let mut tmp = [0u8; 5];
+                message_id.encode_var(&mut tmp) + 1 + payload.len() + 16
+            }
+            UnreliablePayload::Fragmented {
+                payload,
+                message_id,
+                fragment_id,
+                ..
+            } => {
+                let mut tmp = [0u8; 5];
+                message_id.encode_var(&mut tmp)
+                    + fragment_id.encode_var(&mut tmp)
+                    + 1
+                    + payload.len()
+                    + 16
+            }
+            UnreliablePayload::OrderedStandalone {
+                payload,
+                message_id,
+                ..
+            } => {
+                let mut tmp = [0u8; 5];
+                message_id.encode_var(&mut tmp) + 2 + payload.len() + 16
+            }
+            UnreliablePayload::OrderedFragmented {
+                payload,
+                message_id,
+                fragment_id,
+                ..
+            } => {
+                let mut tmp = [0u8; 5];
+                message_id.encode_var(&mut tmp)
+                    + fragment_id.encode_var(&mut tmp)
+                    + 2
+                    + payload.len()
+                    + 16
+            }
+        }
+    }
+
     pub fn serialize(&self, crypto: &Crypto, buf: &mut [u8]) -> usize {
         match self {
             UnreliablePayload::Standalone {
