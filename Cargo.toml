@@ -8,6 +8,14 @@ keywords = ["networking", "gamedev", "multiplayer", "netcode", "udp"]
 categories = ["game-development", "game-engines", "network-programming"]
 license = "MPL-2.0"
 readme = "README.md"
+repository = "https://github.com/alexdesander/hexgate"
+
+include = [
+    "/src",
+    "/examples",
+    "/LICENSE",
+    "/README.md"
+]
 
 [dependencies]
 aes-gcm = "0.10.3"
