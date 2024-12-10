@@ -7,7 +7,6 @@ description = "Efficient and easy-to-use udp based client-server game networking
 keywords = ["networking", "gamedev", "multiplayer", "netcode", "udp"]
 categories = ["game-development", "game-engines", "network-programming"]
 license = "MPL-2.0"
-license-file = "LICENSE"
 readme = "README.md"
 
 [dependencies]
