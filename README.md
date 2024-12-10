@@ -6,6 +6,16 @@
 
 *WIP*
 
+## Inspiration
+
+Hexgate draws inspiration from the following projects and resources:
+
+- [redpine-rs](https://github.com/lowquark/redpine-rs)
+- [GameNetworkingSockets](https://github.com/ValveSoftware/GameNetworkingSockets)
+- [RakNet](https://github.com/facebookarchive/RakNet)
+- [ENet](http://enet.bespin.org/)
+- [Gaffer on Games](https://gafferongames.com/)
+
 ## Contributor License Agreement (CLA)
 
 By contributing to this project, you agree that your contributions will be licensed under the [Mozilla Public License, Version 2.0](https://www.mozilla.org/en-US/MPL/2.0/).
