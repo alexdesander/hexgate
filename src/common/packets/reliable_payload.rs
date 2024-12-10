@@ -63,6 +63,17 @@ impl<'a> ReliablePayload<'a> {
         }
     }
 
+    pub fn serialized_size(&self) -> usize {
+        match self {
+            ReliablePayload::NoAcks {
+                payload, packet_id, ..
+            } => {
+                let mut tmp = [0u8; 9];
+                2 + packet_id.encode_var(&mut tmp) + payload.len() + 16
+            }
+        }
+    }
+
     pub fn serialize(&self, crypto: &Crypto, buf: &mut [u8]) -> usize {
         match self {
             ReliablePayload::NoAcks {
@@ -161,6 +172,17 @@ impl ReliablePayloadOwned {
     pub fn take_payload(self) -> Vec<u8> {
         match self {
             ReliablePayloadOwned::NoAcks { payload, .. } => payload,
+        }
+    }
+
+    pub fn serialized_size(&self) -> usize {
+        match self {
+            ReliablePayloadOwned::NoAcks {
+                payload, packet_id, ..
+            } => {
+                let mut tmp = [0u8; 9];
+                2 + packet_id.encode_var(&mut tmp) + payload.len() + 16
+            }
         }
     }
 

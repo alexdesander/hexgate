@@ -320,6 +320,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         let mut batch_size = connection.congestion.allowed_to_send_this_batch();
         while batch_size > 0 {
             match connection.channels.pop(
+                &self.channel_config,
                 &mut connection.congestion,
                 &connection.crypto,
                 &mut self.buf,

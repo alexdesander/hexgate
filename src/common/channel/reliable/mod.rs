@@ -143,6 +143,15 @@ impl ReliableChannel {
         self.disassembler.push(message);
     }
 
+    pub fn peek_size(&mut self) -> usize {
+        self.gather_in_flights();
+        if let Some(in_flight) = self.in_flights.peek() {
+            in_flight.packet.serialized_size()
+        } else {
+            0
+        }
+    }
+
     pub fn pop(
         &mut self,
         congestion: &mut CongestionController,
