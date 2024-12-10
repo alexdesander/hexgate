@@ -11,9 +11,6 @@ use std::{
 // I HAVE MY EYES ON BBRv3 BUT THATS A LOT OF WORK AND MAYBE NOT EVEN WORTH IT.
 // => How does Valve do it? Or RakNet?
 
-const MAX_KBPS: u32 = 40000;
-const MIN_KBPS: u32 = 800;
-const START_KBPS: u32 = 2800;
 const LATENCIES_CONSIDERED: usize = 12;
 const SPEED_UP_INTERVAL: Duration = Duration::from_millis(500);
 const SPEED_UP_AFTER_SLOWDOWN_INTERVAL: Duration = Duration::from_secs(5);
@@ -21,8 +18,30 @@ const RESET_RELIABLE_COUNT_INTERVAL: Duration = Duration::from_secs(2);
 const BATCHES_PER_SECOND: u32 = 30;
 const BATCHES_DOWNTIME: Duration = Duration::from_millis(1000 / BATCHES_PER_SECOND as u64);
 
-pub struct CongestionController {
+/// Bandwidth is in kibibytes per second (1024 bytes per second).
+/// You should manually tune this to your game's needs.
+#[derive(Debug, Clone, Copy)]
+pub struct CongestionConfiguration {
+    pub start_bandwidth: u32,
+    pub max_bandwidth: u32,
+    pub min_bandwidth: u32,
+}
+
+impl Default for CongestionConfiguration {
+    fn default() -> Self {
+        Self {
+            start_bandwidth: 600,
+            max_bandwidth: 10000,
+            min_bandwidth: 100,
+        }
+    }
+}
+
+pub(crate) struct CongestionController {
+    // Bandwidth in kbps
     bandwidth: u32,
+    max_bandwidth: u32,
+    min_bandwidth: u32,
     batch_size: u32,
     latencies: VecDeque<Duration>,
     last_speedup: Instant,
@@ -34,10 +53,12 @@ pub struct CongestionController {
 }
 
 impl CongestionController {
-    pub fn new() -> Self {
+    pub fn new(config: CongestionConfiguration) -> Self {
         Self {
-            bandwidth: START_KBPS,
-            batch_size: START_KBPS / BATCHES_PER_SECOND,
+            bandwidth: config.start_bandwidth,
+            max_bandwidth: config.max_bandwidth,
+            min_bandwidth: config.min_bandwidth,
+            batch_size: config.start_bandwidth / BATCHES_PER_SECOND,
             latencies: VecDeque::new(),
             last_speedup: Instant::now(),
             last_slowdown: Some(Instant::now()),
@@ -122,7 +143,7 @@ impl CongestionController {
     fn slow_down(&mut self) {
         self.last_slowdown = Some(Instant::now());
         self.bandwidth = (self.bandwidth * 8) / 10;
-        self.bandwidth = self.bandwidth.max(MIN_KBPS);
+        self.bandwidth = self.bandwidth.max(self.min_bandwidth);
         self.batch_size = self.bandwidth / BATCHES_PER_SECOND;
     }
 
@@ -137,7 +158,7 @@ impl CongestionController {
         }
         self.last_speedup = Instant::now();
         self.bandwidth = (self.bandwidth * 11) / 10;
-        self.bandwidth = self.bandwidth.min(MAX_KBPS);
+        self.bandwidth = self.bandwidth.min(self.max_bandwidth);
         self.batch_size = self.bandwidth / BATCHES_PER_SECOND;
     }
 }

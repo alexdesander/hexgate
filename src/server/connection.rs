@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channels},
-    congestion::CongestionController,
+    congestion::{CongestionConfiguration, CongestionController},
     crypto::Crypto,
 };
 
@@ -22,8 +22,12 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(crypto: Crypto, channel_config: &ChannelConfiguration) -> Self {
-        let congestion = CongestionController::new();
+    pub fn new(
+        crypto: Crypto,
+        channel_config: &ChannelConfiguration,
+        congestion_config: CongestionConfiguration,
+    ) -> Self {
+        let congestion = CongestionController::new(congestion_config);
         Self {
             crypto,
             last_latency_discovery_response: 0,

@@ -21,7 +21,7 @@ use x25519_dalek::{PublicKey, ReusableSecret};
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, Channels},
-    congestion::CongestionController,
+    congestion::{CongestionConfiguration, CongestionController},
     crypto::Crypto,
     packets::{
         client_hello::ClientHello, connection_request::ConnectionRequest,
@@ -184,6 +184,7 @@ impl Client {
         client_version: ClientVersion,
         #[builder(default = Duration::from_secs(10))] timeout_dur: Duration,
         channel_config: ChannelConfiguration,
+        #[builder(default)] congestion_config: CongestionConfiguration,
     ) -> Result<Self, ConnectError> {
         const READ_COOLDOWN: Duration = Duration::from_millis(50);
 
@@ -353,12 +354,12 @@ impl Client {
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
         let _waker = waker.clone();
         let thread = std::thread::spawn(move || {
-            let congestion = CongestionController::new();
+            let congestion = CongestionController::new(congestion_config);
             let mut state = ClientThreadState {
                 cmds: cmd_rx,
                 event_tx,
                 poll,
-                _waker: _waker,
+                _waker,
                 socket,
                 buf: [0u8; 1201],
 

@@ -16,6 +16,7 @@ use thread::{Cmd, ServerThreadState};
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel},
+    congestion::CongestionConfiguration,
     socket::{net_sym::NetworkSimulator, Socket},
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
@@ -113,6 +114,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         #[builder(default = Duration::from_millis(500))] latency_discovery_interval: Duration,
         #[builder(default = 1024)] max_events: usize,
         channel_config: ChannelConfiguration,
+        #[builder(default)] congestion_config: CongestionConfiguration,
     ) -> Result<Self, io::Error> {
         assert!(info.len() <= 256, "Info can be at most 256 bytes");
         let socket = Socket::builder()
@@ -174,6 +176,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
                 is_discovering_latencies: false,
 
                 channel_config,
+                congestion_config,
             };
             state.run()
         });

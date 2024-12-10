@@ -5,7 +5,7 @@
 use mio::Token;
 
 pub mod channel;
-pub(crate) mod congestion;
+pub mod congestion;
 pub(crate) mod crypto;
 pub(crate) mod packets;
 pub mod socket;

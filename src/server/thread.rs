@@ -22,6 +22,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel},
+    congestion::CongestionConfiguration,
     crypto::Crypto,
     packets::{
         acks::Acks, client_hello::ClientHello, connection_request::ConnectionRequest,
@@ -96,6 +97,7 @@ pub struct ServerThreadState<R: AuthResult> {
     pub is_discovering_latencies: bool,
 
     pub channel_config: ChannelConfiguration,
+    pub congestion_config: CongestionConfiguration,
 }
 
 impl<R: AuthResult> ServerThreadState<R> {
@@ -377,10 +379,10 @@ impl<R: AuthResult> ServerThreadState<R> {
         let login_response = LoginResponse::Success;
         let size = login_response.serialize(&crypto, &mut self.buf);
         self.socket.send_to(from, &self.buf[..size])?;
-        if let Some(_old_connection) = self
-            .connections
-            .insert(from, Connection::new(crypto, &self.channel_config))
-        {
+        if let Some(_old_connection) = self.connections.insert(
+            from,
+            Connection::new(crypto, &self.channel_config, self.congestion_config),
+        ) {
             todo!("Handle old connection");
         };
         let _ = self.event_tx.send(Event::Connected(from, auth_result));
