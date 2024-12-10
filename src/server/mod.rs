@@ -15,11 +15,7 @@ use siphasher::sip::SipHasher;
 use thread::{Cmd, ServerThreadState};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel},
-    congestion::CongestionConfiguration,
-    socket::{net_sym::NetworkSimulator, Socket},
-    timed_event_queue::TimedEventQueue,
-    AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
+    channel::{scheduler::ChannelConfiguration, Channel}, congestion::CongestionConfiguration, crypto::sym::SymCipher, socket::{net_sym::NetworkSimulator, Socket}, timed_event_queue::TimedEventQueue, AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN
 };
 
 pub mod auth;
@@ -125,7 +121,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         let (event_tx, event_rx) = bounded(max_events);
 
         // TODO: Benchmark for optimal cipher
-        let cipher = cipher.unwrap_or(Cipher::AES256GCM);
+        let cipher = cipher.unwrap_or(SymCipher::better());
 
         // Has to be unbounded to prevent deadlocks
         let (cmd_tx, cmd_rx) = unbounded();
