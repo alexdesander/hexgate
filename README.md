@@ -74,7 +74,7 @@ match server.next() {
 }
 ```
 
-Creating a client and joining a server:
+Creating a hexgate client and connecting to a server:
 ```rust
 let client = Client::prepare()
     .client_version(ClientVersion::ZERO)
