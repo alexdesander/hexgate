@@ -193,10 +193,6 @@ impl Client {
         #[builder(default = Duration::from_secs(10))] timeout_dur: Duration,
         channel_config: ChannelConfiguration,
         #[builder(default)] congestion_config: CongestionConfiguration,
-        /// Maximum size of a message that can be received.
-        /// If a sender sends a message larger than this, the connection will be shut down.
-        #[builder(default)]
-        max_recv_msg_size: usize,
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
