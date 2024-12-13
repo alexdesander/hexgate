@@ -15,7 +15,12 @@ use siphasher::sip::SipHasher;
 use thread::{Cmd, ServerThreadState};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel}, congestion::CongestionConfiguration, crypto::sym::SymCipher, socket::{net_sym::NetworkSimulator, Socket}, timed_event_queue::TimedEventQueue, AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN
+    channel::{scheduler::ChannelConfiguration, Channel},
+    congestion::CongestionConfiguration,
+    crypto::sym::SymCipher,
+    socket::{net_sym::NetworkSimulator, Socket},
+    timed_event_queue::TimedEventQueue,
+    AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
 };
 
 pub mod auth;
@@ -31,6 +36,7 @@ pub enum Event<R: AuthResult> {
 }
 
 pub struct Server<R: AuthResult, A: Authenticator<R>> {
+    max_send_msg_size: usize,
     inner: Arc<ServerInner<R, A>>,
 }
 
@@ -66,6 +72,13 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
     }
 
     pub fn send(&self, to: SocketAddr, channel: Channel, message: Vec<u8>) -> Result<(), ()> {
+        if message.len() > self.max_send_msg_size {
+            panic!(
+                "Tried sending a message of size {} which is larger than the max_send_msg_size of {}",
+                message.len(),
+                self.max_send_msg_size
+            );
+        }
         self.inner
             .cmd_tx
             .send(Cmd::Send(to, channel, message))
@@ -111,6 +124,8 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         #[builder(default = 1024)] max_events: usize,
         channel_config: ChannelConfiguration,
         #[builder(default)] congestion_config: CongestionConfiguration,
+        /// Maximum size of a message that can be sent.
+        #[builder(default = 1048576)] max_send_msg_size: usize,
     ) -> Result<Self, io::Error> {
         assert!(info.len() <= 256, "Info can be at most 256 bytes");
         let socket = Socket::builder()
@@ -178,6 +193,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         });
 
         Ok(Server {
+            max_send_msg_size,
             inner: Arc::new(ServerInner {
                 _phantom: PhantomData,
                 event_rx,

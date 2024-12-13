@@ -109,6 +109,7 @@ pub enum Event {
 
 #[derive(Clone)]
 pub struct Client {
+    max_send_msg_size: usize,
     inner: Arc<ClientInner>,
 }
 
@@ -128,6 +129,13 @@ impl Client {
     }
 
     pub fn send(&self, channel: Channel, message: Vec<u8>) -> Result<(), ()> {
+        if message.len() > self.max_send_msg_size {
+            panic!(
+                "Tried sending a message of size {} which is larger than the max_send_msg_size of {}",
+                message.len(),
+                self.max_send_msg_size
+            );
+        }
         self.inner
             .cmd_tx
             .send(Cmd::Send(channel, message))
@@ -185,6 +193,13 @@ impl Client {
         #[builder(default = Duration::from_secs(10))] timeout_dur: Duration,
         channel_config: ChannelConfiguration,
         #[builder(default)] congestion_config: CongestionConfiguration,
+        /// Maximum size of a message that can be received.
+        /// If a sender sends a message larger than this, the connection will be shut down.
+        #[builder(default)]
+        max_recv_msg_size: usize,
+        /// Maximum size of a message that can be sent.
+        #[builder(default = 1048576)]
+        max_send_msg_size: usize,
     ) -> Result<Self, ConnectError> {
         const READ_COOLDOWN: Duration = Duration::from_millis(50);
 
@@ -381,6 +396,7 @@ impl Client {
         });
 
         Ok(Client {
+            max_send_msg_size,
             inner: Arc::new(ClientInner {
                 server_ed25519_pubkey,
                 cmd_tx,
