@@ -564,4 +564,38 @@ mod tests {
         }
         assert!(i > amount_messages - 1000);
     }
+
+    #[test]
+    fn test_connecting() {
+        let server_addr: SocketAddr = "127.0.0.1:30008".parse().unwrap();
+        for i in 0..10 {
+            let server = Server::prepare()
+                .bind_addr(server_addr)
+                .info(b"Example of a chat server".to_vec())
+                .allowed_client_versions(|_| Ok(()))
+                .secret_key([0u8; 32])
+                .auth_salt([0u8; 16])
+                .authenticator(MockAuthenticator)
+                .channel_config(ChannelConfiguration {
+                    weight_unreliable: 10,
+                    weights_unreliable_ordered: vec![10, 10, 10, 10, 10],
+                    weights_reliable: vec![10, 10, 10, 10, 10],
+                })
+                .run()
+                .unwrap();
+
+            let client = Client::prepare()
+                .client_version(ClientVersion::ZERO)
+                .server_socket_addr(server_addr)
+                .auth_data(vec![])
+                .hash_auth_data(false)
+                .channel_config(ChannelConfiguration {
+                    weight_unreliable: 10,
+                    weights_unreliable_ordered: vec![10, 10, 10, 10, 10],
+                    weights_reliable: vec![10, 10, 10, 10, 10],
+                })
+                .connect()
+                .unwrap();
+        }
+    }
 }

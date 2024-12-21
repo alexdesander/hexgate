@@ -125,7 +125,8 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         channel_config: ChannelConfiguration,
         #[builder(default)] congestion_config: CongestionConfiguration,
         /// Maximum size of a message that can be sent.
-        #[builder(default = 1048576)] max_send_msg_size: usize,
+        #[builder(default = 1048576)]
+        max_send_msg_size: usize,
     ) -> Result<Self, io::Error> {
         assert!(info.len() <= 256, "Info can be at most 256 bytes");
         let socket = Socket::builder()

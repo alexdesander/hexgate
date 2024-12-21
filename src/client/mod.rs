@@ -196,6 +196,8 @@ impl Client {
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
+        #[builder(default = Duration::from_secs(1))] handshake_timeout: Duration,
+        #[builder(default = 1)] mut handshake_tries: u8,
     ) -> Result<Self, ConnectError> {
         const READ_COOLDOWN: Duration = Duration::from_millis(50);
 
@@ -207,210 +209,224 @@ impl Client {
             .build()?;
         let mut buf = [0u8; 1201];
 
-        // Send ClientHello
-        let real_salt: [u8; 4] = rand::random();
-        let client_hello = ClientHello {
-            salt: real_salt,
-            client_version,
-        };
-        let size = client_hello.serialize(&mut buf);
-        socket.send(&buf[..size])?;
-
-        let start = Instant::now();
-
-        // Wait for ServerHello
-        let timestamp: [u8; 8];
-        let cipher: Cipher;
-        let server_ed25519_pubkey: VerifyingKey;
-        let siphash: u64;
-        loop {
-            check_timeout_handshake(timeout_dur, start)?;
-            let Some(size) = read_socket(&mut socket, &mut buf)? else {
-                std::thread::sleep(READ_COOLDOWN);
-                continue;
+        'outer: while handshake_tries > 0 {
+            handshake_tries -= 1;
+            // Send ClientHello
+            let real_salt: [u8; 4] = rand::random();
+            let client_hello = ClientHello {
+                salt: real_salt,
+                client_version,
             };
-            if size == 0 || size > 1200 {
-                continue;
-            }
-            let Ok(server_hello) = ServerHello::deserialize(&buf[..size]) else {
-                continue;
-            };
-            match server_hello {
-                ServerHello::VersionNotSupported {
-                    salt,
-                    allowed_versions,
-                } => {
-                    if salt == real_salt {
-                        return Err(ConnectError::VersionNotSupported(allowed_versions));
+            let size = client_hello.serialize(&mut buf);
+            socket.send(&buf[..size])?;
+
+            let start = Instant::now();
+
+            // Wait for ServerHello
+            let timestamp: [u8; 8];
+            let cipher: Cipher;
+            let server_ed25519_pubkey: VerifyingKey;
+            let siphash: u64;
+            loop {
+                if check_timeout_handshake(handshake_timeout, start).is_err() {
+                    continue 'outer;
+                };
+                let Some(size) = read_socket(&mut socket, &mut buf)? else {
+                    std::thread::sleep(READ_COOLDOWN);
+                    continue;
+                };
+                if size == 0 || size > 1200 {
+                    continue;
+                }
+                let Ok(server_hello) = ServerHello::deserialize(&buf[..size]) else {
+                    continue;
+                };
+                match server_hello {
+                    ServerHello::VersionNotSupported {
+                        salt,
+                        allowed_versions,
+                    } => {
+                        if salt == real_salt {
+                            return Err(ConnectError::VersionNotSupported(allowed_versions));
+                        }
+                    }
+                    ServerHello::VersionSupported {
+                        salt,
+                        timestamp: _timestamp,
+                        cipher: _cipher,
+                        server_ed25519_pubkey: _server_ed25519_pubkey,
+                        siphash: _siphash,
+                    } => {
+                        if salt != real_salt {
+                            continue;
+                        }
+                        timestamp = _timestamp;
+                        cipher = _cipher;
+                        server_ed25519_pubkey = _server_ed25519_pubkey;
+                        siphash = _siphash.unwrap();
+                        break;
                     }
                 }
-                ServerHello::VersionSupported {
-                    salt,
-                    timestamp: _timestamp,
-                    cipher: _cipher,
-                    server_ed25519_pubkey: _server_ed25519_pubkey,
-                    siphash: _siphash,
-                } => {
-                    if salt != real_salt {
-                        continue;
-                    }
-                    timestamp = _timestamp;
-                    cipher = _cipher;
-                    server_ed25519_pubkey = _server_ed25519_pubkey;
-                    siphash = _siphash.unwrap();
-                    break;
+            }
+
+            if let Some(expected_server_key) = expected_server_key {
+                if server_ed25519_pubkey.to_bytes() != expected_server_key {
+                    return Err(ConnectError::ServerKeyMismatch {
+                        received_key: server_ed25519_pubkey.to_bytes(),
+                    });
                 }
             }
-        }
 
-        if let Some(expected_server_key) = expected_server_key {
-            if server_ed25519_pubkey.to_bytes() != expected_server_key {
-                return Err(ConnectError::ServerKeyMismatch {
-                    received_key: server_ed25519_pubkey.to_bytes(),
-                });
-            }
-        }
-
-        // Send ConnectionRequest
-        let client_x25519_key = ReusableSecret::random_from_rng(&mut thread_rng());
-        let hkdf_salt: [u8; 32] = rand::random();
-        let connection_request = ConnectionRequest {
-            salt: real_salt,
-            timestamp,
-            server_ed25519_pubkey,
-            siphash: siphash.to_le_bytes(),
-            client_x25519_pubkey: PublicKey::from(&client_x25519_key),
-            hkdf_salt,
-        };
-        let size = connection_request.serialize(&mut buf);
-        socket.send(&buf[..size])?;
-
-        // Wait for ConnectionResponse
-        let crypto: Crypto;
-        let auth_salt: [u8; 16];
-        loop {
-            check_timeout_handshake(timeout_dur, start)?;
-            let Some(size) = read_socket(&mut socket, &mut buf)? else {
-                std::thread::sleep(READ_COOLDOWN);
-                continue;
-            };
-            if size == 0 || size > 1200 {
-                continue;
-            }
-            let Ok((connection_response, _crypto)) = ConnectionResponse::deserialize(
-                &buf[..size],
+            // Send ConnectionRequest
+            let client_x25519_key = ReusableSecret::random_from_rng(&mut thread_rng());
+            let hkdf_salt: [u8; 32] = rand::random();
+            let connection_request = ConnectionRequest {
+                salt: real_salt,
+                timestamp,
                 server_ed25519_pubkey,
-                client_x25519_key.clone(),
+                siphash: siphash.to_le_bytes(),
+                client_x25519_pubkey: PublicKey::from(&client_x25519_key),
                 hkdf_salt,
-                cipher,
-            ) else {
-                continue;
             };
-            if connection_response.salt != real_salt {
-                continue;
-            }
-            crypto = _crypto;
-            auth_salt = connection_response.auth_salt;
-            break;
-        }
+            let size = connection_request.serialize(&mut buf);
+            socket.send(&buf[..size])?;
 
-        // Send LoginRequest
-        let auth_data = if hash_auth_data {
-            let mut new_auth_data = vec![0u8; 20];
-            Argon2::new(
-                argon2::Algorithm::Argon2id,
-                argon2::Version::V0x13,
-                Params::new(65536, 2, 1, Some(20)).unwrap(),
-            )
-            .hash_password_into(&auth_data, &auth_salt, &mut new_auth_data)
-            .unwrap();
-            new_auth_data
-        } else {
-            auth_data
-        };
-        let login_request = LoginRequest {
-            salt: real_salt,
-            auth_data: &auth_data,
-        };
-        let size = login_request.serialize(&crypto, &mut buf);
-        socket.send(&buf[..size])?;
-
-        // Receive LoginResponse
-        loop {
-            check_timeout_handshake(timeout_dur, start)?;
-            let Some(size) = read_socket(&mut socket, &mut buf)? else {
-                std::thread::sleep(READ_COOLDOWN);
-                continue;
-            };
-            if size == 0 || size > 1200 {
-                continue;
-            }
-            let Ok(login_response) = LoginResponse::deserialize(&crypto, &mut buf[..size]) else {
-                continue;
-            };
-            match login_response {
-                LoginResponse::Failure { failure_data } => {
-                    return Err(ConnectError::ServerDeniedLogin(failure_data.to_vec()));
+            // Wait for ConnectionResponse
+            let crypto: Crypto;
+            let auth_salt: [u8; 16];
+            loop {
+                if check_timeout_handshake(handshake_timeout, start).is_err() {
+                    continue 'outer;
+                };
+                let Some(size) = read_socket(&mut socket, &mut buf)? else {
+                    std::thread::sleep(READ_COOLDOWN);
+                    continue;
+                };
+                if size == 0 || size > 1200 {
+                    continue;
                 }
-                LoginResponse::Success => {
-                    break;
+                let Ok((connection_response, _crypto)) = ConnectionResponse::deserialize(
+                    &buf[..size],
+                    server_ed25519_pubkey,
+                    client_x25519_key.clone(),
+                    hkdf_salt,
+                    cipher,
+                ) else {
+                    continue;
+                };
+                if connection_response.salt != real_salt {
+                    continue;
+                }
+                crypto = _crypto;
+                auth_salt = connection_response.auth_salt;
+                break;
+            }
+
+            // Send LoginRequest
+            let auth_data = if hash_auth_data {
+                let mut new_auth_data = vec![0u8; 20];
+                Argon2::new(
+                    argon2::Algorithm::Argon2id,
+                    argon2::Version::V0x13,
+                    Params::new(65536, 2, 1, Some(20)).unwrap(),
+                )
+                .hash_password_into(&auth_data, &auth_salt, &mut new_auth_data)
+                .unwrap();
+                new_auth_data
+            } else {
+                auth_data.clone()
+            };
+            let login_request = LoginRequest {
+                salt: real_salt,
+                auth_data: &auth_data,
+            };
+            let size = login_request.serialize(&crypto, &mut buf);
+            socket.send(&buf[..size])?;
+
+            // Receive LoginResponse
+            loop {
+                if check_timeout_handshake(handshake_timeout, start).is_err() {
+                    continue 'outer;
+                };
+                let Some(size) = read_socket(&mut socket, &mut buf)? else {
+                    std::thread::sleep(READ_COOLDOWN);
+                    continue;
+                };
+                if size == 0 || size > 1200 {
+                    continue;
+                }
+                let Ok(login_response) = LoginResponse::deserialize(&crypto, &mut buf[..size])
+                else {
+                    continue;
+                };
+                match login_response {
+                    LoginResponse::Failure { failure_data } => {
+                        return Err(ConnectError::ServerDeniedLogin(failure_data.to_vec()));
+                    }
+                    LoginResponse::Success => {
+                        break;
+                    }
                 }
             }
+
+            // Handshake done, run thread
+            let (event_tx, event_rx) = bounded(1024);
+            let (cmd_tx, cmd_rx) = unbounded();
+            let poll = Poll::new()?;
+            let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
+            let _waker = waker.clone();
+            let thread = std::thread::spawn(move || {
+                let congestion = CongestionController::new(congestion_config);
+                let mut state = ClientThreadState {
+                    cmds: cmd_rx,
+                    event_tx,
+                    poll,
+                    _waker,
+                    socket,
+                    buf: [0u8; 1201],
+
+                    timed_events: TimedEventQueue::new(),
+                    crypto,
+
+                    latency_discoveries: Default::default(),
+                    latencies: Default::default(),
+
+                    last_received: Instant::now(),
+                    timeout_dur,
+
+                    channels: Channels::new(&congestion, &channel_config),
+                    channel_config,
+                    congestion,
+                    last_sent: Instant::now(),
+                };
+                state.run()
+            });
+
+            return Ok(Client {
+                max_send_msg_size,
+                inner: Arc::new(ClientInner {
+                    server_ed25519_pubkey,
+                    cmd_tx,
+                    event_rx,
+                    waker,
+                    thread: Some(thread),
+                }),
+            });
         }
-
-        // Handshake done, run thread
-        let (event_tx, event_rx) = bounded(1024);
-        let (cmd_tx, cmd_rx) = unbounded();
-        let poll = Poll::new()?;
-        let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
-        let _waker = waker.clone();
-        let thread = std::thread::spawn(move || {
-            let congestion = CongestionController::new(congestion_config);
-            let mut state = ClientThreadState {
-                cmds: cmd_rx,
-                event_tx,
-                poll,
-                _waker,
-                socket,
-                buf: [0u8; 1201],
-
-                timed_events: TimedEventQueue::new(),
-                crypto,
-
-                latency_discoveries: Default::default(),
-                latencies: Default::default(),
-
-                last_received: Instant::now(),
-                timeout_dur,
-
-                channels: Channels::new(&congestion, &channel_config),
-                channel_config,
-                congestion,
-                last_sent: Instant::now(),
-            };
-            state.run()
-        });
-
-        Ok(Client {
-            max_send_msg_size,
-            inner: Arc::new(ClientInner {
-                server_ed25519_pubkey,
-                cmd_tx,
-                event_rx,
-                waker,
-                thread: Some(thread),
-            }),
-        })
+        Err(ConnectError::IoError(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "Hexgate Handshake timed out after {} tries",
+                handshake_tries
+            ),
+        )))
     }
 }
 
-fn check_timeout_handshake(timeout_dur: Duration, start: Instant) -> Result<(), io::Error> {
+fn check_timeout_handshake(timeout_dur: Duration, start: Instant) -> Result<(), ()> {
     let time_left = timeout_dur.saturating_sub(start.elapsed());
     if time_left == Duration::ZERO {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "Hexgate Handshake timed out",
-        ));
+        return Err(());
     }
     Ok(())
 }
