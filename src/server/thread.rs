@@ -223,6 +223,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                 Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
                 Err(e) => return Err(e),
             };
+            println!("RECEIVED A PACKET");
             if size == 0 || size > 1200 {
                 continue;
             }
@@ -373,6 +374,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         from: SocketAddr,
         auth_result: R,
     ) -> Result<(), io::Error> {
+        println!("HANDLING AUTH SUCCESS");
         let Some(crypto) = self.expecting_auth_result.remove(&from) else {
             return Ok(());
         };
@@ -406,6 +408,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         from: SocketAddr,
         failure_data: Vec<u8>,
     ) -> Result<(), io::Error> {
+        println!("HANDLING AUTH FAILURE");
         let Some(crypto) = self.expecting_auth_result.remove(&from) else {
             return Ok(());
         };
@@ -436,6 +439,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         size: usize,
         from: SocketAddr,
     ) -> Result<(), io::Error> {
+        println!("HANDLING CLIENT HELLO");
         let Ok(client_hello) = ClientHello::deserialize(&self.buf[..size]) else {
             return Ok(());
         };
@@ -468,6 +472,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         size: usize,
         from: SocketAddr,
     ) -> Result<(), io::Error> {
+        println!("HANDLING CONNECTION REQUEST");
         let Ok(connection_request) = ConnectionRequest::deserialize(&self.buf[..size]) else {
             return Ok(());
         };
@@ -515,6 +520,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         size: usize,
         from: SocketAddr,
     ) -> Result<(), io::Error> {
+        println!("HANDLING LOGIN REQUEST");
         let Some(salt) = LoginRequest::deserialize_salt(&self.buf[..size]) else {
             return Ok(());
         };

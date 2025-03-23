@@ -219,6 +219,7 @@ impl Client {
                 client_version,
             };
             let size = client_hello.serialize(&mut buf);
+            println!("SENDING CLIENT HELLO");
             socket.send(&buf[..size])?;
 
             // Wait for ServerHello
@@ -235,6 +236,7 @@ impl Client {
                     std::thread::sleep(READ_COOLDOWN);
                     continue;
                 };
+                println!("RECEIVED SERVER HELLO (PROBABLY)");
                 if size == 0 || size > 1200 {
                     continue;
                 }
@@ -289,6 +291,7 @@ impl Client {
                 hkdf_salt,
             };
             let size = connection_request.serialize(&mut buf);
+            println!("SENDING CONNECTION REQUEST");
             socket.send(&buf[..size])?;
 
             // Wait for ConnectionResponse
@@ -303,6 +306,7 @@ impl Client {
                     std::thread::sleep(READ_COOLDOWN);
                     continue;
                 };
+                println!("RECEIVED CONNECTION RESPONSE (PROBABLY)");
                 if size == 0 || size > 1200 {
                     continue;
                 }
@@ -342,6 +346,7 @@ impl Client {
                 auth_data: &auth_data,
             };
             let size = login_request.serialize(&crypto, &mut buf);
+            println!("SENDING LOGIN REQUEST");
             socket.send(&buf[..size])?;
 
             // Receive LoginResponse
@@ -354,6 +359,7 @@ impl Client {
                     std::thread::sleep(READ_COOLDOWN);
                     continue;
                 };
+                println!("RECEIVED LOGIN RESPONSE (PROBABLY)");
                 if size == 0 || size > 1200 {
                     continue;
                 }
@@ -370,6 +376,7 @@ impl Client {
                     }
                 }
             }
+            println!("HANDSHAKE DONE");
 
             // Handshake done, run thread
             let (event_tx, event_rx) = bounded(1024);
