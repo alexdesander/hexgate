@@ -84,7 +84,8 @@ pub struct ServerThreadState<R: AuthResult> {
     pub veryifying_key: VerifyingKey,
     pub siphasher: SipHasher,
 
-    pub connection_request_max_timestamp_age: Option<Duration>,
+    pub connection_request_max_timestamp_age: Duration,
+    pub disable_timestamp_age_check: bool,
     pub timeout_dur: Duration,
     pub is_checking_for_timeouts: bool,
     pub latency_discovery_interval: Duration,
@@ -475,13 +476,14 @@ impl<R: AuthResult> ServerThreadState<R> {
         if connection_request.siphash != self.siphasher.hash(&self.buf[1..45]).to_le_bytes() {
             return Ok(());
         }
-        if let Some(max_timestamp_age) = self.connection_request_max_timestamp_age {
+        if !self.disable_timestamp_age_check {
             let min_time_stamp = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_secs()
-                .saturating_sub(max_timestamp_age.as_secs());
-            if connection_request.timestamp < min_time_stamp.to_le_bytes() {
+                .saturating_sub(self.connection_request_max_timestamp_age)
+                .as_secs();
+            let time_stamp = u64::from_le_bytes(connection_request.timestamp);
+            if time_stamp < min_time_stamp {
                 return Ok(());
             }
         }
