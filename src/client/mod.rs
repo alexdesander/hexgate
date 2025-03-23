@@ -196,8 +196,8 @@ impl Client {
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
-        #[builder(default = Duration::from_secs(1))] handshake_timeout: Duration,
-        #[builder(default = 1)] mut handshake_tries: u8,
+        #[builder(default = Duration::from_secs(4))] handshake_timeout: Duration,
+        #[builder(default = 2)] mut handshake_tries: u8,
     ) -> Result<Self, ConnectError> {
         const READ_COOLDOWN: Duration = Duration::from_millis(50);
 
@@ -220,13 +220,12 @@ impl Client {
             let size = client_hello.serialize(&mut buf);
             socket.send(&buf[..size])?;
 
-            let start = Instant::now();
-
             // Wait for ServerHello
             let timestamp: [u8; 8];
             let cipher: Cipher;
             let server_ed25519_pubkey: VerifyingKey;
             let siphash: u64;
+            let start = Instant::now();
             loop {
                 if check_timeout_handshake(handshake_timeout, start).is_err() {
                     continue 'outer;
@@ -294,6 +293,7 @@ impl Client {
             // Wait for ConnectionResponse
             let crypto: Crypto;
             let auth_salt: [u8; 16];
+            let start = Instant::now();
             loop {
                 if check_timeout_handshake(handshake_timeout, start).is_err() {
                     continue 'outer;
@@ -344,6 +344,7 @@ impl Client {
             socket.send(&buf[..size])?;
 
             // Receive LoginResponse
+            let start = Instant::now();
             loop {
                 if check_timeout_handshake(handshake_timeout, start).is_err() {
                     continue 'outer;
