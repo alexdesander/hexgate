@@ -223,7 +223,6 @@ impl<R: AuthResult> ServerThreadState<R> {
                 Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
                 Err(e) => return Err(e),
             };
-            println!("RECEIVED A PACKET");
             if size == 0 || size > 1200 {
                 continue;
             }
@@ -374,7 +373,6 @@ impl<R: AuthResult> ServerThreadState<R> {
         from: SocketAddr,
         auth_result: R,
     ) -> Result<(), io::Error> {
-        println!("HANDLING AUTH SUCCESS");
         let Some(crypto) = self.expecting_auth_result.remove(&from) else {
             return Ok(());
         };
@@ -408,7 +406,6 @@ impl<R: AuthResult> ServerThreadState<R> {
         from: SocketAddr,
         failure_data: Vec<u8>,
     ) -> Result<(), io::Error> {
-        println!("HANDLING AUTH FAILURE");
         let Some(crypto) = self.expecting_auth_result.remove(&from) else {
             return Ok(());
         };
@@ -439,7 +436,6 @@ impl<R: AuthResult> ServerThreadState<R> {
         size: usize,
         from: SocketAddr,
     ) -> Result<(), io::Error> {
-        println!("HANDLING CLIENT HELLO");
         let Ok(client_hello) = ClientHello::deserialize(&self.buf[..size]) else {
             return Ok(());
         };
@@ -474,9 +470,11 @@ impl<R: AuthResult> ServerThreadState<R> {
     ) -> Result<(), io::Error> {
         println!("HANDLING CONNECTION REQUEST");
         let Ok(connection_request) = ConnectionRequest::deserialize(&self.buf[..size]) else {
+            println!("Deserialization failed");
             return Ok(());
         };
         if connection_request.siphash != self.siphasher.hash(&self.buf[1..45]).to_le_bytes() {
+            println!("Siphash mismatch");
             return Ok(());
         }
         let min_time_stamp = SystemTime::now()
@@ -485,6 +483,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             .as_secs()
             - 5;
         if connection_request.timestamp < min_time_stamp.to_le_bytes() {
+            println!("Timestamp too old");
             return Ok(());
         }
         let x25519_secret_key = EphemeralSecret::random_from_rng(&mut thread_rng());
@@ -504,6 +503,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             auth_salt: self.auth_salt,
         };
         let size = connection_response.serialize(&crypto, &self.signing_key, &mut self.buf);
+        println!("Sending connection response");
         self.socket.send_to(from, &self.buf[..size])?;
         self.expecting_login_requests
             .insert((from, connection_request.salt), crypto);
@@ -520,7 +520,6 @@ impl<R: AuthResult> ServerThreadState<R> {
         size: usize,
         from: SocketAddr,
     ) -> Result<(), io::Error> {
-        println!("HANDLING LOGIN REQUEST");
         let Some(salt) = LoginRequest::deserialize_salt(&self.buf[..size]) else {
             return Ok(());
         };
