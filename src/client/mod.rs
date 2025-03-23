@@ -200,6 +200,7 @@ impl Client {
         #[builder(default = 2)] mut handshake_tries: u8,
     ) -> Result<Self, ConnectError> {
         const READ_COOLDOWN: Duration = Duration::from_millis(50);
+        let max_handshake_tries = handshake_tries;
 
         let mut socket = Socket::builder()
             .bind_addr(bind_addr)
@@ -418,7 +419,7 @@ impl Client {
             io::ErrorKind::TimedOut,
             format!(
                 "Hexgate Handshake timed out after {} tries",
-                handshake_tries
+                max_handshake_tries
             ),
         )))
     }
