@@ -127,6 +127,11 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
+        /// Maximum age the connection request timestamp can be.
+        /// This is only present to prevent some form of replay attacks,
+        /// but might introduce instability in handshakes. Leave None for
+        /// maximum stability.
+        connection_request_max_timestamp_age: Option<Duration>,
     ) -> Result<Self, io::Error> {
         assert!(info.len() <= 256, "Info can be at most 256 bytes");
         let socket = Socket::builder()
@@ -174,6 +179,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
                 signing_key,
                 auth_salt,
 
+                connection_request_max_timestamp_age,
                 timeout_dur,
                 is_checking_for_timeouts: false,
                 latency_discovery_interval,

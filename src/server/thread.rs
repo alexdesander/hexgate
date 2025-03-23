@@ -84,6 +84,7 @@ pub struct ServerThreadState<R: AuthResult> {
     pub veryifying_key: VerifyingKey,
     pub siphasher: SipHasher,
 
+    pub connection_request_max_timestamp_age: Option<Duration>,
     pub timeout_dur: Duration,
     pub is_checking_for_timeouts: bool,
     pub latency_discovery_interval: Duration,
@@ -468,23 +469,21 @@ impl<R: AuthResult> ServerThreadState<R> {
         size: usize,
         from: SocketAddr,
     ) -> Result<(), io::Error> {
-        println!("HANDLING CONNECTION REQUEST");
         let Ok(connection_request) = ConnectionRequest::deserialize(&self.buf[..size]) else {
-            println!("Deserialization failed");
             return Ok(());
         };
         if connection_request.siphash != self.siphasher.hash(&self.buf[1..45]).to_le_bytes() {
-            println!("Siphash mismatch");
             return Ok(());
         }
-        let min_time_stamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - 5;
-        if connection_request.timestamp < min_time_stamp.to_le_bytes() {
-            println!("Timestamp too old");
-            return Ok(());
+        if let Some(max_timestamp_age) = self.connection_request_max_timestamp_age {
+            let min_time_stamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(max_timestamp_age.as_secs());
+            if connection_request.timestamp < min_time_stamp.to_le_bytes() {
+                return Ok(());
+            }
         }
         let x25519_secret_key = EphemeralSecret::random_from_rng(&mut thread_rng());
         let x25519_public_key = PublicKey::from(&x25519_secret_key);
@@ -503,7 +502,6 @@ impl<R: AuthResult> ServerThreadState<R> {
             auth_salt: self.auth_salt,
         };
         let size = connection_response.serialize(&crypto, &self.signing_key, &mut self.buf);
-        println!("Sending connection response");
         self.socket.send_to(from, &self.buf[..size])?;
         self.expecting_login_requests
             .insert((from, connection_request.salt), crypto);
