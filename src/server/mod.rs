@@ -40,6 +40,15 @@ pub struct Server<R: AuthResult, A: Authenticator<R>> {
     inner: Arc<ServerInner<R, A>>,
 }
 
+impl<R: AuthResult, A: Authenticator<R>> Clone for Server<R, A> {
+    fn clone(&self) -> Self {
+        Self {
+            max_send_msg_size: self.max_send_msg_size,
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 struct ServerInner<R: AuthResult, A: Authenticator<R>> {
     _phantom: PhantomData<A>,
     event_rx: Receiver<Event<R>>,
@@ -127,8 +136,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
-        #[builder(default = false)]
-        disable_timestamp_age_check: bool,
+        #[builder(default = false)] disable_timestamp_age_check: bool,
         #[builder(default = Duration::from_secs(10))]
         connection_request_max_timestamp_age: Duration,
     ) -> Result<Self, io::Error> {
