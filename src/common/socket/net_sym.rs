@@ -48,22 +48,20 @@ pub(crate) fn simulator_thread(
     mut simulator: Box<dyn NetworkSimulator>,
 ) {
     let connected = socket.peer_addr().is_ok();
+    // A failed send is a lost packet, like on the real network path.
+    let send = |Event::Send(socket_addr, packet): Event| {
+        let _ = if connected {
+            socket.send(&packet)
+        } else {
+            socket.send_to(&packet, socket_addr)
+        };
+    };
     let mut timed_events: TimedEventQueue<EventKey, Event> = TimedEventQueue::new();
     let mut send_key_counter = 0;
     loop {
         let cmd = if let Some(deadline) = timed_events.next() {
             if deadline.elapsed() > Duration::ZERO {
-                let (_key, event) = timed_events.pop().unwrap();
-                match event {
-                    // A failed send is a lost packet, like on the real network path.
-                    Event::Send(socket_addr, packet) => {
-                        let _ = if connected {
-                            socket.send(&packet)
-                        } else {
-                            socket.send_to(&packet, socket_addr)
-                        };
-                    }
-                }
+                send(timed_events.pop().unwrap().1);
                 continue;
             }
             match cmds.recv_deadline(deadline) {
@@ -91,7 +89,14 @@ pub(crate) fn simulator_thread(
                     send_key_counter += 1;
                 }
             }
-            SimulatorThreadCmd::Shutdown => break,
+            // Packets already sent are on the wire, deliver them.
+            SimulatorThreadCmd::Shutdown => {
+                while let Some(deadline) = timed_events.next() {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    send(timed_events.pop().unwrap().1);
+                }
+                break;
+            }
         }
     }
 }

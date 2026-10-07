@@ -19,7 +19,7 @@ struct SocketInner {
     socket: std::net::UdpSocket,
     mio_socket: mio::net::UdpSocket,
     use_simulator: bool,
-    simulator: Option<(Sender<SimulatorThreadCmd>, std::thread::JoinHandle<()>)>,
+    simulator: Option<Sender<SimulatorThreadCmd>>,
 }
 
 #[bon]
@@ -43,16 +43,9 @@ impl Socket {
             socket.connect(connected_to)?;
         }
 
-        let simulator = if let Some(simulator) = simulator {
-            let _socket = socket.try_clone()?;
-            let (sim_cmd_tx, sim_cmd_rx) = crossbeam::channel::unbounded();
-            let thread = std::thread::spawn(move || {
-                net_sym::simulator_thread(sim_cmd_rx, _socket, simulator)
-            });
-            Some((sim_cmd_tx, thread))
-        } else {
-            None
-        };
+        let simulator = simulator
+            .map(|simulator| spawn_simulator(&socket, simulator))
+            .transpose()?;
 
         Ok(Self {
             inner: SocketInner {
@@ -75,7 +68,7 @@ impl Socket {
         &mut self,
         simulator: Box<dyn net_sym::NetworkSimulator>,
     ) -> Result<(), io::Error> {
-        if let Some((sim_cmd_tx, _)) = &self.inner.simulator {
+        if let Some(sim_cmd_tx) = &self.inner.simulator {
             sim_cmd_tx
                 .send(SimulatorThreadCmd::ChangeSimulator(simulator))
                 .map_err(|_| {
@@ -85,12 +78,7 @@ impl Socket {
                     )
                 })?;
         } else {
-            let _socket = self.inner.socket.try_clone()?;
-            let (sim_cmd_tx, sim_cmd_rx) = crossbeam::channel::unbounded();
-            let thread = std::thread::spawn(move || {
-                net_sym::simulator_thread(sim_cmd_rx, _socket, simulator)
-            });
-            self.inner.simulator = Some((sim_cmd_tx, thread));
+            self.inner.simulator = Some(spawn_simulator(&self.inner.socket, simulator)?);
         }
         Ok(())
     }
@@ -103,8 +91,12 @@ impl Socket {
     /// errors, an unreachable peer) must not take down the connection, timeouts handle the rest.
     pub fn send_to(&self, to: SocketAddr, data: &[u8]) {
         assert!(data.len() <= 1200);
-        if self.inner.use_simulator && self.inner.simulator.is_some() {
-            let (sim_cmd_tx, _) = self.inner.simulator.as_ref().unwrap();
+        if let Some(sim_cmd_tx) = self
+            .inner
+            .simulator
+            .as_ref()
+            .filter(|_| self.inner.use_simulator)
+        {
             let _ = sim_cmd_tx.send(SimulatorThreadCmd::Send(to, data.to_vec()));
         } else {
             // BSD-derived stacks reject send_to on connected sockets (EISCONN).
@@ -140,6 +132,16 @@ impl Socket {
     }
 }
 
+fn spawn_simulator(
+    socket: &std::net::UdpSocket,
+    simulator: Box<dyn net_sym::NetworkSimulator>,
+) -> Result<Sender<SimulatorThreadCmd>, io::Error> {
+    let socket = socket.try_clone()?;
+    let (sim_cmd_tx, sim_cmd_rx) = crossbeam::channel::unbounded();
+    std::thread::spawn(move || net_sym::simulator_thread(sim_cmd_rx, socket, simulator));
+    Ok(sim_cmd_tx)
+}
+
 fn is_transient(e: &io::Error) -> bool {
     // WSAEMSGSIZE: Windows reports oversized datagrams as an error.
     const WSAEMSGSIZE: i32 = 10040;
@@ -154,10 +156,10 @@ fn is_transient(e: &io::Error) -> bool {
 }
 
 impl Drop for SocketInner {
+    /// The simulator thread delivers the packets it still delays, then exits on its own.
     fn drop(&mut self) {
-        self.simulator.take().map(|(cmd, handle)| {
-            let _ = cmd.send(SimulatorThreadCmd::Shutdown);
-            let _ = handle.join();
-        });
+        if let Some(sim_cmd_tx) = &self.simulator {
+            let _ = sim_cmd_tx.send(SimulatorThreadCmd::Shutdown);
+        }
     }
 }
