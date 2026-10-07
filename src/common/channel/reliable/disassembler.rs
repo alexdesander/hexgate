@@ -23,6 +23,13 @@ impl MessageDisassembler {
         self.messages.push_back((message, 0, false));
     }
 
+    pub fn queued_bytes(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|(message, offset, _)| message.len() - offset)
+            .sum()
+    }
+
     pub fn pop(&mut self, mut max_size: usize) -> Option<Vec<u8>> {
         let mut payload = Vec::with_capacity(max_size);
         while let Some((message, offset, wrote_size)) = self.messages.front_mut() {

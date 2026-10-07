@@ -8,12 +8,14 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channels},
     congestion::{CongestionConfiguration, CongestionController},
     crypto::Crypto,
+    stats::ProbeLoss,
 };
 
 /// This struct just holds state. The logic resides in the thread module.
 pub struct Connection {
     pub crypto: Crypto,
     pub last_latency_discovery_response: u32,
+    pub probe_loss: ProbeLoss,
     pub last_received: Instant,
     pub last_sent: Instant,
 
@@ -33,6 +35,7 @@ impl Connection {
         Self {
             crypto,
             last_latency_discovery_response: 0,
+            probe_loss: ProbeLoss::default(),
             last_received: Instant::now(),
             last_sent: Instant::now(),
 

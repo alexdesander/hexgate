@@ -23,6 +23,7 @@ use crate::common::{
     events::{self, EventReceiver},
     packets::{disconnect, info_response::MAX_INFO_SIZE},
     socket::{net_sym::NetworkSimulator, Socket},
+    stats::Stats,
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
 };
@@ -90,6 +91,15 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
     /// The address the server is bound to (e.g. the port chosen for `bind_addr` port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Asks the network thread for a client's connection statistics, `None` if it isn't
+    /// connected.
+    pub fn stats(&self, client: SocketAddr) -> Option<Stats> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.inner.cmd_tx.send(Cmd::Stats(client, reply_tx)).ok()?;
+        let _ = self.inner.waker.wake();
+        reply_rx.recv().ok().flatten()
     }
 
     /// Sets the info that will be sent to clients on info requests (for server list pings etc).

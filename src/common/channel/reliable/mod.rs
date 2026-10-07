@@ -157,6 +157,16 @@ impl ReliableChannel {
         self.disassembler.push(message);
     }
 
+    /// Queued bytes plus unacknowledged packet payloads.
+    pub fn queued_bytes(&self) -> usize {
+        self.disassembler.queued_bytes()
+            + self
+                .in_flights
+                .iter()
+                .map(|in_flight| in_flight.packet.payload().len())
+                .sum::<usize>()
+    }
+
     /// Size of the next packet if one can be sent now, otherwise the time until a retransmission
     /// is due.
     pub fn peek(&mut self, now: Instant) -> Pop {

@@ -52,6 +52,13 @@ impl UnreliableOrderedChannel {
         });
     }
 
+    pub fn queued_bytes(&self) -> usize {
+        self.to_send
+            .iter()
+            .map(|to_send| to_send.payload.len() - to_send.sent)
+            .sum()
+    }
+
     pub fn peek_size(&self) -> usize {
         let Some(to_send) = self.to_send.front() else {
             return 0;

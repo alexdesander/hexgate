@@ -13,7 +13,7 @@ use std::{
 use ahash::HashSet;
 use argon2::{Argon2, Params};
 use bon::bon;
-use crossbeam::channel::{unbounded, Sender};
+use crossbeam::channel::{bounded, unbounded, Sender};
 use ed25519_dalek::VerifyingKey;
 use mio::{Events, Interest, Poll, Waker};
 use rand::thread_rng;
@@ -37,6 +37,7 @@ use crate::common::{
         server_hello::ServerHello,
     },
     socket::{is_transient, net_sym::NetworkSimulator, Socket},
+    stats::Stats,
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, ClientVersion, RECV_TOKEN, WAKE_TOKEN,
 };
@@ -189,6 +190,14 @@ impl Client {
     pub fn set_simulator(&self, simulator: Option<Box<dyn NetworkSimulator>>) {
         let _ = self.inner.cmd_tx.send(Cmd::SetSimulator(simulator));
         let _ = self.inner.waker.wake();
+    }
+
+    /// Asks the network thread for the connection statistics, `None` once it has stopped.
+    pub fn stats(&self) -> Option<Stats> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.inner.cmd_tx.send(Cmd::Stats(reply_tx)).ok()?;
+        let _ = self.inner.waker.wake();
+        reply_rx.recv().ok()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -428,6 +437,7 @@ impl Client {
 
                     latency_discoveries: Default::default(),
                     latencies: Default::default(),
+                    probe_loss: Default::default(),
 
                     last_received: Instant::now(),
                     timeout_dur,

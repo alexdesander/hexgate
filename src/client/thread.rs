@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam::channel::{Receiver, TryRecvError};
+use crossbeam::channel::{Receiver, Sender, TryRecvError};
 use mio::{Events, Poll, Waker};
 
 use crate::common::{
@@ -30,6 +30,7 @@ use crate::common::{
         PacketIdentifier,
     },
     socket::net_sym::NetworkSimulator,
+    stats::{ProbeLoss, Stats},
     timed_event_queue::TimedEventQueue,
     RECV_TOKEN, WAKE_TOKEN,
 };
@@ -43,6 +44,7 @@ pub enum Cmd {
     SetSimulator(Option<Box<dyn NetworkSimulator>>),
     Disconnect(Vec<u8>),
     Send(Channel, Vec<u8>),
+    Stats(Sender<Stats>),
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -71,6 +73,7 @@ pub struct ClientThreadState {
 
     pub latency_discoveries: BTreeMap<u32, Instant>,
     pub latencies: BTreeSet<u32>,
+    pub probe_loss: ProbeLoss,
 
     pub last_received: Instant,
     pub timeout_dur: Duration,
@@ -150,6 +153,13 @@ impl ClientThreadState {
                         self.last_sent + self.congestion.downtime_between_batches(),
                         TimedEventData::Nothing,
                     );
+                }
+                Cmd::Stats(reply) => {
+                    let _ = reply.send(Stats::new(
+                        &self.congestion,
+                        &self.channels,
+                        &self.probe_loss,
+                    ));
                 }
                 Cmd::SetSimulator(network_simulator) => {
                     if let Some(network_simulator) = network_simulator {
@@ -322,6 +332,7 @@ impl ClientThreadState {
         }
         self.latency_discoveries
             .insert(latency_discovery.sequence_number, Instant::now());
+        self.probe_loss.probe(latency_discovery.sequence_number);
         if self.latency_discoveries.len() > 63 {
             self.latency_discoveries.pop_first();
         }
@@ -358,6 +369,8 @@ impl ClientThreadState {
         };
         let latency = sent.elapsed();
         self.congestion.update_latency(latency);
+        self.probe_loss
+            .answered(latency_discovery_response_2.sequence_number);
         self.latencies
             .insert(latency_discovery_response_2.sequence_number);
         if self.latencies.len() > 19 {

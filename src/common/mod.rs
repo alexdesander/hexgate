@@ -11,6 +11,7 @@ pub mod error;
 pub(crate) mod events;
 pub(crate) mod packets;
 pub mod socket;
+pub mod stats;
 pub(crate) mod timed_event_queue;
 
 const PROTOCOL_VERSION: u8 = 0;

@@ -44,6 +44,7 @@ use crate::common::{
         PacketIdentifier,
     },
     socket::net_sym::NetworkSimulator,
+    stats::Stats,
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, Cipher, ClientVersion, RECV_TOKEN, WAKE_TOKEN,
 };
@@ -77,6 +78,7 @@ pub enum Cmd<R: AuthResult> {
     AuthSuccess(LoginAttempt, R),
     AuthFailed(LoginAttempt, Vec<u8>),
     Send(SocketAddr, Channel, Vec<u8>),
+    Stats(SocketAddr, Sender<Option<Stats>>),
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -214,6 +216,15 @@ impl<R: AuthResult> ServerThreadState<R> {
                         TimedEventData::Nothing,
                     );
                 }
+                Cmd::Stats(addr, reply) => {
+                    let _ = reply.send(self.connections.get(&addr).map(|connection| {
+                        Stats::new(
+                            &connection.congestion,
+                            &connection.channels,
+                            &connection.probe_loss,
+                        )
+                    }));
+                }
                 Cmd::SetSimulator(network_simulator) => {
                     if let Some(network_simulator) = network_simulator {
                         self.socket.set_network_simulator(network_simulator)?;
@@ -346,9 +357,10 @@ impl<R: AuthResult> ServerThreadState<R> {
         if self.latency_discoveries_sent.len() > 63 {
             self.latency_discoveries_sent.pop_first();
         }
-        for (addr, connection) in self.connections.iter() {
+        for (addr, connection) in self.connections.iter_mut() {
             let size = latency_discovery.serialize(&connection.crypto, &mut self.buf);
             self.socket.send_to(*addr, &self.buf[..size]);
+            connection.probe_loss.probe(sequence_number);
         }
         if self.connections.len() > 0 {
             self.timed_events.push(
@@ -713,6 +725,9 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         connection.last_latency_discovery_response = latency_discovery_response.sequence_number;
+        connection
+            .probe_loss
+            .answered(latency_discovery_response.sequence_number);
         let latency = sent.elapsed();
         connection.congestion.update_latency(latency);
 

@@ -167,6 +167,20 @@ impl Channels {
         }
     }
 
+    pub fn queued_bytes(&self) -> usize {
+        self.unreliable.queued_bytes()
+            + self
+                .unreliable_ordered
+                .iter()
+                .map(UnreliableOrderedChannel::queued_bytes)
+                .sum::<usize>()
+            + self
+                .reliable
+                .iter()
+                .map(ReliableChannel::queued_bytes)
+                .sum::<usize>()
+    }
+
     pub fn handle_unreliable(
         &mut self,
         packet: UnreliablePayload,

@@ -144,12 +144,7 @@ impl CongestionController {
             return;
         }
         let avg = self.avg_latency();
-        let deviation = self
-            .latencies
-            .iter()
-            .map(|sample| sample.abs_diff(avg))
-            .sum::<Duration>()
-            / self.latencies.len() as u32;
+        let deviation = self.jitter();
         self.latencies.push_back(latency);
         if self.latencies.len() > LATENCIES_CONSIDERED {
             self.latencies.pop_front();
@@ -182,6 +177,27 @@ impl CongestionController {
             return Duration::from_millis(50);
         }
         self.latencies.iter().sum::<Duration>() / self.latencies.len() as u32
+    }
+
+    /// Average probe RTT, `None` before the first sample.
+    pub fn rtt(&self) -> Option<Duration> {
+        (!self.latencies.is_empty()).then(|| self.avg_latency())
+    }
+
+    /// Mean deviation of the probe RTTs.
+    pub fn jitter(&self) -> Duration {
+        let Some(avg) = self.rtt() else {
+            return Duration::ZERO;
+        };
+        self.latencies
+            .iter()
+            .map(|sample| sample.abs_diff(avg))
+            .sum::<Duration>()
+            / self.latencies.len() as u32
+    }
+
+    pub fn send_rate(&self) -> u64 {
+        self.bandwidth
     }
 
     pub fn ack_delay(&self) -> Duration {
