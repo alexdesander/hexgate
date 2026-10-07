@@ -2,6 +2,7 @@
 name = "hexgate"
 version = "0.0.1"
 edition = "2021"
+rust-version = "1.86"
 authors = ["alexdesander <alexdesander@tuta.io>"]
 description = "Efficient and easy-to-use udp based client-server game networking crate"
 keywords = ["networking", "gamedev", "multiplayer", "netcode", "udp"]
