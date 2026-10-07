@@ -39,8 +39,8 @@ impl ServerHello {
                 buf[13..45].copy_from_slice(server_ed25519_pubkey.as_bytes());
                 let siphash = siphash.unwrap_or_else(|| siphasher.hash(&buf[1..45]));
                 buf[45..53].copy_from_slice(&siphash.to_le_bytes());
-                buf[54] = *cipher as u8;
-                55
+                buf[53] = *cipher as u8;
+                54
             }
             ServerHello::VersionNotSupported {
                 salt,
@@ -64,7 +64,7 @@ impl ServerHello {
             return Err(ERROR_INVALID_BUFFER_SIZE);
         }
         if buf[0] == PacketIdentifier::ServerHelloVersionSupported as u8 {
-            if buf.len() != 55 {
+            if buf.len() != 54 {
                 return Err(ERROR_INVALID_BUFFER_SIZE);
             }
             let salt = buf[1..5].try_into().unwrap();
@@ -75,7 +75,7 @@ impl ServerHello {
                 return Err(&ERROR_INVALID_SERVER_ED25519_PUBKEY);
             };
             let siphash = u64::from_le_bytes(buf[45..53].try_into().unwrap());
-            let Ok(cipher) = Cipher::try_from(buf[54]) else {
+            let Ok(cipher) = Cipher::try_from(buf[53]) else {
                 return Err(ERROR_INVALID_CIPHER);
             };
             return Ok(ServerHello::VersionSupported {
