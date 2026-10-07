@@ -30,6 +30,8 @@ mod disassembler;
 const MAX_BACKOFF_EXPONENT: u32 = 2;
 /// A packet is lost once a packet this many ids later, sent after it, is acked (RFC 9002).
 const PACKET_THRESHOLD: u64 = 3;
+/// Packets in flight per channel: everything the ack bitfield can cover.
+const WINDOW: usize = ACK_BITFIELD_SIZE * 8;
 
 struct InFlight {
     /// Last transmission and its retransmission deadline, `None` until first sent.
@@ -116,7 +118,6 @@ pub struct ReliableChannel {
     disassembler: MessageDisassembler,
 
     next: u64,
-    max_in_flight: usize,
     in_flights: BinaryHeap<InFlight>,
     lowest_unreceived_remote: u64,
     /// Id and last send time of the highest acked packet.
@@ -130,14 +131,13 @@ pub struct ReliableChannel {
 }
 
 impl ReliableChannel {
-    pub fn new(channel_id: u8, max_in_flight: usize, max_recv_msg_size: usize) -> Self {
+    pub fn new(channel_id: u8, max_recv_msg_size: usize) -> Self {
         Self {
             channel_id,
             assembler: MessageAssembler::new(max_recv_msg_size),
             disassembler: MessageDisassembler::new(),
 
             next: 0,
-            max_in_flight,
             in_flights: BinaryHeap::new(),
             lowest_unreceived_remote: 0,
             largest_acked: None,
@@ -171,12 +171,8 @@ impl ReliableChannel {
     }
 
     fn gather_in_flights(&mut self) {
-        for _ in self.in_flights.len()..self.max_in_flight {
-            if self.next
-                >= self
-                    .lowest_unreceived_remote
-                    .saturating_add(self.max_in_flight as u64)
-            {
+        for _ in self.in_flights.len()..WINDOW {
+            if self.next >= self.lowest_unreceived_remote.saturating_add(WINDOW as u64) {
                 break;
             }
             let Some(payload) = self
@@ -230,7 +226,7 @@ impl ReliableChannel {
         if self.ack_data.is_acked(pid) {
             return Ok(Vec::new());
         }
-        if pid > self.ack_data.lowest_unreceived + self.max_in_flight as u64 {
+        if pid > self.ack_data.lowest_unreceived + WINDOW as u64 {
             return Ok(Vec::new());
         }
         self.ack_data.ack(pid);

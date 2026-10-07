@@ -76,11 +76,7 @@ pub(crate) struct Channels {
 }
 
 impl Channels {
-    pub fn new(
-        congestion: &CongestionController,
-        config: &ChannelConfiguration,
-        max_recv_msg_size: usize,
-    ) -> Self {
+    pub fn new(config: &ChannelConfiguration, max_recv_msg_size: usize) -> Self {
         Self {
             max_recv_msg_size,
             scheduler: Scheduler::new(config),
@@ -89,13 +85,7 @@ impl Channels {
                 .map(|i| UnreliableOrderedChannel::new(i.try_into().unwrap(), max_recv_msg_size))
                 .collect(),
             reliable: (0..config.weights_reliable.len())
-                .map(|i| {
-                    ReliableChannel::new(
-                        i.try_into().unwrap(),
-                        congestion.max_in_flight(),
-                        max_recv_msg_size,
-                    )
-                })
+                .map(|i| ReliableChannel::new(i.try_into().unwrap(), max_recv_msg_size))
                 .collect(),
         }
     }

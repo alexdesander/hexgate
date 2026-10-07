@@ -326,8 +326,8 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         let now = Instant::now();
-        let mut batch_size = connection.congestion.allowed_to_send_this_batch();
-        while batch_size > 0 {
+        let downtime = connection.congestion.downtime_between_batches();
+        while connection.congestion.can_send(now) {
             match connection.channels.pop(
                 &mut connection.congestion,
                 &connection.crypto,
@@ -336,12 +336,10 @@ impl<R: AuthResult> ServerThreadState<R> {
                 Either::Left(size) => {
                     connection.last_sent = now;
                     self.socket.send_to(to, &self.buf[..size]);
-                    batch_size = batch_size.saturating_sub(size as u32);
+                    connection.congestion.consume(size);
                 }
                 Either::Right(Some(time_till_resend)) => {
-                    let deadline = (now + time_till_resend).max(
-                        connection.last_sent + connection.congestion.downtime_between_batches(),
-                    );
+                    let deadline = (now + time_till_resend).max(connection.last_sent + downtime);
                     self.timed_events.push(
                         TimedEventKey::Send(to),
                         deadline,
@@ -356,7 +354,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         }
         self.timed_events.push(
             TimedEventKey::Send(to),
-            now + connection.congestion.downtime_between_batches(),
+            now + connection.congestion.time_until_send().max(downtime),
             TimedEventData::Nothing,
         );
     }

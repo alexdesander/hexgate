@@ -7,6 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::common::error::ConfigError;
+
 // TODO: IMPLEMENT A BETTER CONGESTION CONTROL ALGORITHM (this is a super scuffed homebrew solution)
 // I HAVE MY EYES ON BBRv3 BUT THATS A LOT OF WORK AND MAYBE NOT EVEN WORTH IT.
 // => How does Valve do it? Or RakNet?
@@ -21,13 +23,27 @@ const BATCHES_DOWNTIME: Duration = Duration::from_millis(1000 / BATCHES_PER_SECO
 const INITIAL_RTT: Duration = Duration::from_millis(333);
 const TIMER_GRANULARITY: Duration = Duration::from_millis(1);
 
-/// Bandwidth is in kibibytes per second (1024 bytes per second).
+/// Bandwidth is in kibibytes per second (1024 bytes per second), with
+/// `0 < min_bandwidth <= start_bandwidth <= max_bandwidth`.
 /// You should manually tune this to your game's needs.
 #[derive(Debug, Clone, Copy)]
 pub struct CongestionConfiguration {
     pub start_bandwidth: u32,
     pub max_bandwidth: u32,
     pub min_bandwidth: u32,
+}
+
+impl CongestionConfiguration {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        if 0 < self.min_bandwidth
+            && self.min_bandwidth <= self.start_bandwidth
+            && self.start_bandwidth <= self.max_bandwidth
+        {
+            Ok(())
+        } else {
+            Err(ConfigError::InvalidBandwidth)
+        }
+    }
 }
 
 impl Default for CongestionConfiguration {
@@ -41,47 +57,60 @@ impl Default for CongestionConfiguration {
 }
 
 pub(crate) struct CongestionController {
-    // Bandwidth in kbps
-    bandwidth: u32,
-    max_bandwidth: u32,
-    min_bandwidth: u32,
-    batch_size: u32,
+    /// Bytes per second.
+    bandwidth: u64,
+    max_bandwidth: u64,
+    min_bandwidth: u64,
+    /// Send token bucket in bytes, refilled at `bandwidth` up to one batch. Negative after a
+    /// packet larger than the remaining tokens was sent.
+    tokens: f64,
+    last_refill: Instant,
     latencies: VecDeque<Duration>,
     last_speedup: Instant,
     last_slowdown: Option<Instant>,
     sent_reliable: u32,
     resent_reliable: u32,
     last_reset_reliable_count: Instant,
-    max_in_flight: usize,
     srtt: Option<Duration>,
     rttvar: Duration,
 }
 
 impl CongestionController {
     pub fn new(config: CongestionConfiguration) -> Self {
+        let bandwidth = u64::from(config.start_bandwidth) * 1024;
         Self {
-            bandwidth: config.start_bandwidth,
-            max_bandwidth: config.max_bandwidth,
-            min_bandwidth: config.min_bandwidth,
-            batch_size: config.start_bandwidth / BATCHES_PER_SECOND,
+            bandwidth,
+            max_bandwidth: u64::from(config.max_bandwidth) * 1024,
+            min_bandwidth: u64::from(config.min_bandwidth) * 1024,
+            tokens: bandwidth as f64 / BATCHES_PER_SECOND as f64,
+            last_refill: Instant::now(),
             latencies: VecDeque::new(),
             last_speedup: Instant::now(),
             last_slowdown: Some(Instant::now()),
             sent_reliable: 0,
             resent_reliable: 0,
             last_reset_reliable_count: Instant::now(),
-            max_in_flight: 32,
             srtt: None,
             rttvar: INITIAL_RTT / 2,
         }
     }
 
-    pub fn max_in_flight(&self) -> usize {
-        self.max_in_flight
+    /// Refills the token bucket and returns whether a packet may be sent now.
+    pub fn can_send(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.last_refill = now;
+        let max_tokens = self.bandwidth as f64 / BATCHES_PER_SECOND as f64;
+        self.tokens = (self.tokens + self.bandwidth as f64 * elapsed.as_secs_f64()).min(max_tokens);
+        self.tokens > 0.0
     }
 
-    pub fn allowed_to_send_this_batch(&self) -> u32 {
-        self.batch_size * 1024
+    pub fn consume(&mut self, size: usize) {
+        self.tokens -= size as f64;
+    }
+
+    /// Time until `can_send` allows the next packet.
+    pub fn time_until_send(&self) -> Duration {
+        Duration::from_secs_f64((-self.tokens).max(0.0) / self.bandwidth as f64)
     }
 
     pub fn downtime_between_batches(&self) -> Duration {
@@ -114,14 +143,20 @@ impl CongestionController {
             self.latencies.push_back(latency);
             return;
         }
-        let sum = self.latencies.iter().sum::<Duration>();
-        let avg = sum / self.latencies.len() as u32;
+        let avg = self.avg_latency();
+        let deviation = self
+            .latencies
+            .iter()
+            .map(|sample| sample.abs_diff(avg))
+            .sum::<Duration>()
+            / self.latencies.len() as u32;
         self.latencies.push_back(latency);
         if self.latencies.len() > LATENCIES_CONSIDERED {
             self.latencies.pop_front();
         }
-        let threshhold = ((avg * 11) / 10).max(avg + Duration::from_millis(5));
-        if latency > threshhold {
+        // Normal jitter (4 mean deviations, like RFC 6298's RTO) is not congestion.
+        let threshold = avg + (avg / 10).max(Duration::from_millis(5)).max(deviation * 4);
+        if latency > threshold {
             self.slow_down();
         } else {
             self.speed_up();
@@ -166,9 +201,7 @@ impl CongestionController {
 
     fn slow_down(&mut self) {
         self.last_slowdown = Some(Instant::now());
-        self.bandwidth = (self.bandwidth * 8) / 10;
-        self.bandwidth = self.bandwidth.max(self.min_bandwidth);
-        self.batch_size = self.bandwidth / BATCHES_PER_SECOND;
+        self.bandwidth = (self.bandwidth * 8 / 10).max(self.min_bandwidth);
     }
 
     fn speed_up(&mut self) {
@@ -181,8 +214,6 @@ impl CongestionController {
             return;
         }
         self.last_speedup = Instant::now();
-        self.bandwidth = (self.bandwidth * 11) / 10;
-        self.bandwidth = self.bandwidth.min(self.max_bandwidth);
-        self.batch_size = self.bandwidth / BATCHES_PER_SECOND;
+        self.bandwidth = (self.bandwidth * 11 / 10).min(self.max_bandwidth);
     }
 }

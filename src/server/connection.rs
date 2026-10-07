@@ -28,15 +28,14 @@ impl Connection {
         congestion_config: CongestionConfiguration,
         max_recv_msg_size: usize,
     ) -> Self {
-        let congestion = CongestionController::new(congestion_config);
         Self {
             crypto,
             last_latency_discovery_response: 0,
             last_received: Instant::now(),
             last_sent: Instant::now(),
 
-            channels: Channels::new(&congestion, channel_config, max_recv_msg_size),
-            congestion,
+            channels: Channels::new(channel_config, max_recv_msg_size),
+            congestion: CongestionController::new(congestion_config),
         }
     }
 }

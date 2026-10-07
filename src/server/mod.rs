@@ -165,6 +165,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
     ) -> Result<Self, StartError> {
         TooLarge::check(info.len(), MAX_INFO_SIZE).map_err(ConfigError::InfoTooLarge)?;
         channel_config.validate()?;
+        congestion_config.validate()?;
         let send_limits = SendLimits::new(&channel_config, max_send_msg_size);
         let socket = Socket::builder()
             .bind_addr(bind_addr)

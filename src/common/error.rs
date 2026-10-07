@@ -57,4 +57,6 @@ pub enum ConfigError {
     TooManyChannels(usize),
     #[error("info too large: {0}")]
     InfoTooLarge(TooLarge),
+    #[error("congestion config needs 0 < min_bandwidth <= start_bandwidth <= max_bandwidth")]
+    InvalidBandwidth,
 }

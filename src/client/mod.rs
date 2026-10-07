@@ -216,6 +216,7 @@ impl Client {
     ) -> Result<Self, ConnectError> {
         let max_handshake_tries = handshake_tries;
         channel_config.validate()?;
+        congestion_config.validate()?;
         if !hash_auth_data {
             TooLarge::check(auth_data.len(), login_request::MAX_AUTH_DATA_SIZE)
                 .map_err(ConnectError::AuthDataTooLarge)?;
@@ -355,7 +356,6 @@ impl Client {
             let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
             let _waker = waker.clone();
             let thread = std::thread::spawn(move || {
-                let congestion = CongestionController::new(congestion_config);
                 let mut state = ClientThreadState {
                     cmds: cmd_rx,
                     event_tx,
@@ -373,9 +373,9 @@ impl Client {
                     last_received: Instant::now(),
                     timeout_dur,
 
-                    channels: Channels::new(&congestion, &channel_config, max_recv_msg_size),
+                    channels: Channels::new(&channel_config, max_recv_msg_size),
                     channel_config,
-                    congestion,
+                    congestion: CongestionController::new(congestion_config),
                     last_sent: Instant::now(),
                 };
                 if let Err(e) = state.run() {
