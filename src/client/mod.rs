@@ -4,7 +4,7 @@
 
 use std::{
     io::{self, ErrorKind},
-    net::{SocketAddr, UdpSocket},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{mpsc, Arc},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -191,7 +191,8 @@ impl Client {
     /// You can freely run this on a different thread and then send the client back to your main thread.
     #[builder(finish_fn = connect)]
     pub fn prepare(
-        #[builder(default = "0.0.0.0:0".parse().unwrap())] bind_addr: SocketAddr,
+        /// Defaults to any address of the server's IP version, with a random port.
+        bind_addr: Option<SocketAddr>,
         server_socket_addr: SocketAddr,
         expected_server_key: Option<[u8; 32]>,
         /// At most 1177 bytes unless hashed.
@@ -231,6 +232,10 @@ impl Client {
         }
         let send_limits = SendLimits::new(&channel_config, max_send_msg_size);
 
+        let bind_addr = bind_addr.unwrap_or(match server_socket_addr {
+            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+        });
         let mut socket = Socket::builder()
             .bind_addr(bind_addr)
             .connected_to(server_socket_addr)
