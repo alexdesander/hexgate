@@ -157,23 +157,17 @@ impl ReliableChannel {
         self.disassembler.push(message);
     }
 
-    pub fn peek_size(&mut self) -> usize {
+    /// Size of the next packet if one can be sent now, otherwise the time until a retransmission
+    /// is due (`None`: nothing in flight).
+    pub fn peek(&mut self, now: Instant) -> Either<usize, Option<Duration>> {
         self.gather_in_flights();
-        if let Some(in_flight) = self.in_flights.peek() {
-            in_flight.packet.serialized_size()
-        } else {
-            0
+        let Some(in_flight) = self.in_flights.peek() else {
+            return Either::Right(None);
+        };
+        match in_flight.resend_at() {
+            Some(resend_at) if resend_at > now => Either::Right(Some(resend_at - now)),
+            _ => Either::Left(in_flight.packet.serialized_size()),
         }
-    }
-
-    pub fn pop(
-        &mut self,
-        congestion: &mut CongestionController,
-        crypto: &Crypto,
-        buf: &mut [u8],
-    ) -> Either<usize, Option<Duration>> {
-        self.gather_in_flights();
-        self.next_to_send(congestion, crypto, buf)
     }
 
     fn gather_in_flights(&mut self) {
@@ -205,27 +199,15 @@ impl ReliableChannel {
         }
     }
 
-    fn next_to_send(
+    /// Sends the packet `peek` reported.
+    pub fn pop(
         &mut self,
+        now: Instant,
         congestion: &mut CongestionController,
         crypto: &Crypto,
         buf: &mut [u8],
-    ) -> Either<usize, Option<Duration>> {
-        // Return resend wait time if there are no packets to send
-        if self.in_flights.is_empty() {
-            return Either::Right(None);
-        }
-        let now = Instant::now();
-        let in_flight = self.in_flights.peek().unwrap();
-        if let Some(resend_at) = in_flight.resend_at() {
-            if resend_at > now {
-                return Either::Right(Some(resend_at - now));
-            }
-        }
-
-        // A packet is ready to be sent, return its size
+    ) -> usize {
         let mut packet = self.in_flights.pop().unwrap();
-
         if packet.transmissions > 0 {
             congestion.register_resent_reliable();
         } else {
@@ -237,7 +219,7 @@ impl ReliableChannel {
         packet.sent = Some((now, now + congestion.rto() * backoff));
         let size = packet.packet.serialize(crypto, buf);
         self.in_flights.push(packet);
-        Either::Left(size)
+        size
     }
 
     pub fn handle(

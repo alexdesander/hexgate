@@ -83,7 +83,7 @@ impl Channels {
     ) -> Self {
         Self {
             max_recv_msg_size,
-            scheduler: Scheduler::new(),
+            scheduler: Scheduler::new(config),
             unreliable: UnreliableChannel::new(max_recv_msg_size),
             unreliable_ordered: (0..config.weights_unreliable_ordered.len())
                 .map(|i| UnreliableOrderedChannel::new(i.try_into().unwrap(), max_recv_msg_size))
@@ -110,71 +110,56 @@ impl Channels {
         }
     }
 
+    /// Encrypts the next packet into `buf`. `Right(Some)` means nothing can be sent before then
+    /// (reliable retransmissions), `Right(None)` means nothing is queued.
     pub fn pop(
         &mut self,
-        config: &ChannelConfiguration,
         congestion: &mut CongestionController,
         crypto: &Crypto,
         buf: &mut [u8],
     ) -> Either<usize, Option<Duration>> {
-        // This is initialized here to minimize drift in the scheduler.
         let now = Instant::now();
+        let mut next: Option<(u64, usize)> = None;
+        let mut wait: Option<Duration> = None;
+        for slot in 0..self.scheduler.slots() {
+            match self.peek(slot, now) {
+                Either::Left(size) => {
+                    let tag = self.scheduler.tag(slot, size);
+                    if next.is_none_or(|(best, _)| tag < best) {
+                        next = Some((tag, slot));
+                    }
+                }
+                Either::Right(slot_wait) => {
+                    self.scheduler.clear(slot);
+                    wait = wait.into_iter().chain(slot_wait).min();
+                }
+            }
+        }
+        let Some((_, slot)) = next else {
+            self.scheduler.reset();
+            return Either::Right(wait);
+        };
+        self.scheduler.served(slot);
+        let ordered = self.unreliable_ordered.len();
+        Either::Left(match slot {
+            0 => self.unreliable.pop(crypto, buf),
+            slot if slot <= ordered => self.unreliable_ordered[slot - 1].pop(crypto, buf),
+            slot => self.reliable[slot - 1 - ordered].pop(now, congestion, crypto, buf),
+        })
+    }
 
-        // Schedule unreliable packets
-        let size = self.unreliable.peek_size();
+    fn peek(&mut self, slot: usize, now: Instant) -> Either<usize, Option<Duration>> {
+        let ordered = self.unreliable_ordered.len();
+        let size = match slot {
+            0 => self.unreliable.peek_size(),
+            slot if slot <= ordered => self.unreliable_ordered[slot - 1].peek_size(),
+            slot => return self.reliable[slot - 1 - ordered].peek(now),
+        };
         if size > 0 {
-            self.scheduler
-                .schedule(now, &config, Channel::Unreliable, size);
+            Either::Left(size)
+        } else {
+            Either::Right(None)
         }
-
-        // Schedule unreliable ordered packets
-        for (i, channel) in self.unreliable_ordered.iter().enumerate() {
-            let size = channel.peek_size();
-            if size > 0 {
-                self.scheduler
-                    .schedule(now, &config, Channel::UnreliableOrdered(i as u8), size);
-            }
-        }
-
-        // Schedule reliable packets
-        for (i, channel) in self.reliable.iter_mut().enumerate() {
-            let size = channel.peek_size();
-            if size > 0 {
-                self.scheduler
-                    .schedule(now, &config, Channel::Reliable(i as u8), size);
-            }
-        }
-
-        // Pop the next packet
-        if let Some(channel) = self.scheduler.next() {
-            match channel {
-                Channel::Unreliable => {
-                    let size = self.unreliable.pop(crypto, buf);
-                    if size > 0 {
-                        return Either::Left(size);
-                    }
-                }
-                Channel::UnreliableOrdered(channel_id) => {
-                    let size = self.unreliable_ordered[channel_id as usize].pop(crypto, buf);
-                    if size > 0 {
-                        return Either::Left(size);
-                    }
-                }
-                Channel::Reliable(channel_id) => {
-                    match self.reliable[channel_id as usize].pop(congestion, crypto, buf) {
-                        Either::Left(size) => {
-                            assert!(size > 0);
-                            return Either::Left(size);
-                        }
-                        Either::Right(Some(cooldown)) => {
-                            return Either::Right(Some(cooldown));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Either::Right(None)
     }
 
     pub fn handle_unreliable(

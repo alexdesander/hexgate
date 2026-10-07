@@ -217,28 +217,21 @@ impl ClientThreadState {
         let now = Instant::now();
         let mut batch_size = self.congestion.allowed_to_send_this_batch();
         while batch_size > 0 {
-            match self.channels.pop(
-                &self.channel_config,
-                &mut self.congestion,
-                &self.crypto,
-                &mut self.buf,
-            ) {
+            match self
+                .channels
+                .pop(&mut self.congestion, &self.crypto, &mut self.buf)
+            {
                 Either::Left(size) => {
                     self.last_sent = now;
                     self.socket.send(&self.buf[..size]);
                     batch_size = batch_size.saturating_sub(size as u32);
                 }
                 Either::Right(Some(time_till_resend)) => {
-                    let mut new_deadline = now + time_till_resend;
-                    new_deadline = new_deadline
+                    let deadline = (now + time_till_resend)
                         .max(self.last_sent + self.congestion.downtime_between_batches());
-                    self.timed_events.push(
-                        TimedEventKey::Send,
-                        new_deadline,
-                        TimedEventData::Nothing,
-                    );
-
-                    break;
+                    self.timed_events
+                        .push(TimedEventKey::Send, deadline, TimedEventData::Nothing);
+                    return;
                 }
                 Either::Right(None) => {
                     return;
@@ -374,6 +367,12 @@ impl ClientThreadState {
             return false;
         };
         self.channels.handle_acks(acks, &mut self.congestion);
+        // Acks can open the window or reveal losses.
+        self.timed_events.push(
+            TimedEventKey::Send,
+            self.last_sent + self.congestion.downtime_between_batches(),
+            TimedEventData::Nothing,
+        );
         false
     }
 

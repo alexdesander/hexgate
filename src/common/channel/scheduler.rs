@@ -2,12 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{
-    collections::BinaryHeap,
-    time::{Duration, Instant},
-};
-
-use super::Channel;
 use crate::common::error::ConfigError;
 
 pub struct ChannelConfiguration {
@@ -35,55 +29,50 @@ impl ChannelConfiguration {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct SchedulerEntry {
-    finish_time: Instant,
-    channel: Channel,
-}
-
-impl Ord for SchedulerEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.finish_time.cmp(&self.finish_time)
-    }
-}
-
-impl PartialOrd for SchedulerEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(other.finish_time.cmp(&self.finish_time))
-    }
-}
-
+/// Self-clocked fair queueing over channel slots (0: unreliable, then unreliable ordered, then
+/// reliable). The head packet of a sendable slot gets the finish tag `virtual_time + size / weight`
+/// once; the smallest tag is sent next and advances the virtual time.
 pub(crate) struct Scheduler {
-    queue: BinaryHeap<SchedulerEntry>,
+    weights: Vec<u16>,
+    tags: Vec<Option<u64>>,
+    virtual_time: u64,
 }
 
 impl Scheduler {
-    pub fn new() -> Self {
+    pub fn new(config: &ChannelConfiguration) -> Self {
+        let weights: Vec<u16> = std::iter::once(config.weight_unreliable)
+            .chain(config.weights_unreliable_ordered.iter().copied())
+            .chain(config.weights_reliable.iter().copied())
+            .collect();
         Self {
-            queue: BinaryHeap::new(),
+            tags: vec![None; weights.len()],
+            weights,
+            virtual_time: 0,
         }
     }
 
-    pub fn schedule(
-        &mut self,
-        now: Instant,
-        config: &ChannelConfiguration,
-        channel: Channel,
-        packet_size: usize,
-    ) {
-        let weight = match channel {
-            Channel::Unreliable => config.weight_unreliable,
-            Channel::UnreliableOrdered(i) => config.weights_unreliable_ordered[i as usize],
-            Channel::Reliable(i) => config.weights_reliable[i as usize],
-        };
-        let finish_time = now + Duration::from_secs_f32(packet_size as f32 / weight as f32);
-        self.queue.push(SchedulerEntry {
-            finish_time,
-            channel,
-        });
+    pub fn slots(&self) -> usize {
+        self.weights.len()
     }
 
-    pub fn next(&mut self) -> Option<Channel> {
-        self.queue.pop().map(|entry| entry.channel)
+    pub fn tag(&mut self, slot: usize, size: usize) -> u64 {
+        let finish = self.virtual_time + ((size as u64) << 16) / self.weights[slot] as u64;
+        *self.tags[slot].get_or_insert(finish)
+    }
+
+    /// The slot has nothing to send right now.
+    pub fn clear(&mut self, slot: usize) {
+        self.tags[slot] = None;
+    }
+
+    pub fn served(&mut self, slot: usize) {
+        if let Some(tag) = self.tags[slot].take() {
+            self.virtual_time = tag;
+        }
+    }
+
+    /// No slot is backlogged, so the virtual time can restart (keeps it from overflowing).
+    pub fn reset(&mut self) {
+        self.virtual_time = 0;
     }
 }

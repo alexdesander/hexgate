@@ -310,7 +310,6 @@ impl<R: AuthResult> ServerThreadState<R> {
         let mut batch_size = connection.congestion.allowed_to_send_this_batch();
         while batch_size > 0 {
             match connection.channels.pop(
-                &self.channel_config,
                 &mut connection.congestion,
                 &connection.crypto,
                 &mut self.buf,
@@ -321,17 +320,15 @@ impl<R: AuthResult> ServerThreadState<R> {
                     batch_size = batch_size.saturating_sub(size as u32);
                 }
                 Either::Right(Some(time_till_resend)) => {
-                    let mut new_deadline = now + time_till_resend;
-                    new_deadline = new_deadline.max(
+                    let deadline = (now + time_till_resend).max(
                         connection.last_sent + connection.congestion.downtime_between_batches(),
                     );
                     self.timed_events.push(
                         TimedEventKey::Send(to),
-                        new_deadline,
+                        deadline,
                         TimedEventData::Nothing,
                     );
-
-                    break;
+                    return;
                 }
                 Either::Right(None) => {
                     return;
@@ -606,6 +603,12 @@ impl<R: AuthResult> ServerThreadState<R> {
         connection
             .channels
             .handle_acks(packet, &mut connection.congestion);
+        // Acks can open the window or reveal losses.
+        self.timed_events.push(
+            TimedEventKey::Send(from),
+            connection.last_sent + connection.congestion.downtime_between_batches(),
+            TimedEventData::Nothing,
+        );
     }
 
     fn handle_violation(&mut self, addr: SocketAddr, violation: ProtocolViolation) {
