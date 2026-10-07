@@ -11,19 +11,18 @@ use crate::common::{
 
 use super::{ERROR_INVALID_BUFFER_SIZE, ERROR_INVALID_PACKET_IDENTIFIER};
 
-pub const MAX_ACK_BITFIELD_SIZE_IN_BYTES: usize = 128;
+pub const ACK_BITFIELD_SIZE: usize = 16;
 
 #[derive(Debug)]
-pub struct Acks<'a> {
+pub struct Acks {
     pub channel_id: u8,
     pub packet_id: u64,
     pub lowest_unreceived: u64,
-    pub ack_bitfield: &'a [u8],
+    pub ack_bitfield: [u8; ACK_BITFIELD_SIZE],
 }
 
-impl<'a> Acks<'a> {
+impl Acks {
     pub fn serialize(&self, crypto: &Crypto, buf: &mut [u8]) -> usize {
-        assert!(self.ack_bitfield.len() <= MAX_ACK_BITFIELD_SIZE_IN_BYTES);
         buf[0] = PacketIdentifier::Acks as u8;
         buf[1] = self.channel_id;
         let packet_id_size = self.packet_id.encode_var(&mut buf[2..]);
@@ -32,37 +31,37 @@ impl<'a> Acks<'a> {
             + self
                 .lowest_unreceived
                 .encode_var(&mut buf[2 + packet_id_size..]);
-        buf[offset..offset + self.ack_bitfield.len()].copy_from_slice(self.ack_bitfield);
-        let hash = crypto.hash_out(&buf[..offset + self.ack_bitfield.len()]);
-        buf[offset + self.ack_bitfield.len()..offset + self.ack_bitfield.len() + 8]
-            .copy_from_slice(&hash.to_le_bytes());
-        offset + self.ack_bitfield.len() + 8
+        let end = offset + ACK_BITFIELD_SIZE;
+        buf[offset..end].copy_from_slice(&self.ack_bitfield);
+        let hash = crypto.hash_out(&buf[..end]);
+        buf[end..end + 8].copy_from_slice(&hash.to_le_bytes());
+        end + 8
     }
 
-    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(crypto: &Crypto, buf: &[u8]) -> Result<Self, &'static str> {
         if buf.len() < 12 {
             return Err(ERROR_INVALID_BUFFER_SIZE);
         }
         if buf[0] != PacketIdentifier::Acks as u8 {
             return Err(ERROR_INVALID_PACKET_IDENTIFIER);
         }
-        let hash = crypto.hash_in(&buf[..buf.len() - 8]).to_le_bytes();
-        if hash != buf[buf.len() - 8..buf.len()] {
+        let (data, hash) = buf.split_at(buf.len() - 8);
+        if crypto.hash_in(data).to_le_bytes() != hash {
             return Err(ERROR_INVALID_TAG);
         }
-        let channel_id = buf[1];
-        let Some((packet_id, packet_id_size)) = u64::decode_var(&buf[2..]) else {
+        let channel_id = data[1];
+        let Some((packet_id, packet_id_size)) = u64::decode_var(&data[2..]) else {
             return Err(ERROR_MALFORMED_PACKET);
         };
         let Some((lowest_unreceived, lowest_unreceived_size)) =
-            u64::decode_var(&buf[2 + packet_id_size..])
+            u64::decode_var(&data[2 + packet_id_size..])
         else {
             return Err(ERROR_MALFORMED_PACKET);
         };
-        let ack_bitfield = &buf[2 + packet_id_size + lowest_unreceived_size..buf.len() - 8];
-        if ack_bitfield.len() > MAX_ACK_BITFIELD_SIZE_IN_BYTES {
+        let Ok(ack_bitfield) = data[2 + packet_id_size + lowest_unreceived_size..].try_into()
+        else {
             return Err(ERROR_INVALID_BUFFER_SIZE);
-        }
+        };
         Ok(Acks {
             channel_id,
             packet_id,
@@ -79,7 +78,7 @@ mod tests {
 
     use crate::common::{crypto::Crypto, Cipher};
 
-    use super::Acks;
+    use super::{Acks, ACK_BITFIELD_SIZE};
 
     #[test]
     fn test_acks() {
@@ -92,12 +91,10 @@ mod tests {
         let crypto_client = Crypto::new(shared_secret_1, [44u8; 32], false, Cipher::AES256GCM);
 
         let mut buf = [0u8; 1200];
-        let mut ack_bitfield = [0u8; 128];
         for packet_id in 0..4444 {
             let channel_id: u8 = rng.gen();
             let lowest_unreceived: u64 = rng.gen();
-            let ack_bitfield = &mut ack_bitfield[..rng.gen_range(0..129)];
-            ack_bitfield.fill(rng.gen());
+            let ack_bitfield: [u8; ACK_BITFIELD_SIZE] = rng.gen();
             let acks = Acks {
                 channel_id,
                 packet_id,

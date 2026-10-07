@@ -16,7 +16,10 @@ use either::Either;
 use crate::common::{
     congestion::CongestionController,
     crypto::Crypto,
-    packets::{acks::Acks, reliable_payload::ReliablePayloadOwned},
+    packets::{
+        acks::{Acks, ACK_BITFIELD_SIZE},
+        reliable_payload::ReliablePayloadOwned,
+    },
 };
 
 mod assembler;
@@ -58,7 +61,7 @@ impl Ord for InFlight {
 #[derive(Debug)]
 struct AckData {
     pub lowest_unreceived: u64,
-    pub bitfield: BitArray<[u8; 16], Lsb0>,
+    pub bitfield: BitArray<[u8; ACK_BITFIELD_SIZE], Lsb0>,
 }
 
 impl AckData {
@@ -247,16 +250,14 @@ impl ReliableChannel {
             channel_id: self.channel_id,
             packet_id: self.acks_next - 1,
             lowest_unreceived: self.ack_data.lowest_unreceived,
-            ack_bitfield: self.ack_data.bitfield.as_raw_slice(),
+            ack_bitfield: self.ack_data.bitfield.into_inner(),
         }
     }
 
     pub fn handle_acks(&mut self, acks: Acks) {
-        let mut bitfield = [0u8; 16];
-        bitfield.copy_from_slice(acks.ack_bitfield);
         let ack_data = AckData {
             lowest_unreceived: acks.lowest_unreceived,
-            bitfield: BitArray::new(bitfield),
+            bitfield: BitArray::new(acks.ack_bitfield),
         };
         self.lowest_unreceived_remote = self
             .lowest_unreceived_remote
