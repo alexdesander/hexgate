@@ -4,22 +4,31 @@
 
 use std::io;
 
-use crossbeam::channel::{bounded, Receiver, Sender, TryRecvError};
+use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 
 use super::error::RecvError;
 
+/// The network thread never blocks on the app: connection events are always queued, received
+/// messages only while fewer than `max_events` events are queued (see `has_room`).
 pub(crate) fn channel<E>(max_events: usize) -> (EventSender<E>, EventReceiver<E>) {
-    let (tx, rx) = bounded(max_events);
-    (EventSender { tx }, EventReceiver { rx })
+    let (tx, rx) = unbounded();
+    (EventSender { tx, max_events }, EventReceiver { rx })
 }
 
 pub(crate) struct EventSender<E> {
     tx: Sender<Result<E, io::Error>>,
+    max_events: usize,
 }
 
 impl<E> EventSender<E> {
     pub fn send(&self, event: E) {
         let _ = self.tx.send(Ok(event));
+    }
+
+    /// When false, incoming payload packets are dropped: unreliable messages are lost, reliable
+    /// packets stay unacknowledged and are retransmitted by the peer.
+    pub fn has_room(&self) -> bool {
+        self.tx.len() < self.max_events
     }
 
     /// Reports the fatal error that stopped the network thread.

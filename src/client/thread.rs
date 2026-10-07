@@ -327,6 +327,9 @@ impl ClientThreadState {
     }
 
     fn handle_packet_unreliable_payload(&mut self, size: usize) -> bool {
+        if !self.event_tx.has_room() {
+            return false;
+        }
         let Ok(packet) = UnreliablePayload::deserialize(&self.crypto, &mut self.buf[0..size])
         else {
             return false;
@@ -339,6 +342,9 @@ impl ClientThreadState {
     }
 
     fn handle_packet_reliable_payload(&mut self, size: usize) -> bool {
+        if !self.event_tx.has_room() {
+            return false;
+        }
         let Ok(packet) = ReliablePayload::deserialize(&self.crypto, &mut self.buf[..size]) else {
             return false;
         };

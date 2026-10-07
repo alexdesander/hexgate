@@ -129,7 +129,11 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         auth_salt: [u8; 16],
         #[builder(default = Duration::from_secs(10))] timeout_dur: Duration,
         #[builder(default = Duration::from_millis(500))] latency_discovery_interval: Duration,
-        #[builder(default = 1024)] max_events: usize,
+        /// Limit for queued, undrained events. While reached, received unreliable messages are
+        /// dropped and reliable packets are left unacknowledged (the peer resends them later).
+        /// Connection events are always delivered.
+        #[builder(default = 1024)]
+        max_events: usize,
         channel_config: ChannelConfiguration,
         #[builder(default)] congestion_config: CongestionConfiguration,
         /// Maximum size of a message that can be sent.

@@ -483,14 +483,17 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Ok(login_request) = LoginRequest::deserialize(&crypto, &mut self.buf[..size]) else {
             return;
         };
+        let auth_cmd = AuthCmd::Authenticate(from, login_request.auth_data.to_vec());
         let crypto = self.expecting_login_requests.remove(&(from, salt)).unwrap();
+        if self.auth_cmd_tx.try_send(auth_cmd).is_err() {
+            let login_response = LoginResponse::Failure {
+                failure_data: b"Server busy",
+            };
+            let size = login_response.serialize(&crypto, &mut self.buf);
+            self.socket.send_to(from, &self.buf[..size]);
+            return;
+        }
         self.expecting_auth_result.insert(from, crypto);
-        self.auth_cmd_tx
-            .send(AuthCmd::Authenticate(
-                from,
-                login_request.auth_data.to_vec(),
-            ))
-            .unwrap();
     }
 
     fn handle_packet_disconnect(&mut self, size: usize, from: SocketAddr) {
@@ -541,6 +544,9 @@ impl<R: AuthResult> ServerThreadState<R> {
     }
 
     fn handle_packet_unreliable_payload(&mut self, size: usize, from: SocketAddr) {
+        if !self.event_tx.has_room() {
+            return;
+        }
         let Some(connection) = self.connections.get_mut(&from) else {
             return;
         };
@@ -555,6 +561,9 @@ impl<R: AuthResult> ServerThreadState<R> {
     }
 
     fn handle_packet_reliable_payload(&mut self, size: usize, from: SocketAddr) {
+        if !self.event_tx.has_room() {
+            return;
+        }
         let Some(connection) = self.connections.get_mut(&from) else {
             return;
         };

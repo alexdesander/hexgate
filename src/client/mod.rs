@@ -189,6 +189,11 @@ impl Client {
         socket_buffer_size: Option<usize>,
         client_version: ClientVersion,
         #[builder(default = Duration::from_secs(10))] timeout_dur: Duration,
+        /// Limit for queued, undrained events. While reached, received unreliable messages are
+        /// dropped and reliable packets are left unacknowledged (the peer resends them later).
+        /// Connection events are always delivered.
+        #[builder(default = 1024)]
+        max_events: usize,
         channel_config: ChannelConfiguration,
         #[builder(default)] congestion_config: CongestionConfiguration,
         /// Maximum size of a message that can be sent.
@@ -370,7 +375,7 @@ impl Client {
             }
 
             // Handshake done, run thread
-            let (event_tx, event_rx) = events::channel(1024);
+            let (event_tx, event_rx) = events::channel(max_events);
             let (cmd_tx, cmd_rx) = unbounded();
             let poll = Poll::new()?;
             let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
