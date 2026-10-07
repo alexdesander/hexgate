@@ -175,6 +175,8 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         secret_key: [u8; 32],
         auth_salt: [u8; 16],
         #[builder(default = Duration::from_secs(10))] timeout_dur: Duration,
+        /// Further clients are turned away (`ConnectError::ServerFull`). Unlimited by default.
+        max_connections: Option<usize>,
         #[builder(default = Duration::from_millis(500))] latency_discovery_interval: Duration,
         /// Limit for queued, undrained events. While reached, received unreliable messages are
         /// dropped and reliable packets are left unacknowledged (the peer resends them later).
@@ -251,6 +253,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
                 connection_request_max_timestamp_age,
                 disable_timestamp_age_check,
                 timeout_dur,
+                max_connections,
                 max_recv_msg_size,
                 is_checking_for_timeouts: false,
                 latency_discovery_interval,

@@ -28,6 +28,9 @@ pub enum ServerHello {
         salt: [u8; 4],
         allowed_versions: AllowedClientVersions,
     },
+    ServerFull {
+        salt: [u8; 4],
+    },
 }
 
 /// The cookie a client echoes in its ConnectionRequest: a MAC over the echoed salt, timestamp
@@ -78,6 +81,11 @@ impl ServerHello {
                 buf[13..15].copy_from_slice(&allowed_versions.max.minor.to_le_bytes());
                 buf[15..17].copy_from_slice(&allowed_versions.max.patch.to_le_bytes());
                 17
+            }
+            ServerHello::ServerFull { salt } => {
+                buf[0] = PacketIdentifier::ServerHelloServerFull as u8;
+                buf[1..5].copy_from_slice(salt);
+                5
             }
         }
     }
@@ -134,6 +142,15 @@ impl ServerHello {
             return Ok(ServerHello::VersionNotSupported {
                 salt,
                 allowed_versions,
+            });
+        }
+
+        if buf[0] == PacketIdentifier::ServerHelloServerFull as u8 {
+            if buf.len() != 5 {
+                return Err(ERROR_INVALID_BUFFER_SIZE);
+            }
+            return Ok(ServerHello::ServerFull {
+                salt: buf[1..5].try_into().unwrap(),
             });
         }
 

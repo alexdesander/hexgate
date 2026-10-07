@@ -51,6 +51,8 @@ pub enum ConnectError {
     VersionNotSupported(AllowedClientVersions),
     #[error("Server denied login")]
     ServerDeniedLogin(Vec<u8>),
+    #[error("Server is full")]
+    ServerFull,
     #[error("The server's public key does not match the expected key (possible SECURITY IMPLICATIONS!!!)")]
     ServerKeyMismatch { received_key: [u8; 32] },
     #[error("Invalid configuration: {0}")]
@@ -298,6 +300,9 @@ impl Client {
                         allowed_versions,
                     } => (salt == real_salt)
                         .then_some(Err(ConnectError::VersionNotSupported(allowed_versions))),
+                    ServerHello::ServerFull { salt } => {
+                        (salt == real_salt).then_some(Err(ConnectError::ServerFull))
+                    }
                     ServerHello::VersionSupported {
                         salt,
                         timestamp,

@@ -59,6 +59,7 @@ pub enum PacketIdentifier {
     UnreliableOrderedFragmentedPayloadLast = 19,
     Acks = 20,
     ReliablePayloadNoAcks = 21,
+    ServerHelloServerFull = 22,
 }
 
 /// Decodes a `u32` varint, rejecting values above `u32::MAX` and encodings longer than 5 bytes.
@@ -94,6 +95,7 @@ impl TryFrom<u8> for PacketIdentifier {
             19 => Ok(PacketIdentifier::UnreliableOrderedFragmentedPayloadLast),
             20 => Ok(PacketIdentifier::Acks),
             21 => Ok(PacketIdentifier::ReliablePayloadNoAcks),
+            22 => Ok(PacketIdentifier::ServerHelloServerFull),
             _ => Err(ERROR_INVALID_PACKET_IDENTIFIER),
         }
     }

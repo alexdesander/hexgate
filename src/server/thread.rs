@@ -116,6 +116,7 @@ pub struct ServerThreadState<R: AuthResult> {
     pub connection_request_max_timestamp_age: Duration,
     pub disable_timestamp_age_check: bool,
     pub timeout_dur: Duration,
+    pub max_connections: Option<usize>,
     pub max_recv_msg_size: usize,
     pub is_checking_for_timeouts: bool,
     pub latency_discovery_interval: Duration,
@@ -412,6 +413,13 @@ impl<R: AuthResult> ServerThreadState<R> {
         );
     }
 
+    /// A client reconnecting from a connected address replaces its old connection.
+    fn is_full_for(&self, client: SocketAddr) -> bool {
+        self.max_connections
+            .is_some_and(|max| self.connections.len() >= max)
+            && !self.connections.contains_key(&client)
+    }
+
     /// Starts a graceful disconnect: queued messages are flushed for up to `close_linger`.
     fn start_close(&mut self, addr: SocketAddr, reason: Rc<[u8]>) {
         let Some(connection) = self.connections.get_mut(&addr) else {
@@ -463,6 +471,15 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         if self.shutting_down {
+            return;
+        }
+        // The server filled up while authenticating.
+        if self.is_full_for(attempt.0) {
+            let login_response = LoginResponse::Failure {
+                failure_data: b"Server full",
+            };
+            let size = login_response.serialize(&crypto, &mut self.buf);
+            self.answer_login(attempt, size);
             return;
         }
         let from = attempt.0;
@@ -531,6 +548,9 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         let server_hello = match (self.allowed_client_versions)(client_hello.client_version) {
+            Ok(()) if self.is_full_for(from) => ServerHello::ServerFull {
+                salt: client_hello.salt,
+            },
             Ok(()) => {
                 let time_stamp = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
