@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ahash::HashSet;
 use argon2::{Argon2, Params};
 use bon::bon;
 use crossbeam::channel::{unbounded, Sender};
@@ -35,7 +36,7 @@ use crate::common::{
         login_response::LoginResponse,
         server_hello::ServerHello,
     },
-    socket::{net_sym::NetworkSimulator, Socket},
+    socket::{is_transient, net_sym::NetworkSimulator, Socket},
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, ClientVersion, RECV_TOKEN, WAKE_TOKEN,
 };
@@ -61,53 +62,64 @@ pub enum ConnectError {
     ChannelMismatch { client: [u16; 2], server: [u16; 2] },
 }
 
-/// Request server infos from a list of servers.
-/// This will block until duration has elapsed (even if all servers responded already).
-/// This would normally be used to get data to display to the user in a server browser.
-///
-/// This does not handle lost packets, so it is possible that some servers will not respond.
-/// This would easily be fixed by just sending the requests again for servers that did not respond yet.
+/// Requests the info of every server in `server_addrs` and sends each server's answer to
+/// `results` once, e.g. for a server browser. Requests are resent every 500 ms to servers that
+/// have not answered yet. Blocks until all servers answered, `duration` elapsed or `results` was
+/// dropped. `socket` must be blocking, its read timeout is restored before returning.
 pub fn request_infos(
     socket: &UdpSocket,
     duration: Duration,
     server_addrs: &[SocketAddr],
     results: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 ) -> Result<(), io::Error> {
-    // Send info requests
-    let mut buf = [0u8; 257];
-    let request = InfoRequest::new();
-    request.serialize(&mut buf);
+    let read_timeout = socket.read_timeout()?;
+    let result = query_infos(socket, duration, server_addrs, &results);
+    socket.set_read_timeout(read_timeout)?;
+    result
+}
 
-    for addr in server_addrs {
-        socket.send_to(&buf, addr)?;
-    }
-
-    // Wait for responses
-    let start = Instant::now();
-    loop {
-        if start.elapsed() >= duration {
+fn query_infos(
+    socket: &UdpSocket,
+    duration: Duration,
+    server_addrs: &[SocketAddr],
+    results: &mpsc::Sender<(SocketAddr, Vec<u8>)>,
+) -> Result<(), io::Error> {
+    const RESEND_INTERVAL: Duration = Duration::from_millis(500);
+    let mut request = [0u8; 257];
+    let request_size = InfoRequest::new().serialize(&mut request);
+    // One byte more than the largest InfoResponse, so oversized datagrams are rejected.
+    let mut buf = [0u8; 258];
+    let mut pending: HashSet<SocketAddr> = server_addrs.iter().copied().collect();
+    let deadline = Instant::now() + duration;
+    let mut resend_at = Instant::now();
+    while !pending.is_empty() {
+        let now = Instant::now();
+        if now >= deadline {
             break;
         }
-        socket.set_read_timeout(Some(duration.saturating_sub(start.elapsed())))?;
-        let (size, server_addr) = match socket.recv_from(&mut buf) {
-            Ok(x) => x,
-            Err(ref e)
-                if e.kind() == ErrorKind::WouldBlock
-                    || e.kind() == ErrorKind::TimedOut
-                    // Windows shenanigans
-                    || e.kind() == ErrorKind::ConnectionReset =>
-            {
-                continue
+        if now >= resend_at {
+            for addr in &pending {
+                // A server that can't be reached just doesn't answer.
+                let _ = socket.send_to(&request[..request_size], addr);
             }
+            resend_at = now + RESEND_INTERVAL;
+        }
+        let wait = resend_at.min(deadline) - now;
+        socket.set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
+        let (size, from) = match socket.recv_from(&mut buf) {
+            Ok(received) => received,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+            Err(e) if is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
+        if !pending.contains(&from) {
+            continue;
+        }
         let Ok(info_response) = InfoResponse::deserialize(&buf[..size]) else {
             continue;
         };
-        if results
-            .send((server_addr, info_response.data.to_vec()))
-            .is_err()
-        {
+        pending.remove(&from);
+        if results.send((from, info_response.data.to_vec())).is_err() {
             break;
         }
     }

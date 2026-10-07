@@ -142,7 +142,8 @@ fn spawn_simulator(
     Ok(sim_cmd_tx)
 }
 
-fn is_transient(e: &io::Error) -> bool {
+/// Errors caused by a single datagram or an ICMP message, the socket itself still works.
+pub(crate) fn is_transient(e: &io::Error) -> bool {
     // WSAEMSGSIZE: Windows reports oversized datagrams as an error.
     const WSAEMSGSIZE: i32 = 10040;
     matches!(
