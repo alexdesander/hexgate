@@ -102,7 +102,7 @@ mod tests {
                 ack_bitfield,
             };
             let len = acks.serialize(&crypto_server, &mut buf);
-            let acks = Acks::deserialize(&crypto_client, &mut buf[..len]).unwrap();
+            let acks = Acks::deserialize(&crypto_client, &buf[..len]).unwrap();
             assert_eq!(acks.channel_id, channel_id);
             assert_eq!(acks.packet_id, packet_id);
             assert_eq!(acks.lowest_unreceived, lowest_unreceived);

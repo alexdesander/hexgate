@@ -377,7 +377,7 @@ impl ClientThreadState {
     }
 
     fn handle_packet_acks(&mut self, size: usize) -> Result<bool, io::Error> {
-        let Ok(acks) = Acks::deserialize(&self.crypto, &mut self.buf[..size]) else {
+        let Ok(acks) = Acks::deserialize(&self.crypto, &self.buf[..size]) else {
             return Ok(false);
         };
         self.channels.handle_acks(acks);

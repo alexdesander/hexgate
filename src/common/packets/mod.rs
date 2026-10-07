@@ -64,7 +64,7 @@ pub enum PacketIdentifier {
 /// Decodes a `u32` varint, rejecting values above `u32::MAX` and encodings longer than 5 bytes.
 fn decode_var_u32(buf: &[u8]) -> Option<(u32, usize)> {
     let (value, size) = u64::decode_var(buf)?;
-    Some((u32::try_from(value).ok()?, size)).filter(|_| size <= 5)
+    (size <= 5).then_some((u32::try_from(value).ok()?, size))
 }
 
 impl TryFrom<u8> for PacketIdentifier {

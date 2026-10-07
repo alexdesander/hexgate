@@ -644,7 +644,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Some(connection) = self.connections.get_mut(&from) else {
             return Ok(());
         };
-        let Ok(packet) = Acks::deserialize(&connection.crypto, &mut self.buf[..size]) else {
+        let Ok(packet) = Acks::deserialize(&connection.crypto, &self.buf[..size]) else {
             return Ok(());
         };
         connection.channels.handle_acks(packet);
