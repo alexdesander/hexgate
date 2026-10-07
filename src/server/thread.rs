@@ -48,6 +48,16 @@ use super::{
 
 /// Timeouts are checked this many times per timeout duration.
 const TIMEOUT_CHECKS: u32 = 4;
+/// How long handshake state is kept to answer retransmitted requests.
+const HANDSHAKE_STATE_TTL: Duration = Duration::from_secs(8);
+
+/// A ConnectionResponse was sent, the LoginRequest is outstanding.
+pub struct PendingLogin {
+    crypto: Crypto,
+    /// The client's x25519 key and HKDF salt, to recognize a retransmitted request.
+    request: [u8; 64],
+    response: Vec<u8>,
+}
 
 pub enum Cmd<R: AuthResult> {
     SetSimulator(Option<Box<dyn NetworkSimulator>>),
@@ -60,7 +70,8 @@ pub enum Cmd<R: AuthResult> {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub enum TimedEventKey {
-    RemoveExpectingLoginRequest(SocketAddr, [u8; 4]),
+    RemoveExpectingLoginRequest(LoginAttempt),
+    RemoveAnsweredLogin(LoginAttempt),
     CheckForTimeouts,
     DiscoverLatencies,
     Send(SocketAddr),
@@ -97,8 +108,10 @@ pub struct ServerThreadState<R: AuthResult> {
     pub latency_discovery_interval: Duration,
 
     pub auth_cmd_tx: Sender<AuthCmd>,
-    pub expecting_login_requests: HashMap<LoginAttempt, Crypto>,
+    pub expecting_login_requests: HashMap<LoginAttempt, PendingLogin>,
     pub expecting_auth_result: HashMap<LoginAttempt, Crypto>,
+    /// Sent LoginResponses, resent for retransmitted LoginRequests.
+    pub answered_logins: HashMap<LoginAttempt, Vec<u8>>,
     pub connections: HashMap<SocketAddr, Connection>,
 
     pub latency_discoveries_sent: BTreeMap<u32, Instant>,
@@ -195,8 +208,11 @@ impl<R: AuthResult> ServerThreadState<R> {
         {
             let (key, _event) = self.timed_events.pop().unwrap();
             match key {
-                TimedEventKey::RemoveExpectingLoginRequest(socket_addr, salt) => {
-                    self.expecting_login_requests.remove(&(socket_addr, salt));
+                TimedEventKey::RemoveExpectingLoginRequest(attempt) => {
+                    self.expecting_login_requests.remove(&attempt);
+                }
+                TimedEventKey::RemoveAnsweredLogin(attempt) => {
+                    self.answered_logins.remove(&attempt);
                 }
                 TimedEventKey::CheckForTimeouts => {
                     self.handle_event_check_for_timeouts();
@@ -359,9 +375,8 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         let from = attempt.0;
-        let login_response = LoginResponse::Success;
-        let size = login_response.serialize(&crypto, &mut self.buf);
-        self.socket.send_to(from, &self.buf[..size]);
+        let size = LoginResponse::Success.serialize(&crypto, &mut self.buf);
+        self.answer_login(attempt, size);
         let connection = Connection::new(
             crypto,
             &self.channel_config,
@@ -392,12 +407,23 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Some(crypto) = self.expecting_auth_result.remove(&attempt) else {
             return;
         };
-        let from = attempt.0;
         let login_response = LoginResponse::Failure {
             failure_data: &failure_data,
         };
         let size = login_response.serialize(&crypto, &mut self.buf);
-        self.socket.send_to(from, &self.buf[..size]);
+        self.answer_login(attempt, size);
+    }
+
+    /// Sends the LoginResponse in `buf` and keeps it for retransmitted LoginRequests.
+    fn answer_login(&mut self, attempt: LoginAttempt, size: usize) {
+        self.socket.send_to(attempt.0, &self.buf[..size]);
+        self.answered_logins
+            .insert(attempt, self.buf[..size].to_vec());
+        self.timed_events.push(
+            TimedEventKey::RemoveAnsweredLogin(attempt),
+            Instant::now() + HANDSHAKE_STATE_TTL,
+            TimedEventData::Nothing,
+        );
     }
 
     fn handle_packet_info_request(&mut self, size: usize, from: SocketAddr) {
@@ -454,6 +480,15 @@ impl<R: AuthResult> ServerThreadState<R> {
                 return;
             }
         }
+        let attempt = (from, connection_request.salt);
+        let request: [u8; 64] = self.buf[53..117].try_into().unwrap();
+        if let Some(pending) = self.expecting_login_requests.get(&attempt) {
+            // A retransmission must get the same keys, a different request is ignored.
+            if pending.request == request {
+                self.socket.send_to(from, &pending.response);
+            }
+            return;
+        }
         let x25519_secret_key = EphemeralSecret::random_from_rng(&mut thread_rng());
         let x25519_public_key = PublicKey::from(&x25519_secret_key);
         let shared_secret =
@@ -472,11 +507,17 @@ impl<R: AuthResult> ServerThreadState<R> {
         };
         let size = connection_response.serialize(&crypto, &self.signing_key, &mut self.buf);
         self.socket.send_to(from, &self.buf[..size]);
-        self.expecting_login_requests
-            .insert((from, connection_request.salt), crypto);
+        self.expecting_login_requests.insert(
+            attempt,
+            PendingLogin {
+                crypto,
+                request,
+                response: self.buf[..size].to_vec(),
+            },
+        );
         self.timed_events.push(
-            TimedEventKey::RemoveExpectingLoginRequest(from, connection_request.salt),
-            Instant::now() + Duration::from_secs(8),
+            TimedEventKey::RemoveExpectingLoginRequest(attempt),
+            Instant::now() + HANDSHAKE_STATE_TTL,
             TimedEventData::Nothing,
         );
     }
@@ -485,23 +526,33 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Some(salt) = LoginRequest::deserialize_salt(&self.buf[..size]) else {
             return;
         };
-        let Some(crypto) = self.expecting_login_requests.get_mut(&(from, salt)) else {
+        let attempt = (from, salt);
+        if let Some(response) = self.answered_logins.get(&attempt) {
+            self.socket.send_to(from, response);
+            return;
+        }
+        let Some(pending) = self.expecting_login_requests.get(&attempt) else {
             return;
         };
-        let Ok(login_request) = LoginRequest::deserialize(&crypto, &mut self.buf[..size]) else {
+        let Ok(login_request) = LoginRequest::deserialize(&pending.crypto, &mut self.buf[..size])
+        else {
             return;
         };
-        let auth_cmd = AuthCmd::Authenticate((from, salt), login_request.auth_data.to_vec());
-        let crypto = self.expecting_login_requests.remove(&(from, salt)).unwrap();
+        let auth_cmd = AuthCmd::Authenticate(attempt, login_request.auth_data.to_vec());
+        let crypto = self
+            .expecting_login_requests
+            .remove(&attempt)
+            .unwrap()
+            .crypto;
         if self.auth_cmd_tx.try_send(auth_cmd).is_err() {
             let login_response = LoginResponse::Failure {
                 failure_data: b"Server busy",
             };
             let size = login_response.serialize(&crypto, &mut self.buf);
-            self.socket.send_to(from, &self.buf[..size]);
+            self.answer_login(attempt, size);
             return;
         }
-        self.expecting_auth_result.insert((from, salt), crypto);
+        self.expecting_auth_result.insert(attempt, crypto);
     }
 
     fn handle_packet_disconnect(&mut self, size: usize, from: SocketAddr) {

@@ -19,7 +19,7 @@ const NONCE: [u8; 12] = [
 ];
 impl<'a> LoginRequest<'a> {
     pub fn deserialize_salt(buf: &[u8]) -> Option<[u8; 4]> {
-        if buf.len() < 5 {
+        if buf.len() != 1200 {
             return None;
         }
         Some(buf[1..5].try_into().unwrap())

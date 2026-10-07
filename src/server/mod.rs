@@ -222,6 +222,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
                 expecting_login_requests: Default::default(),
                 auth_cmd_tx,
                 expecting_auth_result: Default::default(),
+                answered_logins: Default::default(),
                 connections: Default::default(),
 
                 latency_discoveries_sent: Default::default(),

@@ -39,7 +39,7 @@ impl ConnectionResponse {
     pub fn deserialize(
         buf: &[u8],
         served_ed25519_pub_key: VerifyingKey,
-        client_x25519_key: ReusableSecret,
+        client_x25519_key: &ReusableSecret,
         hkdf_salt: [u8; 32],
         cipher: Cipher,
     ) -> Result<(Self, Crypto), &'static str> {

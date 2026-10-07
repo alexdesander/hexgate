@@ -12,7 +12,7 @@ use std::{
 
 use crossbeam::channel::{Receiver, TryRecvError};
 use either::Either;
-use mio::{Events, Interest, Poll, Waker};
+use mio::{Events, Poll, Waker};
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, Channels},
@@ -86,9 +86,6 @@ impl ClientThreadState {
         );
 
         let mut events = Events::with_capacity(16);
-        self.poll
-            .registry()
-            .register(self.socket.mio_socket(), RECV_TOKEN, Interest::READABLE)?;
 
         'outer: loop {
             if self.handle_all_cmds()? || self.handle_all_events() {
