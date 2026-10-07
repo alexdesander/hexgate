@@ -43,6 +43,9 @@ impl<'a> LoginResponse<'a> {
     }
 
     pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, &'static str> {
+        if buf.is_empty() {
+            return Err(ERROR_INVALID_BUFFER_SIZE);
+        }
         if buf[0] == PacketIdentifier::LoginSuccess as u8 {
             if buf.len() != 17 {
                 return Err(ERROR_INVALID_BUFFER_SIZE);

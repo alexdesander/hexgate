@@ -6,7 +6,10 @@ use integer_encoding::VarInt;
 
 use crate::common::{crypto::Crypto, packets::PacketIdentifier};
 
-use super::{ERROR_INVALID_BUFFER_SIZE, ERROR_MALFORMED_PACKET};
+use super::{
+    decode_var_u32, ERROR_INVALID_BUFFER_SIZE, ERROR_INVALID_PACKET_IDENTIFIER,
+    ERROR_MALFORMED_PACKET,
+};
 
 pub const UNRELIABLE_STANDALONE_PAYLOAD_MAX_PAYLOAD_SIZE: usize = 1178;
 pub const UNRELIABLE_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE: usize = 1173;
@@ -181,18 +184,24 @@ impl<'a> UnreliablePayload<'a> {
     }
 
     pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, &'static str> {
-        match PacketIdentifier::try_from(buf[0])? {
+        let Some(&identifier) = buf.first() else {
+            return Err(ERROR_INVALID_BUFFER_SIZE);
+        };
+        match PacketIdentifier::try_from(identifier)? {
             PacketIdentifier::UnreliableStandalonePayload => {
                 if buf.len() < 18 {
                     return Err(ERROR_INVALID_BUFFER_SIZE);
                 }
-                let Some((message_id, message_id_size)) = u32::decode_var(&buf[1..]) else {
+                let Some((message_id, message_id_size)) = decode_var_u32(&buf[1..]) else {
                     return Err(ERROR_MALFORMED_PACKET);
                 };
+                let len = buf.len();
+                if 1 + message_id_size + 16 > len {
+                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                }
                 let mut nonce = [0u8; 12];
                 nonce[0] = buf[0];
                 nonce[1..1 + message_id_size].copy_from_slice(&buf[1..1 + message_id_size]);
-                let len = buf.len();
                 let tag: [u8; 16] = buf[len - 16..len].try_into().unwrap();
                 if crypto
                     .decrypt(&nonce, &[], &mut buf[1 + message_id_size..len - 16], &tag)
@@ -210,21 +219,24 @@ impl<'a> UnreliablePayload<'a> {
                 if buf.len() < 19 {
                     return Err(ERROR_INVALID_BUFFER_SIZE);
                 }
-                let Some((message_id, message_id_size)) = u32::decode_var(&buf[1..]) else {
+                let Some((message_id, message_id_size)) = decode_var_u32(&buf[1..]) else {
                     return Err(ERROR_MALFORMED_PACKET);
                 };
                 let Some((fragment_id, fragment_id_size)) =
-                    u32::decode_var(&buf[1 + message_id_size..])
+                    decode_var_u32(&buf[1 + message_id_size..])
                 else {
                     return Err(ERROR_MALFORMED_PACKET);
                 };
+                let len = buf.len();
+                if 1 + message_id_size + fragment_id_size + 16 > len {
+                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                }
                 let mut nonce = [0u8; 12];
                 nonce[0] = buf[0];
                 nonce[1..1 + message_id_size].copy_from_slice(&buf[1..1 + message_id_size]);
                 nonce[12 - fragment_id_size..12].copy_from_slice(
                     &buf[1 + message_id_size..1 + message_id_size + fragment_id_size],
                 );
-                let len = buf.len();
                 let tag: [u8; 16] = buf[len - 16..len].try_into().unwrap();
                 if crypto
                     .decrypt(
@@ -249,14 +261,17 @@ impl<'a> UnreliablePayload<'a> {
                     return Err(ERROR_INVALID_BUFFER_SIZE);
                 }
                 let channel_id = buf[1];
-                let Some((message_id, message_id_size)) = u32::decode_var(&buf[2..]) else {
+                let Some((message_id, message_id_size)) = decode_var_u32(&buf[2..]) else {
                     return Err(ERROR_MALFORMED_PACKET);
                 };
+                let len = buf.len();
+                if 2 + message_id_size + 16 > len {
+                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                }
                 let mut nonce = [0u8; 12];
                 nonce[0] = buf[0];
                 nonce[1] = buf[1];
                 nonce[2..2 + message_id_size].copy_from_slice(&buf[2..2 + message_id_size]);
-                let len = buf.len();
                 let tag: [u8; 16] = buf[len - 16..len].try_into().unwrap();
                 if crypto
                     .decrypt(&nonce, &[], &mut buf[2 + message_id_size..len - 16], &tag)
@@ -276,14 +291,18 @@ impl<'a> UnreliablePayload<'a> {
                     return Err(ERROR_INVALID_BUFFER_SIZE);
                 }
                 let channel_id = buf[1];
-                let Some((message_id, message_id_size)) = u32::decode_var(&buf[2..]) else {
+                let Some((message_id, message_id_size)) = decode_var_u32(&buf[2..]) else {
                     return Err(ERROR_MALFORMED_PACKET);
                 };
                 let Some((fragment_id, fragment_id_size)) =
-                    u32::decode_var(&buf[2 + message_id_size..])
+                    decode_var_u32(&buf[2 + message_id_size..])
                 else {
                     return Err(ERROR_MALFORMED_PACKET);
                 };
+                let len = buf.len();
+                if 2 + message_id_size + fragment_id_size + 16 > len {
+                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                }
                 let mut nonce = [0u8; 12];
                 nonce[0] = buf[0];
                 nonce[1] = buf[1];
@@ -291,7 +310,6 @@ impl<'a> UnreliablePayload<'a> {
                 nonce[12 - fragment_id_size..12].copy_from_slice(
                     &buf[2 + message_id_size..2 + message_id_size + fragment_id_size],
                 );
-                let len = buf.len();
                 let tag: [u8; 16] = buf[len - 16..len].try_into().unwrap();
                 if crypto
                     .decrypt(
@@ -313,7 +331,7 @@ impl<'a> UnreliablePayload<'a> {
                     payload: &buf[2 + message_id_size + fragment_id_size..len - 16],
                 })
             }
-            _ => unreachable!(),
+            _ => Err(ERROR_INVALID_PACKET_IDENTIFIER),
         }
     }
 }

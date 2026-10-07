@@ -18,6 +18,8 @@ pub mod reliable_payload;
 pub mod server_hello;
 pub mod unreliable_payload;
 
+use integer_encoding::VarInt;
+
 const MAGIC: &str = "HEXGATE";
 
 const ERROR_INVALID_PROTOCOL_VERSION: &str = "Invalid protocol version";
@@ -57,6 +59,12 @@ pub enum PacketIdentifier {
     UnreliableOrderedFragmentedPayloadLast = 19,
     Acks = 20,
     ReliablePayloadNoAcks = 21,
+}
+
+/// Decodes a `u32` varint, rejecting values above `u32::MAX` and encodings longer than 5 bytes.
+fn decode_var_u32(buf: &[u8]) -> Option<(u32, usize)> {
+    let (value, size) = u64::decode_var(buf)?;
+    Some((u32::try_from(value).ok()?, size)).filter(|_| size <= 5)
 }
 
 impl TryFrom<u8> for PacketIdentifier {

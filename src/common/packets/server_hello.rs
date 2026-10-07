@@ -60,6 +60,9 @@ impl ServerHello {
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<Self, &'static str> {
+        if buf.is_empty() {
+            return Err(ERROR_INVALID_BUFFER_SIZE);
+        }
         if buf[0] == PacketIdentifier::ServerHelloVersionSupported as u8 {
             if buf.len() != 55 {
                 return Err(ERROR_INVALID_BUFFER_SIZE);
