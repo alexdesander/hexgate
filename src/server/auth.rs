@@ -20,8 +20,11 @@ pub trait Authenticator<R: AuthResult>: Send + 'static {
     fn authenticate(&mut self, from: SocketAddr, auth_data: Vec<u8>) -> Result<R, Vec<u8>>;
 }
 
+/// Login attempts are identified by the client address and the handshake salt.
+pub(crate) type LoginAttempt = (SocketAddr, [u8; 4]);
+
 pub(crate) enum AuthCmd {
-    Authenticate(SocketAddr, Vec<u8>),
+    Authenticate(LoginAttempt, Vec<u8>),
 }
 
 pub(crate) struct AuthThreadState<A: Authenticator<R>, R: AuthResult> {
@@ -42,12 +45,12 @@ impl<R: AuthResult, A: Authenticator<R>> Drop for AuthThreadState<A, R> {
 pub(crate) fn auth_thread<R: AuthResult, A: Authenticator<R>>(mut state: AuthThreadState<A, R>) {
     while let Ok(cmd) = state.cmds.recv() {
         match cmd {
-            AuthCmd::Authenticate(from, auth_data) => {
-                match state.authenticator.authenticate(from, auth_data) {
+            AuthCmd::Authenticate(attempt, auth_data) => {
+                match state.authenticator.authenticate(attempt.0, auth_data) {
                     Ok(auth_result) => {
                         if state
                             .main_cmds
-                            .send(Cmd::AuthSuccess(from, auth_result))
+                            .send(Cmd::AuthSuccess(attempt, auth_result))
                             .is_err()
                         {
                             break;
@@ -55,7 +58,7 @@ pub(crate) fn auth_thread<R: AuthResult, A: Authenticator<R>>(mut state: AuthThr
                     }
                     Err(mut e) => {
                         e.truncate(MAX_FAILURE_DATA_SIZE);
-                        if state.main_cmds.send(Cmd::AuthFailed(from, e)).is_err() {
+                        if state.main_cmds.send(Cmd::AuthFailed(attempt, e)).is_err() {
                             break;
                         }
                     }

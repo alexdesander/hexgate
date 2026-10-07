@@ -41,7 +41,7 @@ use crate::common::{
 };
 
 use super::{
-    auth::{AuthCmd, AuthResult},
+    auth::{AuthCmd, AuthResult, LoginAttempt},
     connection::Connection,
     Event, Socket,
 };
@@ -53,8 +53,8 @@ pub enum Cmd<R: AuthResult> {
     SetSimulator(Option<Box<dyn NetworkSimulator>>),
     Shutdown(Vec<u8>),
     SetInfo(Vec<u8>),
-    AuthSuccess(SocketAddr, R),
-    AuthFailed(SocketAddr, Vec<u8>),
+    AuthSuccess(LoginAttempt, R),
+    AuthFailed(LoginAttempt, Vec<u8>),
     Send(SocketAddr, Channel, Vec<u8>),
 }
 
@@ -97,8 +97,8 @@ pub struct ServerThreadState<R: AuthResult> {
     pub latency_discovery_interval: Duration,
 
     pub auth_cmd_tx: Sender<AuthCmd>,
-    pub expecting_login_requests: HashMap<(SocketAddr, [u8; 4]), Crypto>,
-    pub expecting_auth_result: HashMap<SocketAddr, Crypto>,
+    pub expecting_login_requests: HashMap<LoginAttempt, Crypto>,
+    pub expecting_auth_result: HashMap<LoginAttempt, Crypto>,
     pub connections: HashMap<SocketAddr, Connection>,
 
     pub latency_discoveries_sent: BTreeMap<u32, Instant>,
@@ -157,11 +157,11 @@ impl<R: AuthResult> ServerThreadState<R> {
                 Cmd::SetInfo(info) => {
                     self.info = info;
                 }
-                Cmd::AuthSuccess(socket_addr, auth_result) => {
-                    self.handle_cmd_auth_success(socket_addr, auth_result);
+                Cmd::AuthSuccess(attempt, auth_result) => {
+                    self.handle_cmd_auth_success(attempt, auth_result);
                 }
-                Cmd::AuthFailed(socket_addr, vec) => {
-                    self.handle_cmd_auth_failure(socket_addr, vec);
+                Cmd::AuthFailed(attempt, vec) => {
+                    self.handle_cmd_auth_failure(attempt, vec);
                 }
                 Cmd::Send(socket_addr, channel, message) => {
                     let Some(connection) = self.connections.get_mut(&socket_addr) else {
@@ -354,10 +354,11 @@ impl<R: AuthResult> ServerThreadState<R> {
         self.socket.send_to(to, &self.buf[..size]);
     }
 
-    fn handle_cmd_auth_success(&mut self, from: SocketAddr, auth_result: R) {
-        let Some(crypto) = self.expecting_auth_result.remove(&from) else {
+    fn handle_cmd_auth_success(&mut self, attempt: LoginAttempt, auth_result: R) {
+        let Some(crypto) = self.expecting_auth_result.remove(&attempt) else {
             return;
         };
+        let from = attempt.0;
         let login_response = LoginResponse::Success;
         let size = login_response.serialize(&crypto, &mut self.buf);
         self.socket.send_to(from, &self.buf[..size]);
@@ -387,10 +388,11 @@ impl<R: AuthResult> ServerThreadState<R> {
         );
     }
 
-    fn handle_cmd_auth_failure(&mut self, from: SocketAddr, failure_data: Vec<u8>) {
-        let Some(crypto) = self.expecting_auth_result.remove(&from) else {
+    fn handle_cmd_auth_failure(&mut self, attempt: LoginAttempt, failure_data: Vec<u8>) {
+        let Some(crypto) = self.expecting_auth_result.remove(&attempt) else {
             return;
         };
+        let from = attempt.0;
         let login_response = LoginResponse::Failure {
             failure_data: &failure_data,
         };
@@ -489,7 +491,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Ok(login_request) = LoginRequest::deserialize(&crypto, &mut self.buf[..size]) else {
             return;
         };
-        let auth_cmd = AuthCmd::Authenticate(from, login_request.auth_data.to_vec());
+        let auth_cmd = AuthCmd::Authenticate((from, salt), login_request.auth_data.to_vec());
         let crypto = self.expecting_login_requests.remove(&(from, salt)).unwrap();
         if self.auth_cmd_tx.try_send(auth_cmd).is_err() {
             let login_response = LoginResponse::Failure {
@@ -499,7 +501,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             self.socket.send_to(from, &self.buf[..size]);
             return;
         }
-        self.expecting_auth_result.insert(from, crypto);
+        self.expecting_auth_result.insert((from, salt), crypto);
     }
 
     fn handle_packet_disconnect(&mut self, size: usize, from: SocketAddr) {
