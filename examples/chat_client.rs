@@ -8,12 +8,13 @@ use std::{
 };
 
 use hexgate::{
-    client::{Client, Event},
+    client::{Client, Event, ServerKey},
     common::{
         channel::{scheduler::ChannelConfiguration, Channel},
         socket::net_sym::NetworkSimulator,
         ClientVersion,
     },
+    server,
 };
 use rand::{thread_rng, Rng};
 use text_io::read;
@@ -35,6 +36,8 @@ fn main() -> anyhow::Result<()> {
     let client = Client::prepare()
         .client_version(ClientVersion::ZERO)
         .server_socket_addr(SERVER_ADDR)
+        // The chat server example runs with the secret key [0; 32].
+        .server_key(ServerKey::Pinned(server::public_key(&[0u8; 32])))
         .auth_data(USERNAME.as_bytes().to_vec())
         .hash_auth_data(false)
         .channel_config(ChannelConfiguration {

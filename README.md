@@ -74,11 +74,14 @@ match server.next() {
 }
 ```
 
-Creating a hexgate client and connecting to a server:
+Creating a hexgate client and connecting to a server. The client pins the server's public key
+(`hexgate::server::public_key(&secret_key)`, shipped with the game), so nobody else can pose as the
+server. `ServerKey::Unverified` turns this off explicitly.
 ```rust
 let client = Client::prepare()
     .client_version(ClientVersion::ZERO)
     .server_socket_addr(SERVER_ADDR)
+    .server_key(ServerKey::Pinned(SERVER_PUBLIC_KEY))
     .auth_data(username)
     .hash_auth_data(false)
     .channel_config(ChannelConfiguration {

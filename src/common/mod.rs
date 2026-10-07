@@ -36,6 +36,14 @@ impl TryFrom<u8> for Cipher {
     }
 }
 
+/// A server key as groups of four hex digits, for users comparing it against a published one.
+pub fn fingerprint(key: &[u8; 32]) -> String {
+    key.chunks(2)
+        .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ClientVersion {
     pub major: u16,

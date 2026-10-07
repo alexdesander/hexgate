@@ -7,16 +7,17 @@
 use std::{net::SocketAddr, ops::Range, time::Duration};
 
 use hexgate::{
-    client::Client,
+    client::{Client, ServerKey},
     common::{
         channel::scheduler::ChannelConfiguration, socket::net_sym::NetworkSimulator, ClientVersion,
     },
-    server::{auth::Authenticator, Server},
+    server::{self, auth::Authenticator, Server},
 };
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+pub const SECRET_KEY: [u8; 32] = [7; 32];
 
 pub struct AcceptAll;
 
@@ -87,7 +88,7 @@ pub fn server(timeout_dur: Duration) -> TestServer {
         .bind_addr("127.0.0.1:0".parse().unwrap())
         .info(b"test server".to_vec())
         .allowed_client_versions(|_| Ok(()))
-        .secret_key([0u8; 32])
+        .secret_key(SECRET_KEY)
         .auth_salt([0u8; 16])
         .authenticator(AcceptAll)
         .channel_config(channel_config())
@@ -100,6 +101,7 @@ pub fn client(server_addr: SocketAddr, timeout_dur: Duration) -> Client {
     Client::prepare()
         .client_version(ClientVersion::ZERO)
         .server_socket_addr(server_addr)
+        .server_key(ServerKey::Pinned(server::public_key(&SECRET_KEY)))
         .auth_data(vec![])
         .hash_auth_data(false)
         .channel_config(channel_config())

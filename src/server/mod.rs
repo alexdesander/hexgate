@@ -36,6 +36,13 @@ mod thread;
 const CONNECTION_REQUESTS_PER_SECOND: f64 = 10.0;
 const CONNECTION_REQUEST_BURST: f64 = 20.0;
 
+/// The public key clients pin (`client::ServerKey::Pinned`) for a server's `secret_key`.
+pub fn public_key(secret_key: &[u8; 32]) -> [u8; 32] {
+    SigningKey::from_bytes(secret_key)
+        .verifying_key()
+        .to_bytes()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
     #[error("io error: {0}")]

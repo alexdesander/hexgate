@@ -126,6 +126,19 @@ fn query_infos(
     Ok(())
 }
 
+/// How the client verifies the server's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerKey {
+    /// The server's ed25519 public key (see `server::public_key`), shipped with the client or
+    /// stored on first use. Connecting to a server with any other key fails with
+    /// `ConnectError::ServerKeyMismatch`.
+    Pinned([u8; 32]),
+    /// Accepts any server. Anyone on the network path can impersonate it and read `auth_data`.
+    /// For trust on first use, connect like this once, store `Client::get_server_key()` and pin
+    /// it from then on.
+    Unverified,
+}
+
 pub enum Event {
     Disconnected(Vec<u8>),
     TimedOut,
@@ -211,7 +224,7 @@ impl Client {
         /// Defaults to any address of the server's IP version, with a random port.
         bind_addr: Option<SocketAddr>,
         server_socket_addr: SocketAddr,
-        expected_server_key: Option<[u8; 32]>,
+        server_key: ServerKey,
         /// At most 1177 bytes unless hashed.
         auth_data: Vec<u8>,
         hash_auth_data: bool,
@@ -307,8 +320,8 @@ impl Client {
                 continue 'outer;
             };
 
-            if let Some(expected_server_key) = expected_server_key {
-                if server_ed25519_pubkey.to_bytes() != expected_server_key {
+            if let ServerKey::Pinned(key) = server_key {
+                if server_ed25519_pubkey.to_bytes() != key {
                     return Err(ConnectError::ServerKeyMismatch {
                         received_key: server_ed25519_pubkey.to_bytes(),
                     });
