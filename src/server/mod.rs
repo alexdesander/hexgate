@@ -110,6 +110,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
 impl<R: AuthResult, A: Authenticator<R>> Drop for ServerInner<R, A> {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send(Cmd::Shutdown(vec![]));
+        let _ = self.waker.wake();
         let _ = self.thread.take().unwrap().join();
         let _ = self.auth_thread.take().unwrap().join();
     }
