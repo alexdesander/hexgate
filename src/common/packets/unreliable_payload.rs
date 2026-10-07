@@ -398,7 +398,7 @@ mod tests {
             for fragment_id in 0..last_fragment_id {
                 let payload_size = rng.gen_range(0..UNRELIABLE_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE);
                 rng.fill(&mut payload[..payload_size]);
-                let is_last = fragment_id == last_fragment_id;
+                let is_last = fragment_id == last_fragment_id - 1;
                 let packet = UnreliablePayload::Fragmented {
                     message_id,
                     fragment_id,
