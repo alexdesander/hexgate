@@ -46,6 +46,9 @@ use super::{
     Event, Socket,
 };
 
+/// Timeouts are checked this many times per timeout duration.
+const TIMEOUT_CHECKS: u32 = 4;
+
 pub enum Cmd<R: AuthResult> {
     SetSimulator(Option<Box<dyn NetworkSimulator>>),
     Shutdown(Vec<u8>),
@@ -265,7 +268,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         if self.connections.len() > 0 {
             self.timed_events.push(
                 TimedEventKey::CheckForTimeouts,
-                Instant::now() + self.timeout_dur + Duration::from_secs(1),
+                Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
                 TimedEventData::Nothing,
             );
         } else {
@@ -379,7 +382,7 @@ impl<R: AuthResult> ServerThreadState<R> {
 
         self.timed_events.push(
             TimedEventKey::CheckForTimeouts,
-            Instant::now() + self.timeout_dur + Duration::from_secs(1),
+            Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
             TimedEventData::Nothing,
         );
     }
@@ -557,6 +560,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         else {
             return;
         };
+        connection.last_received = Instant::now();
         match connection.channels.handle_unreliable(packet) {
             Ok(Some(message)) => self.event_tx.send(Event::Received(from, message)),
             Ok(None) => {}
@@ -575,6 +579,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         else {
             return;
         };
+        connection.last_received = Instant::now();
         if packet.channel_id() as usize >= self.channel_config.weights_reliable.len() {
             return;
         }
@@ -600,6 +605,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Ok(packet) = Acks::deserialize(&connection.crypto, &self.buf[..size]) else {
             return;
         };
+        connection.last_received = Instant::now();
         connection
             .channels
             .handle_acks(packet, &mut connection.congestion);

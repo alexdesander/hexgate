@@ -33,6 +33,9 @@ use crate::common::{
 
 use super::{Event, Socket};
 
+/// Timeouts are checked this many times per timeout duration.
+const TIMEOUT_CHECKS: u32 = 4;
+
 pub enum Cmd {
     SetSimulator(Option<Box<dyn NetworkSimulator>>),
     Disconnect(Vec<u8>),
@@ -78,7 +81,7 @@ impl ClientThreadState {
     pub fn run(&mut self) -> Result<(), io::Error> {
         self.timed_events.push(
             TimedEventKey::CheckForTimeout,
-            Instant::now() + self.timeout_dur + Duration::from_secs(1),
+            Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
             TimedEventData::Nothing,
         );
 
@@ -168,7 +171,7 @@ impl ClientThreadState {
                     } else {
                         self.timed_events.push(
                             TimedEventKey::CheckForTimeout,
-                            Instant::now() + self.timeout_dur + Duration::from_secs(1),
+                            Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
                             TimedEventData::Nothing,
                         );
                     }
@@ -328,6 +331,7 @@ impl ClientThreadState {
         else {
             return false;
         };
+        self.last_received = Instant::now();
         match self.channels.handle_unreliable(packet) {
             Ok(Some(message)) => self.event_tx.send(Event::Received(message)),
             Ok(None) => {}
@@ -343,6 +347,7 @@ impl ClientThreadState {
         let Ok(packet) = ReliablePayload::deserialize(&self.crypto, &mut self.buf[..size]) else {
             return false;
         };
+        self.last_received = Instant::now();
         if packet.channel_id() as usize >= self.channel_config.weights_reliable.len() {
             return false;
         }
@@ -366,6 +371,7 @@ impl ClientThreadState {
         let Ok(acks) = Acks::deserialize(&self.crypto, &self.buf[..size]) else {
             return false;
         };
+        self.last_received = Instant::now();
         self.channels.handle_acks(acks, &mut self.congestion);
         // Acks can open the window or reveal losses.
         self.timed_events.push(
