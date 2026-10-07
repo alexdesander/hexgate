@@ -26,13 +26,22 @@ use crate::common::{
     error::ProtocolViolation,
     events::EventSender,
     packets::{
-        acks::Acks, client_hello::ClientHello, connection_request::ConnectionRequest,
-        connection_response::ConnectionResponse, disconnect::Disconnect, info_request::InfoRequest,
-        info_response::InfoResponse, latency_discovery::LatencyDiscovery,
+        acks::Acks,
+        client_hello::ClientHello,
+        connection_request::ConnectionRequest,
+        connection_response::ConnectionResponse,
+        disconnect::{self, Disconnect},
+        info_request::InfoRequest,
+        info_response::InfoResponse,
+        latency_discovery::LatencyDiscovery,
         latency_discovery_response::LatencyDiscoveryResponse,
-        latency_discovery_response_2::LatencyDiscoveryResponse2, login_request::LoginRequest,
-        login_response::LoginResponse, reliable_payload::ReliablePayload,
-        server_hello::ServerHello, unreliable_payload::UnreliablePayload, PacketIdentifier,
+        latency_discovery_response_2::LatencyDiscoveryResponse2,
+        login_request::LoginRequest,
+        login_response::LoginResponse,
+        reliable_payload::ReliablePayload,
+        server_hello::ServerHello,
+        unreliable_payload::UnreliablePayload,
+        PacketIdentifier,
     },
     socket::net_sym::NetworkSimulator,
     timed_event_queue::TimedEventQueue,
@@ -75,6 +84,7 @@ pub enum TimedEventKey {
     DiscoverLatencies,
     Send(SocketAddr),
     SendAcks(SocketAddr, u8),
+    CloseDeadline(SocketAddr),
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -118,6 +128,9 @@ pub struct ServerThreadState<R: AuthResult> {
 
     pub channel_config: ChannelConfiguration,
     pub congestion_config: CongestionConfiguration,
+
+    pub close_linger: Duration,
+    pub shutting_down: bool,
 }
 
 impl<R: AuthResult> ServerThreadState<R> {
@@ -132,6 +145,9 @@ impl<R: AuthResult> ServerThreadState<R> {
                 break;
             }
             self.handle_all_events();
+            if self.shutting_down && self.connections.is_empty() {
+                break;
+            }
             let max_poll_time = self.timed_events.next().map(|deadline| {
                 deadline
                     .saturating_duration_since(Instant::now())
@@ -159,12 +175,12 @@ impl<R: AuthResult> ServerThreadState<R> {
 
             match cmd {
                 Cmd::Shutdown(reason) => {
-                    let disconnect = Disconnect { data: &reason };
-                    for (addr, connection) in self.connections.drain() {
-                        let size = disconnect.serialize(&connection.crypto, &mut self.buf);
-                        self.socket.send_to(addr, &self.buf[..size]);
+                    self.shutting_down = true;
+                    let reason: Rc<[u8]> = reason.into();
+                    let addrs: Vec<SocketAddr> = self.connections.keys().copied().collect();
+                    for addr in addrs {
+                        self.start_close(addr, reason.clone());
                     }
-                    return Ok(true);
                 }
                 Cmd::SetInfo(info) => {
                     self.info = info;
@@ -176,7 +192,11 @@ impl<R: AuthResult> ServerThreadState<R> {
                     self.handle_cmd_auth_failure(attempt, vec);
                 }
                 Cmd::Send(socket_addr, channel, message) => {
-                    let Some(connection) = self.connections.get_mut(&socket_addr) else {
+                    let Some(connection) = self
+                        .connections
+                        .get_mut(&socket_addr)
+                        .filter(|connection| connection.closing.is_none())
+                    else {
                         continue;
                     };
                     connection.channels.push(channel, Rc::new(message));
@@ -225,6 +245,9 @@ impl<R: AuthResult> ServerThreadState<R> {
                 TimedEventKey::SendAcks(socket_addr, channel_id) => {
                     self.handle_event_send_acks(socket_addr, channel_id);
                 }
+                TimedEventKey::CloseDeadline(socket_addr) => {
+                    self.finish_close(socket_addr);
+                }
             }
         }
     }
@@ -238,6 +261,13 @@ impl<R: AuthResult> ServerThreadState<R> {
                 continue;
             };
             match packet_identifier {
+                PacketIdentifier::ClientHello
+                | PacketIdentifier::ConnectionRequest
+                | PacketIdentifier::LoginRequest
+                    if self.shutting_down =>
+                {
+                    continue
+                }
                 PacketIdentifier::InfoRequest => self.handle_packet_info_request(size, from),
                 PacketIdentifier::ClientHello => self.handle_packet_client_hello(size, from),
                 PacketIdentifier::ConnectionRequest => {
@@ -346,7 +376,12 @@ impl<R: AuthResult> ServerThreadState<R> {
                     );
                     return;
                 }
-                Pop::Idle => return,
+                Pop::Idle => {
+                    if connection.closing.is_some() {
+                        self.finish_close(to);
+                    }
+                    return;
+                }
                 Pop::Exhausted => {
                     let disconnect = Disconnect {
                         data: IDS_EXHAUSTED,
@@ -367,6 +402,43 @@ impl<R: AuthResult> ServerThreadState<R> {
         );
     }
 
+    /// Starts a graceful disconnect: queued messages are flushed for up to `close_linger`.
+    fn start_close(&mut self, addr: SocketAddr, reason: Rc<[u8]>) {
+        let Some(connection) = self.connections.get_mut(&addr) else {
+            return;
+        };
+        if connection.closing.is_some() {
+            return;
+        }
+        connection.closing = Some(reason);
+        let now = Instant::now();
+        self.timed_events.push(
+            TimedEventKey::CloseDeadline(addr),
+            now + self.close_linger,
+            TimedEventData::Nothing,
+        );
+        self.timed_events
+            .push(TimedEventKey::Send(addr), now, TimedEventData::Nothing);
+    }
+
+    /// Ends a graceful disconnect: everything was sent and acked, or the linger ran out.
+    fn finish_close(&mut self, addr: SocketAddr) {
+        let Some(connection) = self
+            .connections
+            .remove(&addr)
+            .filter(|connection| connection.closing.is_some())
+        else {
+            return;
+        };
+        self.timed_events
+            .remove(&TimedEventKey::CloseDeadline(addr));
+        let reason = connection.closing.as_deref().unwrap_or_default();
+        let size = Disconnect { data: reason }.serialize(&connection.crypto, &mut self.buf);
+        for _ in 0..disconnect::REPEATS {
+            self.socket.send_to(addr, &self.buf[..size]);
+        }
+    }
+
     fn handle_event_send_acks(&mut self, to: SocketAddr, channel_id: u8) {
         let Some(connection) = self.connections.get_mut(&to) else {
             return;
@@ -380,6 +452,9 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Some(crypto) = self.expecting_auth_result.remove(&attempt) else {
             return;
         };
+        if self.shutting_down {
+            return;
+        }
         let from = attempt.0;
         let size = LoginResponse::Success.serialize(&crypto, &mut self.buf);
         self.answer_login(attempt, size);
@@ -612,7 +687,11 @@ impl<R: AuthResult> ServerThreadState<R> {
         if !self.event_tx.has_room() {
             return;
         }
-        let Some(connection) = self.connections.get_mut(&from) else {
+        let Some(connection) = self
+            .connections
+            .get_mut(&from)
+            .filter(|connection| connection.closing.is_none())
+        else {
             return;
         };
         let Ok(packet) = UnreliablePayload::deserialize(&connection.crypto, &mut self.buf[0..size])
@@ -631,7 +710,11 @@ impl<R: AuthResult> ServerThreadState<R> {
         if !self.event_tx.has_room() {
             return;
         }
-        let Some(connection) = self.connections.get_mut(&from) else {
+        let Some(connection) = self
+            .connections
+            .get_mut(&from)
+            .filter(|connection| connection.closing.is_none())
+        else {
             return;
         };
         let Ok(packet) = ReliablePayload::deserialize(&connection.crypto, &mut self.buf[..size])

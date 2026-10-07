@@ -106,6 +106,8 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         Ok(())
     }
 
+    /// Closes every connection once its queued messages were sent and acknowledged, or after
+    /// `close_linger`, then stops. Later sends are dropped and no new clients are accepted.
     /// The reason is sent to every client, at most 1183 bytes.
     pub fn shutdown(&self, reason: Vec<u8>) -> Result<(), TooLarge> {
         TooLarge::check(reason.len(), disconnect::MAX_DATA_SIZE)?;
@@ -159,6 +161,10 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         /// and is disconnected.
         #[builder(default = 1048576)]
         max_recv_msg_size: usize,
+        /// How long `shutdown()` (and dropping the server) waits for queued messages to be sent
+        /// and acknowledged before the connections are closed.
+        #[builder(default = Duration::from_secs(1))]
+        close_linger: Duration,
         #[builder(default = false)] disable_timestamp_age_check: bool,
         #[builder(default = Duration::from_secs(10))]
         connection_request_max_timestamp_age: Duration,
@@ -231,6 +237,9 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
 
                 channel_config,
                 congestion_config,
+
+                close_linger,
+                shutting_down: false,
             };
             if let Err(e) = state.run() {
                 state.event_tx.fail(e);

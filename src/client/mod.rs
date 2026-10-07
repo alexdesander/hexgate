@@ -146,7 +146,8 @@ impl Client {
         Ok(())
     }
 
-    /// The data is sent to the server, at most 1183 bytes.
+    /// Closes the connection once queued messages were sent and acknowledged, or after
+    /// `close_linger`. Later sends are dropped. The data is sent to the server, at most 1183 bytes.
     pub fn disconnect(&self, data: Vec<u8>) -> Result<(), TooLarge> {
         TooLarge::check(data.len(), disconnect::MAX_DATA_SIZE)?;
         let _ = self.inner.cmd_tx.send(Cmd::Disconnect(data));
@@ -211,6 +212,10 @@ impl Client {
         /// and is disconnected.
         #[builder(default = 1048576)]
         max_recv_msg_size: usize,
+        /// How long `disconnect()` (and dropping the client) waits for queued messages to be
+        /// sent and acknowledged before the connection is closed.
+        #[builder(default = Duration::from_secs(1))]
+        close_linger: Duration,
         #[builder(default = Duration::from_secs(4))] handshake_timeout: Duration,
         #[builder(default = 2)] mut handshake_tries: u8,
     ) -> Result<Self, ConnectError> {
@@ -377,6 +382,9 @@ impl Client {
                     channel_config,
                     congestion: CongestionController::new(congestion_config),
                     last_sent: Instant::now(),
+
+                    close_linger,
+                    closing: None,
                 };
                 if let Err(e) = state.run() {
                     state.event_tx.fail(e);

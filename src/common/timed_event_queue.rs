@@ -76,6 +76,10 @@ impl<K: Hash + Eq, T: EventData> TimedEventQueue<K, T> {
         self.events.pop().map(|(k, e)| (k, e.event))
     }
 
+    pub fn remove(&mut self, key: &K) {
+        self.events.remove(key);
+    }
+
     pub fn len(&self) -> usize {
         self.events.len()
     }

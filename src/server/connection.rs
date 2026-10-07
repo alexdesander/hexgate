@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::time::Instant;
+use std::{rc::Rc, time::Instant};
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channels},
@@ -19,6 +19,8 @@ pub struct Connection {
 
     pub channels: Channels,
     pub congestion: CongestionController,
+    /// Reason of a graceful disconnect in progress.
+    pub closing: Option<Rc<[u8]>>,
 }
 
 impl Connection {
@@ -36,6 +38,7 @@ impl Connection {
 
             channels: Channels::new(channel_config, max_recv_msg_size),
             congestion: CongestionController::new(congestion_config),
+            closing: None,
         }
     }
 }

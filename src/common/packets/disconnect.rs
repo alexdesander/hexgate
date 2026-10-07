@@ -11,6 +11,8 @@ pub struct Disconnect<'a> {
 }
 
 pub const MAX_DATA_SIZE: usize = 1183;
+/// A graceful disconnect is sent this many times, in case some copies get lost.
+pub const REPEATS: usize = 3;
 
 // 2^96 - 5
 const NONCE: [u8; 12] = [

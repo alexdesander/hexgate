@@ -20,10 +20,14 @@ use crate::common::{
     error::ProtocolViolation,
     events::EventSender,
     packets::{
-        acks::Acks, disconnect::Disconnect, latency_discovery::LatencyDiscovery,
+        acks::Acks,
+        disconnect::{self, Disconnect},
+        latency_discovery::LatencyDiscovery,
         latency_discovery_response::LatencyDiscoveryResponse,
-        latency_discovery_response_2::LatencyDiscoveryResponse2, reliable_payload::ReliablePayload,
-        unreliable_payload::UnreliablePayload, PacketIdentifier,
+        latency_discovery_response_2::LatencyDiscoveryResponse2,
+        reliable_payload::ReliablePayload,
+        unreliable_payload::UnreliablePayload,
+        PacketIdentifier,
     },
     socket::net_sym::NetworkSimulator,
     timed_event_queue::TimedEventQueue,
@@ -46,6 +50,7 @@ pub enum TimedEventKey {
     CheckForTimeout,
     Send,
     SendAcks(u8),
+    CloseDeadline,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -74,6 +79,10 @@ pub struct ClientThreadState {
     pub channels: Channels,
     pub congestion: CongestionController,
     pub last_sent: Instant,
+
+    pub close_linger: Duration,
+    /// Reason of a graceful disconnect in progress.
+    pub closing: Option<Vec<u8>>,
 }
 
 impl ClientThreadState {
@@ -121,11 +130,19 @@ impl ClientThreadState {
 
             match cmd {
                 Cmd::Disconnect(data) => {
-                    let disconnect = Disconnect { data: &data };
-                    let size = disconnect.serialize(&self.crypto, &mut self.buf);
-                    self.socket.send(&self.buf[..size]);
-                    return Ok(true);
+                    if self.closing.is_none() {
+                        let now = Instant::now();
+                        self.closing = Some(data);
+                        self.timed_events.push(
+                            TimedEventKey::CloseDeadline,
+                            now + self.close_linger,
+                            TimedEventData::Nothing,
+                        );
+                        self.timed_events
+                            .push(TimedEventKey::Send, now, TimedEventData::Nothing);
+                    }
                 }
+                Cmd::Send(..) if self.closing.is_some() => {}
                 Cmd::Send(channel, payload) => {
                     self.channels.push(channel, Rc::new(payload));
                     self.timed_events.push(
@@ -161,6 +178,10 @@ impl ClientThreadState {
                     }
                 }
                 TimedEventKey::SendAcks(channel_id) => self.handle_event_send_acks(channel_id),
+                TimedEventKey::CloseDeadline => {
+                    self.finish_close();
+                    return true;
+                }
                 TimedEventKey::CheckForTimeout => {
                     if self.last_received.elapsed() > self.timeout_dur {
                         let disconnect = Disconnect { data: b"Timeout" };
@@ -236,6 +257,10 @@ impl ClientThreadState {
                         .push(TimedEventKey::Send, deadline, TimedEventData::Nothing);
                     return false;
                 }
+                Pop::Idle if self.closing.is_some() => {
+                    self.finish_close();
+                    return true;
+                }
                 Pop::Idle => return false,
                 Pop::Exhausted => {
                     let disconnect = Disconnect {
@@ -255,6 +280,17 @@ impl ClientThreadState {
             TimedEventData::Nothing,
         );
         false
+    }
+
+    /// Ends a graceful disconnect: everything was sent and acked, or the linger ran out.
+    fn finish_close(&mut self) {
+        let Some(reason) = &self.closing else {
+            return;
+        };
+        let size = Disconnect { data: reason }.serialize(&self.crypto, &mut self.buf);
+        for _ in 0..disconnect::REPEATS {
+            self.socket.send(&self.buf[..size]);
+        }
     }
 
     fn handle_event_send_acks(&mut self, channel_id: u8) {
@@ -333,7 +369,7 @@ impl ClientThreadState {
     }
 
     fn handle_packet_unreliable_payload(&mut self, size: usize) -> bool {
-        if !self.event_tx.has_room() {
+        if self.closing.is_some() || !self.event_tx.has_room() {
             return false;
         }
         let Ok(packet) = UnreliablePayload::deserialize(&self.crypto, &mut self.buf[0..size])
@@ -350,7 +386,7 @@ impl ClientThreadState {
     }
 
     fn handle_packet_reliable_payload(&mut self, size: usize) -> bool {
-        if !self.event_tx.has_room() {
+        if self.closing.is_some() || !self.event_tx.has_room() {
             return false;
         }
         let Ok(packet) = ReliablePayload::deserialize(&self.crypto, &mut self.buf[..size]) else {
