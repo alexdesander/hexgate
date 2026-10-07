@@ -8,11 +8,31 @@ use std::{
 };
 
 use super::Channel;
+use crate::common::error::ConfigError;
 
 pub struct ChannelConfiguration {
     pub weight_unreliable: u16,
     pub weights_unreliable_ordered: Vec<u16>,
     pub weights_reliable: Vec<u16>,
+}
+
+impl ChannelConfiguration {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        let channels = self
+            .weights_unreliable_ordered
+            .len()
+            .max(self.weights_reliable.len());
+        if channels > 256 {
+            return Err(ConfigError::TooManyChannels(channels));
+        }
+        let mut weights = std::iter::once(&self.weight_unreliable)
+            .chain(&self.weights_unreliable_ordered)
+            .chain(&self.weights_reliable);
+        if weights.any(|&weight| weight == 0) {
+            return Err(ConfigError::ZeroChannelWeight);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

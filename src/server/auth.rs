@@ -8,6 +8,7 @@ use crossbeam::channel::{Receiver, Sender};
 use mio::Waker;
 
 use super::thread::Cmd;
+use crate::common::packets::login_response::MAX_FAILURE_DATA_SIZE;
 
 pub trait AuthResult: Send + 'static {}
 impl<T> AuthResult for T where T: Send + 'static {}
@@ -15,7 +16,7 @@ impl<T> AuthResult for T where T: Send + 'static {}
 pub trait Authenticator<R: AuthResult>: Send + 'static {
     /// Authenticate the client with the given authentication data.
     /// The error value is sent to the client if the authentication fails.
-    /// NOTE: The error vec can have a max len of 1181 bytes.
+    /// NOTE: The error vec is truncated to 1181 bytes.
     fn authenticate(&mut self, from: SocketAddr, auth_data: Vec<u8>) -> Result<R, Vec<u8>>;
 }
 
@@ -52,7 +53,8 @@ pub(crate) fn auth_thread<R: AuthResult, A: Authenticator<R>>(mut state: AuthThr
                             break;
                         }
                     }
-                    Err(e) => {
+                    Err(mut e) => {
+                        e.truncate(MAX_FAILURE_DATA_SIZE);
                         if state.main_cmds.send(Cmd::AuthFailed(from, e)).is_err() {
                             break;
                         }

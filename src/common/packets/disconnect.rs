@@ -10,6 +10,8 @@ pub struct Disconnect<'a> {
     pub data: &'a [u8],
 }
 
+pub const MAX_DATA_SIZE: usize = 1183;
+
 // 2^96 - 5
 const NONCE: [u8; 12] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfb,
@@ -17,8 +19,8 @@ const NONCE: [u8; 12] = [
 impl<'a> Disconnect<'a> {
     pub fn serialize(&self, crypto: &Crypto, buf: &mut [u8]) -> usize {
         assert!(
-            self.data.len() <= 1183,
-            "Disconnect payload cannot be larger than 1183 bytes"
+            self.data.len() <= MAX_DATA_SIZE,
+            "Disconnect payload cannot be larger than {MAX_DATA_SIZE} bytes"
         );
         buf[0] = PacketIdentifier::Disconnect as u8;
         buf[1..1 + self.data.len()].copy_from_slice(self.data);

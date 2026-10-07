@@ -16,7 +16,7 @@ use unreliable_ordered::UnreliableOrderedChannel;
 use super::{
     congestion::CongestionController,
     crypto::Crypto,
-    error::ProtocolViolation,
+    error::{ProtocolViolation, SendError, TooLarge},
     packets::{
         acks::Acks, reliable_payload::ReliablePayload, unreliable_payload::UnreliablePayload,
     },
@@ -35,6 +35,36 @@ pub enum Channel {
     Unreliable,
     UnreliableOrdered(u8),
     Reliable(u8),
+}
+
+/// What `send` validates before a message is handed to the network thread.
+#[derive(Clone, Copy)]
+pub(crate) struct SendLimits {
+    max_msg_size: usize,
+    unreliable_ordered_channels: usize,
+    reliable_channels: usize,
+}
+
+impl SendLimits {
+    pub fn new(config: &ChannelConfiguration, max_msg_size: usize) -> Self {
+        Self {
+            max_msg_size,
+            unreliable_ordered_channels: config.weights_unreliable_ordered.len(),
+            reliable_channels: config.weights_reliable.len(),
+        }
+    }
+
+    pub fn check(&self, channel: Channel, size: usize) -> Result<(), SendError> {
+        let configured = match channel {
+            Channel::Unreliable => true,
+            Channel::UnreliableOrdered(id) => (id as usize) < self.unreliable_ordered_channels,
+            Channel::Reliable(id) => (id as usize) < self.reliable_channels,
+        };
+        if !configured {
+            return Err(SendError::UnknownChannel(channel));
+        }
+        TooLarge::check(size, self.max_msg_size).map_err(SendError::MessageTooLarge)
+    }
 }
 
 pub(crate) struct Channels {

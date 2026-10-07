@@ -8,11 +8,13 @@ pub struct InfoResponse<'a> {
     pub data: &'a [u8],
 }
 
+pub const MAX_INFO_SIZE: usize = 256;
+
 impl<'a> InfoResponse<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         assert!(
-            data.len() <= 256,
-            "Data in InfoResponse cannot be larger than 256 bytes"
+            data.len() <= MAX_INFO_SIZE,
+            "Data in InfoResponse cannot be larger than {MAX_INFO_SIZE} bytes"
         );
         InfoResponse { data }
     }

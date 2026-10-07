@@ -15,11 +15,12 @@ use siphasher::sip::SipHasher;
 use thread::{Cmd, ServerThreadState};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel},
+    channel::{scheduler::ChannelConfiguration, Channel, SendLimits},
     congestion::CongestionConfiguration,
     crypto::sym::SymCipher,
-    error::{ProtocolViolation, RecvError},
+    error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver},
+    packets::{disconnect, info_response::MAX_INFO_SIZE},
     socket::{net_sym::NetworkSimulator, Socket},
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
@@ -28,6 +29,14 @@ use crate::common::{
 pub mod auth;
 mod connection;
 mod thread;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(#[from] ConfigError),
+}
 
 #[derive(Debug)]
 pub enum Event<R: AuthResult> {
@@ -40,14 +49,14 @@ pub enum Event<R: AuthResult> {
 }
 
 pub struct Server<R: AuthResult, A: Authenticator<R>> {
-    max_send_msg_size: usize,
+    send_limits: SendLimits,
     inner: Arc<ServerInner<R, A>>,
 }
 
 impl<R: AuthResult, A: Authenticator<R>> Clone for Server<R, A> {
     fn clone(&self) -> Self {
         Self {
-            max_send_msg_size: self.max_send_msg_size,
+            send_limits: self.send_limits,
             inner: self.inner.clone(),
         }
     }
@@ -65,9 +74,11 @@ struct ServerInner<R: AuthResult, A: Authenticator<R>> {
 impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
     /// Sets the info that will be sent to clients on info requests (for server list pings etc).
     /// Info can be at most 256 bytes.
-    pub fn set_info(&self, info: Vec<u8>) {
+    pub fn set_info(&self, info: Vec<u8>) -> Result<(), TooLarge> {
+        TooLarge::check(info.len(), MAX_INFO_SIZE)?;
         let _ = self.inner.cmd_tx.send(Cmd::SetInfo(info));
         let _ = self.inner.waker.wake();
+        Ok(())
     }
 
     /// This is non-blocking, an error means the server has shut down.
@@ -80,25 +91,27 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         self.inner.event_rx.next()
     }
 
-    pub fn send(&self, to: SocketAddr, channel: Channel, message: Vec<u8>) -> Result<(), ()> {
-        if message.len() > self.max_send_msg_size {
-            panic!(
-                "Tried sending a message of size {} which is larger than the max_send_msg_size of {}",
-                message.len(),
-                self.max_send_msg_size
-            );
-        }
+    pub fn send(
+        &self,
+        to: SocketAddr,
+        channel: Channel,
+        message: Vec<u8>,
+    ) -> Result<(), SendError> {
+        self.send_limits.check(channel, message.len())?;
         self.inner
             .cmd_tx
             .send(Cmd::Send(to, channel, message))
-            .map_err(|_| ())?;
+            .map_err(|_| SendError::Stopped)?;
         let _ = self.inner.waker.wake();
         Ok(())
     }
 
-    pub fn shutdown(&self, reason: Vec<u8>) {
+    /// The reason is sent to every client, at most 1183 bytes.
+    pub fn shutdown(&self, reason: Vec<u8>) -> Result<(), TooLarge> {
+        TooLarge::check(reason.len(), disconnect::MAX_DATA_SIZE)?;
         let _ = self.inner.cmd_tx.send(Cmd::Shutdown(reason));
         let _ = self.inner.waker.wake();
+        Ok(())
     }
 
     pub fn set_simulator(&self, simulator: Option<Box<dyn NetworkSimulator>>) {
@@ -124,6 +137,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         bind_addr: SocketAddr,
         socket_buffer_size: Option<usize>,
         simulator: Option<Box<dyn NetworkSimulator>>,
+        /// At most 256 bytes.
         info: Vec<u8>,
         allowed_client_versions: fn(ClientVersion) -> Result<(), AllowedClientVersions>,
         cipher: Option<Cipher>,
@@ -148,8 +162,10 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         #[builder(default = false)] disable_timestamp_age_check: bool,
         #[builder(default = Duration::from_secs(10))]
         connection_request_max_timestamp_age: Duration,
-    ) -> Result<Self, io::Error> {
-        assert!(info.len() <= 256, "Info can be at most 256 bytes");
+    ) -> Result<Self, StartError> {
+        TooLarge::check(info.len(), MAX_INFO_SIZE).map_err(ConfigError::InfoTooLarge)?;
+        channel_config.validate()?;
+        let send_limits = SendLimits::new(&channel_config, max_send_msg_size);
         let socket = Socket::builder()
             .bind_addr(bind_addr)
             .maybe_buffer_size_bytes(socket_buffer_size)
@@ -220,7 +236,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         });
 
         Ok(Server {
-            max_send_msg_size,
+            send_limits,
             inner: Arc::new(ServerInner {
                 _phantom: PhantomData,
                 event_rx,

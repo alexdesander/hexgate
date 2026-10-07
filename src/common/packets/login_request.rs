@@ -11,6 +11,8 @@ pub struct LoginRequest<'a> {
     pub auth_data: &'a [u8],
 }
 
+pub const MAX_AUTH_DATA_SIZE: usize = 1177;
+
 // 2^96 - 2
 const NONCE: [u8; 12] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
@@ -25,8 +27,8 @@ impl<'a> LoginRequest<'a> {
 
     pub fn serialize(&self, crypto: &Crypto, buf: &mut [u8]) -> usize {
         assert!(
-            self.auth_data.len() <= 1177,
-            "Auth data in LoginRequest cannot be larger than 1177 bytes"
+            self.auth_data.len() <= MAX_AUTH_DATA_SIZE,
+            "Auth data in LoginRequest cannot be larger than {MAX_AUTH_DATA_SIZE} bytes"
         );
         buf[0] = PacketIdentifier::LoginRequest as u8;
         buf[1..5].copy_from_slice(&self.salt);
@@ -60,7 +62,7 @@ impl<'a> LoginRequest<'a> {
         }
 
         let auth_data_len = u16::from_le_bytes(buf[5..7].try_into().unwrap()) as usize;
-        if auth_data_len > 1177 {
+        if auth_data_len > MAX_AUTH_DATA_SIZE {
             return Err(ERROR_INVALID_DATA_SIZE);
         }
         let auth_data = &buf[7..7 + auth_data_len];

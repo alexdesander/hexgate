@@ -77,7 +77,7 @@ fn main() -> anyhow::Result<()> {
         let mut words = text.split(' ');
         match words.next() {
             Some("/quit") => {
-                client.disconnect("Used /quit".as_bytes().to_vec());
+                client.disconnect("Used /quit".as_bytes().to_vec())?;
                 break;
             }
             // Switch channels using /ch [CHANNEL_NAME] [CHANNEL_NUMBER]

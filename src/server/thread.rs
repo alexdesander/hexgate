@@ -152,7 +152,6 @@ impl<R: AuthResult> ServerThreadState<R> {
                     return Ok(true);
                 }
                 Cmd::SetInfo(info) => {
-                    assert!(info.len() <= 256, "Info can be at most 256 bytes");
                     self.info = info;
                 }
                 Cmd::AuthSuccess(socket_addr, auth_result) => {

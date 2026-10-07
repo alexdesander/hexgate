@@ -4,6 +4,8 @@
 
 use std::io;
 
+use super::channel::Channel;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RecvError {
     #[error("the network thread has stopped")]
@@ -19,4 +21,40 @@ pub enum RecvError {
 pub enum ProtocolViolation {
     #[error("received a message larger than max_recv_msg_size ({max} bytes)")]
     MessageTooLarge { max: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{size} bytes exceed the limit of {max} bytes")]
+pub struct TooLarge {
+    pub size: usize,
+    pub max: usize,
+}
+
+impl TooLarge {
+    pub(crate) fn check(size: usize, max: usize) -> Result<(), Self> {
+        if size > max {
+            return Err(Self { size, max });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    #[error("message too large: {0}")]
+    MessageTooLarge(TooLarge),
+    #[error("channel {0:?} is not configured")]
+    UnknownChannel(Channel),
+    #[error("the network thread has stopped")]
+    Stopped,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("channel weights must be greater than zero")]
+    ZeroChannelWeight,
+    #[error("{0} channels of one kind configured, at most 256 are supported")]
+    TooManyChannels(usize),
+    #[error("info too large: {0}")]
+    InfoTooLarge(TooLarge),
 }

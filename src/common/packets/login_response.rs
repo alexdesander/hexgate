@@ -11,6 +11,8 @@ pub enum LoginResponse<'a> {
     Failure { failure_data: &'a [u8] },
 }
 
+pub const MAX_FAILURE_DATA_SIZE: usize = 1181;
+
 // 2^96 - 3
 const NONCE: [u8; 12] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd,
@@ -26,8 +28,8 @@ impl<'a> LoginResponse<'a> {
             }
             LoginResponse::Failure { failure_data } => {
                 assert!(
-                    failure_data.len() <= 1181,
-                    "Failure data in LoginResponse cannot be larger than 1181 bytes"
+                    failure_data.len() <= MAX_FAILURE_DATA_SIZE,
+                    "Failure data in LoginResponse cannot be larger than {MAX_FAILURE_DATA_SIZE} bytes"
                 );
                 buf[0] = PacketIdentifier::LoginFailure as u8;
                 buf[1..3].copy_from_slice(&(failure_data.len() as u16).to_le_bytes());
@@ -71,7 +73,7 @@ impl<'a> LoginResponse<'a> {
             }
 
             let data_size = u16::from_le_bytes(buf[1..3].try_into().unwrap()) as usize;
-            if data_size > 1181 {
+            if data_size > MAX_FAILURE_DATA_SIZE {
                 return Err(ERROR_INVALID_DATA_SIZE);
             }
             let failure_data = &buf[3..3 + data_size];

@@ -20,15 +20,20 @@ use thread::{ClientThreadState, Cmd};
 use x25519_dalek::{PublicKey, ReusableSecret};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel, Channels},
+    channel::{scheduler::ChannelConfiguration, Channel, Channels, SendLimits},
     congestion::{CongestionConfiguration, CongestionController},
     crypto::Crypto,
-    error::{ProtocolViolation, RecvError},
+    error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver},
     packets::{
-        client_hello::ClientHello, connection_request::ConnectionRequest,
-        connection_response::ConnectionResponse, info_request::InfoRequest,
-        info_response::InfoResponse, login_request::LoginRequest, login_response::LoginResponse,
+        client_hello::ClientHello,
+        connection_request::ConnectionRequest,
+        connection_response::ConnectionResponse,
+        disconnect,
+        info_request::InfoRequest,
+        info_response::InfoResponse,
+        login_request::{self, LoginRequest},
+        login_response::LoginResponse,
         server_hello::ServerHello,
     },
     socket::{net_sym::NetworkSimulator, Socket},
@@ -48,6 +53,10 @@ pub enum ConnectError {
     ServerDeniedLogin(Vec<u8>),
     #[error("The server's public key does not match the expected key (possible SECURITY IMPLICATIONS!!!)")]
     ServerKeyMismatch { received_key: [u8; 32] },
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(#[from] ConfigError),
+    #[error("Auth data too large: {0}")]
+    AuthDataTooLarge(TooLarge),
 }
 
 /// Request server infos from a list of servers.
@@ -113,7 +122,7 @@ pub enum Event {
 
 #[derive(Clone)]
 pub struct Client {
-    max_send_msg_size: usize,
+    send_limits: SendLimits,
     inner: Arc<ClientInner>,
 }
 
@@ -128,25 +137,22 @@ impl Client {
         self.inner.event_rx.next()
     }
 
-    pub fn send(&self, channel: Channel, message: Vec<u8>) -> Result<(), ()> {
-        if message.len() > self.max_send_msg_size {
-            panic!(
-                "Tried sending a message of size {} which is larger than the max_send_msg_size of {}",
-                message.len(),
-                self.max_send_msg_size
-            );
-        }
+    pub fn send(&self, channel: Channel, message: Vec<u8>) -> Result<(), SendError> {
+        self.send_limits.check(channel, message.len())?;
         self.inner
             .cmd_tx
             .send(Cmd::Send(channel, message))
-            .map_err(|_| ())?;
+            .map_err(|_| SendError::Stopped)?;
         let _ = self.inner.waker.wake();
         Ok(())
     }
 
-    pub fn disconnect(&self, data: Vec<u8>) {
+    /// The data is sent to the server, at most 1183 bytes.
+    pub fn disconnect(&self, data: Vec<u8>) -> Result<(), TooLarge> {
+        TooLarge::check(data.len(), disconnect::MAX_DATA_SIZE)?;
         let _ = self.inner.cmd_tx.send(Cmd::Disconnect(data));
         let _ = self.inner.waker.wake();
+        Ok(())
     }
 
     pub fn set_simulator(&self, simulator: Option<Box<dyn NetworkSimulator>>) {
@@ -185,6 +191,7 @@ impl Client {
         #[builder(default = "0.0.0.0:0".parse().unwrap())] bind_addr: SocketAddr,
         server_socket_addr: SocketAddr,
         expected_server_key: Option<[u8; 32]>,
+        /// At most 1177 bytes unless hashed.
         auth_data: Vec<u8>,
         hash_auth_data: bool,
         simulator: Option<Box<dyn NetworkSimulator>>,
@@ -210,6 +217,12 @@ impl Client {
     ) -> Result<Self, ConnectError> {
         const READ_COOLDOWN: Duration = Duration::from_millis(50);
         let max_handshake_tries = handshake_tries;
+        channel_config.validate()?;
+        if !hash_auth_data {
+            TooLarge::check(auth_data.len(), login_request::MAX_AUTH_DATA_SIZE)
+                .map_err(ConnectError::AuthDataTooLarge)?;
+        }
+        let send_limits = SendLimits::new(&channel_config, max_send_msg_size);
 
         let mut socket = Socket::builder()
             .bind_addr(bind_addr)
@@ -416,7 +429,7 @@ impl Client {
             });
 
             return Ok(Client {
-                max_send_msg_size,
+                send_limits,
                 inner: Arc::new(ClientInner {
                     server_ed25519_pubkey,
                     cmd_tx,
