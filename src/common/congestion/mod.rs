@@ -17,6 +17,9 @@ const SPEED_UP_AFTER_SLOWDOWN_INTERVAL: Duration = Duration::from_secs(5);
 const RESET_RELIABLE_COUNT_INTERVAL: Duration = Duration::from_secs(2);
 const BATCHES_PER_SECOND: u32 = 30;
 const BATCHES_DOWNTIME: Duration = Duration::from_millis(1000 / BATCHES_PER_SECOND as u64);
+/// RTT assumed before the first sample (RFC 9002).
+const INITIAL_RTT: Duration = Duration::from_millis(333);
+const TIMER_GRANULARITY: Duration = Duration::from_millis(1);
 
 /// Bandwidth is in kibibytes per second (1024 bytes per second).
 /// You should manually tune this to your game's needs.
@@ -50,6 +53,8 @@ pub(crate) struct CongestionController {
     resent_reliable: u32,
     last_reset_reliable_count: Instant,
     max_in_flight: usize,
+    srtt: Option<Duration>,
+    rttvar: Duration,
 }
 
 impl CongestionController {
@@ -66,6 +71,8 @@ impl CongestionController {
             resent_reliable: 0,
             last_reset_reliable_count: Instant::now(),
             max_in_flight: 32,
+            srtt: None,
+            rttvar: INITIAL_RTT / 2,
         }
     }
 
@@ -81,11 +88,28 @@ impl CongestionController {
         BATCHES_DOWNTIME
     }
 
-    pub fn resend_cooldown(&self) -> Duration {
-        (self.avg_latency() * 4) / 3 + Duration::from_millis(20)
+    /// Retransmission timeout (RFC 6298) plus the time the peer may delay its acks.
+    pub fn rto(&self) -> Duration {
+        let srtt = self.srtt.unwrap_or(INITIAL_RTT);
+        srtt + (self.rttvar * 4).max(TIMER_GRANULARITY) + self.ack_delay()
+    }
+
+    /// Feeds an RTT sample (latency probe or ack) into the RFC 6298 estimator.
+    pub fn update_rtt(&mut self, rtt: Duration) {
+        match self.srtt {
+            None => {
+                self.srtt = Some(rtt);
+                self.rttvar = rtt / 2;
+            }
+            Some(srtt) => {
+                self.rttvar = (self.rttvar * 3 + srtt.abs_diff(rtt)) / 4;
+                self.srtt = Some((srtt * 7 + rtt) / 8);
+            }
+        }
     }
 
     pub fn update_latency(&mut self, latency: Duration) {
+        self.update_rtt(latency);
         if self.latencies.is_empty() {
             self.latencies.push_back(latency);
             return;

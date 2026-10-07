@@ -26,9 +26,22 @@ use crate::common::{
 mod assembler;
 mod disassembler;
 
+/// Retransmissions wait `rto * 2^n` for the n-th retransmission, up to this exponent.
+const MAX_BACKOFF_EXPONENT: u32 = 2;
+/// A packet is lost once a packet this many ids later, sent after it, is acked (RFC 9002).
+const PACKET_THRESHOLD: u64 = 3;
+
 struct InFlight {
-    sent: Option<Instant>,
+    /// Last transmission and its retransmission deadline, `None` until first sent.
+    sent: Option<(Instant, Instant)>,
+    transmissions: u32,
     packet: ReliablePayloadOwned,
+}
+
+impl InFlight {
+    fn resend_at(&self) -> Option<Instant> {
+        self.sent.map(|(_, resend_at)| resend_at)
+    }
 }
 
 impl PartialEq for InFlight {
@@ -41,21 +54,17 @@ impl Eq for InFlight {}
 
 impl PartialOrd for InFlight {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match other.sent.cmp(&self.sent) {
-            std::cmp::Ordering::Equal => {
-                Some(other.packet.packet_id().cmp(&self.packet.packet_id()))
-            }
-            x => Some(x),
-        }
+        Some(self.cmp(other))
     }
 }
 
+/// Unsent packets first, then by retransmission deadline (`BinaryHeap` is a max-heap).
 impl Ord for InFlight {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match other.sent.cmp(&self.sent) {
-            std::cmp::Ordering::Equal => other.packet.packet_id().cmp(&self.packet.packet_id()),
-            x => x,
-        }
+        other
+            .resend_at()
+            .cmp(&self.resend_at())
+            .then_with(|| other.packet.packet_id().cmp(&self.packet.packet_id()))
     }
 }
 
@@ -110,7 +119,8 @@ pub struct ReliableChannel {
     max_in_flight: usize,
     in_flights: BinaryHeap<InFlight>,
     lowest_unreceived_remote: u64,
-    resend_cooldown: Duration,
+    /// Id and last send time of the highest acked packet.
+    largest_acked: Option<(u64, Instant)>,
 
     received: BTreeMap<u64, Vec<u8>>,
     acks_next: u64,
@@ -120,12 +130,7 @@ pub struct ReliableChannel {
 }
 
 impl ReliableChannel {
-    pub fn new(
-        channel_id: u8,
-        resend_cooldown: Duration,
-        max_in_flight: usize,
-        max_recv_msg_size: usize,
-    ) -> Self {
+    pub fn new(channel_id: u8, max_in_flight: usize, max_recv_msg_size: usize) -> Self {
         Self {
             channel_id,
             assembler: MessageAssembler::new(max_recv_msg_size),
@@ -134,8 +139,8 @@ impl ReliableChannel {
             next: 0,
             max_in_flight,
             in_flights: BinaryHeap::new(),
-            resend_cooldown,
             lowest_unreceived_remote: 0,
+            largest_acked: None,
 
             received: BTreeMap::new(),
             acks_next: 0,
@@ -192,7 +197,11 @@ impl ReliableChannel {
                 payload,
             };
             self.next += 1;
-            self.in_flights.push(InFlight { sent: None, packet });
+            self.in_flights.push(InFlight {
+                sent: None,
+                transmissions: 0,
+                packet,
+            });
         }
     }
 
@@ -206,24 +215,26 @@ impl ReliableChannel {
         if self.in_flights.is_empty() {
             return Either::Right(None);
         }
+        let now = Instant::now();
         let in_flight = self.in_flights.peek().unwrap();
-        if let Some(sent) = in_flight.sent {
-            let elapsed = sent.elapsed();
-            if elapsed < self.resend_cooldown {
-                return Either::Right(Some(self.resend_cooldown.saturating_sub(elapsed)));
+        if let Some(resend_at) = in_flight.resend_at() {
+            if resend_at > now {
+                return Either::Right(Some(resend_at - now));
             }
         }
 
         // A packet is ready to be sent, return its size
         let mut packet = self.in_flights.pop().unwrap();
 
-        if packet.sent.is_some() {
+        if packet.transmissions > 0 {
             congestion.register_resent_reliable();
         } else {
             congestion.register_sent_reliable();
         }
 
-        packet.sent = Some(Instant::now());
+        let backoff = 1 << packet.transmissions.min(MAX_BACKOFF_EXPONENT);
+        packet.transmissions += 1;
+        packet.sent = Some((now, now + congestion.rto() * backoff));
         let size = packet.packet.serialize(crypto, buf);
         self.in_flights.push(packet);
         Either::Left(size)
@@ -263,7 +274,9 @@ impl ReliableChannel {
         }
     }
 
-    pub fn handle_acks(&mut self, acks: Acks) {
+    /// Returns an RTT sample from the newest acked packet that was sent once (Karn's algorithm).
+    /// Unacked packets that were overtaken by `PACKET_THRESHOLD` acked ones are resent now.
+    pub fn handle_acks(&mut self, acks: Acks) -> Option<Duration> {
         let ack_data = AckData {
             lowest_unreceived: acks.lowest_unreceived,
             bitfield: BitArray::new(acks.ack_bitfield),
@@ -271,8 +284,37 @@ impl ReliableChannel {
         self.lowest_unreceived_remote = self
             .lowest_unreceived_remote
             .max(ack_data.lowest_unreceived);
-        self.in_flights
-            .retain(|in_flight| !ack_data.is_acked(in_flight.packet.packet_id()));
+        let mut in_flights = std::mem::take(&mut self.in_flights).into_vec();
+        let mut newest_sample = None;
+        in_flights.retain(|in_flight| {
+            let id = in_flight.packet.packet_id();
+            if !ack_data.is_acked(id) {
+                return true;
+            }
+            if let Some((sent, _)) = in_flight.sent {
+                if in_flight.transmissions == 1 {
+                    newest_sample = newest_sample.max(Some(sent));
+                }
+                if self.largest_acked.is_none_or(|(largest, _)| id > largest) {
+                    self.largest_acked = Some((id, sent));
+                }
+            }
+            false
+        });
+        if let Some((largest, largest_sent)) = self.largest_acked {
+            let now = Instant::now();
+            for in_flight in &mut in_flights {
+                if let Some((sent, resend_at)) = &mut in_flight.sent {
+                    if in_flight.packet.packet_id() + PACKET_THRESHOLD <= largest
+                        && *sent < largest_sent
+                    {
+                        *resend_at = (*resend_at).min(now);
+                    }
+                }
+            }
+        }
+        self.in_flights = in_flights.into();
+        newest_sample.map(|sent| sent.elapsed())
     }
 
     pub fn _has_acks_to_send(&self) -> bool {

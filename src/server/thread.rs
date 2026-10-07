@@ -603,7 +603,9 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Ok(packet) = Acks::deserialize(&connection.crypto, &self.buf[..size]) else {
             return;
         };
-        connection.channels.handle_acks(packet);
+        connection
+            .channels
+            .handle_acks(packet, &mut connection.congestion);
     }
 
     fn handle_violation(&mut self, addr: SocketAddr, violation: ProtocolViolation) {

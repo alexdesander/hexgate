@@ -92,7 +92,6 @@ impl Channels {
                 .map(|i| {
                     ReliableChannel::new(
                         i.try_into().unwrap(),
-                        congestion.resend_cooldown(),
                         congestion.max_in_flight(),
                         max_recv_msg_size,
                     )
@@ -221,10 +220,12 @@ impl Channels {
         }
     }
 
-    pub fn handle_acks(&mut self, acks: Acks) {
-        if acks.channel_id as usize >= self.reliable.len() {
+    pub fn handle_acks(&mut self, acks: Acks, congestion: &mut CongestionController) {
+        let Some(channel) = self.reliable.get_mut(acks.channel_id as usize) else {
             return;
+        };
+        if let Some(rtt) = channel.handle_acks(acks) {
+            congestion.update_rtt(rtt);
         }
-        self.reliable[acks.channel_id as usize].handle_acks(acks);
     }
 }

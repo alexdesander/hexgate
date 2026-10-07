@@ -373,7 +373,7 @@ impl ClientThreadState {
         let Ok(acks) = Acks::deserialize(&self.crypto, &self.buf[..size]) else {
             return false;
         };
-        self.channels.handle_acks(acks);
+        self.channels.handle_acks(acks, &mut self.congestion);
         false
     }
 
