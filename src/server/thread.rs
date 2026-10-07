@@ -162,7 +162,11 @@ impl<R: AuthResult> ServerThreadState<R> {
                     .saturating_duration_since(Instant::now())
                     .max(Duration::from_millis(1))
             });
-            self.poll.poll(&mut events, max_poll_time)?;
+            // A signal handler ran, nothing happened on the socket.
+            match self.poll.poll(&mut events, max_poll_time) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            }
             for event in events.iter() {
                 match event.token() {
                     RECV_TOKEN => self.handle_all_recvs()?,
