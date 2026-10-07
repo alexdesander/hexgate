@@ -362,17 +362,17 @@ impl<R: AuthResult> ServerThreadState<R> {
         let login_response = LoginResponse::Success;
         let size = login_response.serialize(&crypto, &mut self.buf);
         self.socket.send_to(from, &self.buf[..size]);
-        if let Some(_old_connection) = self.connections.insert(
-            from,
-            Connection::new(
-                crypto,
-                &self.channel_config,
-                self.congestion_config,
-                self.max_recv_msg_size,
-            ),
-        ) {
-            todo!("Handle old connection");
-        };
+        let connection = Connection::new(
+            crypto,
+            &self.channel_config,
+            self.congestion_config,
+            self.max_recv_msg_size,
+        );
+        // A new handshake from a connected address means the client lost its old session
+        // (e.g. our LoginSuccess got lost and it started over).
+        if self.connections.insert(from, connection).is_some() {
+            self.event_tx.send(Event::Disconnected(from, Vec::new()));
+        }
         self.event_tx.send(Event::Connected(from, auth_result));
 
         self.timed_events.push(
