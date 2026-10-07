@@ -11,14 +11,14 @@ use rand::{thread_rng, Rng};
 use crate::common::Cipher;
 
 pub enum SymCipher {
-    AES256GCM(Aes256Gcm),
+    AES256GCM(Box<Aes256Gcm>),
     ChaCha20Poly1305(ChaCha20Poly1305),
 }
 
 impl SymCipher {
     pub fn new(cipher: Cipher, key: [u8; 32]) -> Self {
         match cipher {
-            Cipher::AES256GCM => SymCipher::AES256GCM(Aes256Gcm::new(&key.into())),
+            Cipher::AES256GCM => SymCipher::AES256GCM(Box::new(Aes256Gcm::new(&key.into()))),
             Cipher::ChaCha20Poly1305 => {
                 SymCipher::ChaCha20Poly1305(ChaCha20Poly1305::new(&key.into()))
             }

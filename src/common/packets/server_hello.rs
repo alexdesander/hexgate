@@ -14,6 +14,10 @@ use crate::common::{AllowedClientVersions, Cipher, ClientVersion};
 
 use super::*;
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "only lives while (de)serializing"
+)]
 pub enum ServerHello {
     VersionSupported {
         salt: [u8; 4],
@@ -103,7 +107,7 @@ impl ServerHello {
             let Ok(server_ed25519_pubkey) =
                 VerifyingKey::from_bytes(&buf[13..45].try_into().unwrap())
             else {
-                return Err(&ERROR_INVALID_SERVER_ED25519_PUBKEY);
+                return Err(ERROR_INVALID_SERVER_ED25519_PUBKEY);
             };
             let siphash = u64::from_le_bytes(buf[45..53].try_into().unwrap());
             let Ok(cipher) = Cipher::try_from(buf[53]) else {

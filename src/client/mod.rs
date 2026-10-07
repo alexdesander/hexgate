@@ -350,7 +350,7 @@ impl Client {
             }
 
             // ConnectionRequest -> ConnectionResponse
-            let client_x25519_key = ReusableSecret::random_from_rng(&mut thread_rng());
+            let client_x25519_key = ReusableSecret::random_from_rng(thread_rng());
             let hkdf_salt: [u8; 32] = rand::random();
             let connection_request = ConnectionRequest {
                 salt: real_salt,

@@ -337,8 +337,6 @@ impl<'a> UnreliablePayload<'a> {
 }
 #[cfg(test)]
 mod tests {
-    use std::u32;
-
     use rand::Rng;
     use x25519_dalek::{PublicKey, ReusableSecret};
 

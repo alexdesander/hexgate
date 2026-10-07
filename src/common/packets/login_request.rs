@@ -69,7 +69,7 @@ impl<'a> LoginRequest<'a> {
 
         Ok(LoginRequest {
             salt: buf[1..5].try_into().unwrap(),
-            auth_data: &auth_data,
+            auth_data,
         })
     }
 }

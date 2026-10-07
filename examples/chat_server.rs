@@ -97,7 +97,7 @@ fn main() -> anyhow::Result<()> {
             }
         };
         println!("{}", text);
-        for (client_addr, _) in clients.iter() {
+        for client_addr in clients.keys() {
             if *client_addr == sender {
                 continue;
             }

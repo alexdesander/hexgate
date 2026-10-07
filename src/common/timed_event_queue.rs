@@ -29,7 +29,7 @@ impl<T: EventData> Eq for TimedEvent<T> {}
 
 impl<T: EventData> PartialOrd for TimedEvent<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(other.deadline.cmp(&self.deadline))
+        Some(self.cmp(other))
     }
 }
 

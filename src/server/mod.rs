@@ -249,7 +249,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
                 cmds: cmd_rx,
                 socket,
                 poll,
-                _waker: _waker,
+                _waker,
                 timed_events: TimedEventQueue::new(),
                 buf: [0; 1201],
 

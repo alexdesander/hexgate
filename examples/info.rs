@@ -36,10 +36,10 @@ fn main() {
         .run()
         .unwrap();
 
-    let mut tmp_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let tmp_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     let (infos_tx, infos_rx) = channel();
     request_infos(
-        &mut tmp_socket,
+        &tmp_socket,
         Duration::from_secs(2),
         &[SERVER_ADDR],
         infos_tx,

@@ -235,7 +235,7 @@ mod tests {
             let size = channel_client.pop(&crypto_client, &mut buf).unwrap();
             let packet = UnreliablePayload::deserialize(&crypto_server, &mut buf[..size]).unwrap();
             let message = channel_server.handle(packet).unwrap().unwrap();
-            if message.len() > 0 {
+            if !message.is_empty() {
                 assert_eq!(message.len() % 256, message[0] as usize);
             }
         }

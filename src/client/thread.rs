@@ -182,7 +182,7 @@ impl ClientThreadState {
         while self
             .timed_events
             .next()
-            .map_or(false, |deadline| deadline <= Instant::now())
+            .is_some_and(|deadline| deadline <= Instant::now())
         {
             let (key, _event) = self.timed_events.pop().unwrap();
             match key {
@@ -323,8 +323,7 @@ impl ClientThreadState {
     }
 
     fn handle_packet_latency_discovery(&mut self, size: usize) -> bool {
-        let Ok(latency_discovery) =
-            LatencyDiscovery::deserialize(&self.crypto, &mut self.buf[..size])
+        let Ok(latency_discovery) = LatencyDiscovery::deserialize(&self.crypto, &self.buf[..size])
         else {
             return false;
         };
@@ -354,7 +353,7 @@ impl ClientThreadState {
 
     fn handle_packet_latency_response_2(&mut self, size: usize) -> bool {
         let Ok(latency_discovery_response_2) =
-            LatencyDiscoveryResponse2::deserialize(&self.crypto, &mut self.buf[..size])
+            LatencyDiscoveryResponse2::deserialize(&self.crypto, &self.buf[..size])
         else {
             return false;
         };

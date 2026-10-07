@@ -165,7 +165,7 @@ impl ReliablePayloadOwned {
 
     pub fn payload(&self) -> &[u8] {
         match self {
-            ReliablePayloadOwned::NoAcks { payload, .. } => &payload,
+            ReliablePayloadOwned::NoAcks { payload, .. } => payload,
         }
     }
 

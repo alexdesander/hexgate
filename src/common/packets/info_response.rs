@@ -26,7 +26,7 @@ impl<'a> InfoResponse<'a> {
     }
 
     pub fn deserialize(buf: &'a [u8]) -> Result<Self, &'static str> {
-        if buf.len() > 257 || buf.len() < 1 {
+        if buf.len() > 257 || buf.is_empty() {
             return Err(ERROR_INVALID_BUFFER_SIZE);
         }
 

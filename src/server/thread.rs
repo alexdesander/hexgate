@@ -246,7 +246,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         while self
             .timed_events
             .next()
-            .map_or(false, |deadline| deadline <= Instant::now())
+            .is_some_and(|deadline| deadline <= Instant::now())
         {
             let (key, _event) = self.timed_events.pop().unwrap();
             match key {
@@ -336,7 +336,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         for addr in timed_outs {
             self.connections.remove(&addr);
         }
-        if self.connections.len() > 0 {
+        if !self.connections.is_empty() {
             self.timed_events.push(
                 TimedEventKey::CheckForTimeouts,
                 Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
@@ -366,7 +366,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             self.socket.send_to(*addr, &self.buf[..size]);
             connection.probe_loss.probe(sequence_number);
         }
-        if self.connections.len() > 0 {
+        if !self.connections.is_empty() {
             self.timed_events.push(
                 TimedEventKey::DiscoverLatencies,
                 Instant::now() + self.latency_discovery_interval,
@@ -629,7 +629,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             now + RATE_LIMIT_PRUNE_INTERVAL,
             TimedEventData::Nothing,
         );
-        let x25519_secret_key = EphemeralSecret::random_from_rng(&mut thread_rng());
+        let x25519_secret_key = EphemeralSecret::random_from_rng(thread_rng());
         let x25519_public_key = PublicKey::from(&x25519_secret_key);
         let shared_secret =
             x25519_secret_key.diffie_hellman(&connection_request.client_x25519_pubkey);
@@ -713,7 +713,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         let Ok(latency_discovery_response) =
-            LatencyDiscoveryResponse::deserialize(&connection.crypto, &mut self.buf[..size])
+            LatencyDiscoveryResponse::deserialize(&connection.crypto, &self.buf[..size])
         else {
             return;
         };

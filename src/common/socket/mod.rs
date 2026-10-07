@@ -76,8 +76,7 @@ impl Socket {
             sim_cmd_tx
                 .send(SimulatorThreadCmd::ChangeSimulator(simulator))
                 .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         "Simulator thread not running anymore (changing simulator failed)",
                     )
                 })?;
