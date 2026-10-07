@@ -70,6 +70,7 @@ pub struct PendingLogin {
 pub enum Cmd<R: AuthResult> {
     SetSimulator(Option<Box<dyn NetworkSimulator>>),
     Shutdown(Vec<u8>),
+    Disconnect(SocketAddr, Vec<u8>),
     SetInfo(Vec<u8>),
     AuthSuccess(LoginAttempt, R),
     AuthFailed(LoginAttempt, Vec<u8>),
@@ -182,6 +183,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                         self.start_close(addr, reason.clone());
                     }
                 }
+                Cmd::Disconnect(addr, reason) => self.start_close(addr, reason.into()),
                 Cmd::SetInfo(info) => {
                     self.info = info;
                 }

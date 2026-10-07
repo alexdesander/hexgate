@@ -116,6 +116,15 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         Ok(())
     }
 
+    /// Disconnects one client like `shutdown` does, without an event for it.
+    /// The reason is sent to the client, at most 1183 bytes.
+    pub fn disconnect(&self, client: SocketAddr, reason: Vec<u8>) -> Result<(), TooLarge> {
+        TooLarge::check(reason.len(), disconnect::MAX_DATA_SIZE)?;
+        let _ = self.inner.cmd_tx.send(Cmd::Disconnect(client, reason));
+        let _ = self.inner.waker.wake();
+        Ok(())
+    }
+
     pub fn set_simulator(&self, simulator: Option<Box<dyn NetworkSimulator>>) {
         let _ = self.inner.cmd_tx.send(Cmd::SetSimulator(simulator));
         let _ = self.inner.waker.wake();
