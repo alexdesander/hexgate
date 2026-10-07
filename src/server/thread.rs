@@ -534,6 +534,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                     cipher: self.cipher,
                     server_ed25519_pubkey: self.veryifying_key,
                     siphash: None,
+                    channel_counts: self.channel_config.counts(),
                 }
             }
             Err(allowed_versions) => ServerHello::VersionNotSupported {

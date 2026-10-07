@@ -16,6 +16,8 @@ pub enum ServerHello {
         cipher: Cipher,
         server_ed25519_pubkey: VerifyingKey,
         siphash: Option<u64>,
+        /// Unreliable ordered and reliable channel counts, the client's must match.
+        channel_counts: [u16; 2],
     },
     VersionNotSupported {
         salt: [u8; 4],
@@ -32,6 +34,7 @@ impl ServerHello {
                 cipher,
                 server_ed25519_pubkey,
                 siphash,
+                channel_counts,
             } => {
                 buf[0] = PacketIdentifier::ServerHelloVersionSupported as u8;
                 buf[1..5].copy_from_slice(salt);
@@ -40,7 +43,9 @@ impl ServerHello {
                 let siphash = siphash.unwrap_or_else(|| siphasher.hash(&buf[1..45]));
                 buf[45..53].copy_from_slice(&siphash.to_le_bytes());
                 buf[53] = *cipher as u8;
-                54
+                buf[54..56].copy_from_slice(&channel_counts[0].to_le_bytes());
+                buf[56..58].copy_from_slice(&channel_counts[1].to_le_bytes());
+                58
             }
             ServerHello::VersionNotSupported {
                 salt,
@@ -64,7 +69,7 @@ impl ServerHello {
             return Err(ERROR_INVALID_BUFFER_SIZE);
         }
         if buf[0] == PacketIdentifier::ServerHelloVersionSupported as u8 {
-            if buf.len() != 54 {
+            if buf.len() != 58 {
                 return Err(ERROR_INVALID_BUFFER_SIZE);
             }
             let salt = buf[1..5].try_into().unwrap();
@@ -84,6 +89,10 @@ impl ServerHello {
                 cipher,
                 server_ed25519_pubkey,
                 siphash: Some(siphash),
+                channel_counts: [
+                    u16::from_le_bytes(buf[54..56].try_into().unwrap()),
+                    u16::from_le_bytes(buf[56..58].try_into().unwrap()),
+                ],
             });
         }
 

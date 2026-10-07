@@ -11,6 +11,14 @@ pub struct ChannelConfiguration {
 }
 
 impl ChannelConfiguration {
+    /// Unreliable ordered and reliable channel counts (at most 256 each once validated).
+    pub(crate) fn counts(&self) -> [u16; 2] {
+        [
+            self.weights_unreliable_ordered.len() as u16,
+            self.weights_reliable.len() as u16,
+        ]
+    }
+
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         let channels = self
             .weights_unreliable_ordered

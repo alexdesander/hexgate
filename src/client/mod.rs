@@ -56,6 +56,9 @@ pub enum ConnectError {
     InvalidConfig(#[from] ConfigError),
     #[error("Auth data too large: {0}")]
     AuthDataTooLarge(TooLarge),
+    /// Counts of unreliable ordered and reliable channels.
+    #[error("Channel configuration differs from the server's (client: {client:?}, server: {server:?} unreliable ordered and reliable channels)")]
+    ChannelMismatch { client: [u16; 2], server: [u16; 2] },
 }
 
 /// Request server infos from a list of servers.
@@ -265,15 +268,19 @@ impl Client {
                         cipher,
                         server_ed25519_pubkey,
                         siphash,
+                        channel_counts,
                     } => (salt == real_salt).then_some(Ok((
                         timestamp,
                         cipher,
                         server_ed25519_pubkey,
                         siphash,
+                        channel_counts,
                     ))),
                 },
             )?;
-            let Some((timestamp, cipher, server_ed25519_pubkey, siphash)) = server_hello else {
+            let Some((timestamp, cipher, server_ed25519_pubkey, siphash, channel_counts)) =
+                server_hello
+            else {
                 continue 'outer;
             };
 
@@ -283,6 +290,12 @@ impl Client {
                         received_key: server_ed25519_pubkey.to_bytes(),
                     });
                 }
+            }
+            if channel_counts != channel_config.counts() {
+                return Err(ConnectError::ChannelMismatch {
+                    client: channel_config.counts(),
+                    server: channel_counts,
+                });
             }
 
             // ConnectionRequest -> ConnectionResponse
