@@ -112,13 +112,17 @@ impl UnreliableChannel {
         }
     }
 
-    pub fn pop(&mut self, crypto: &Crypto, buf: &mut [u8]) -> usize {
+    /// `None` once the message ids are used up: the next one would wrap and reuse nonces.
+    pub fn pop(&mut self, crypto: &Crypto, buf: &mut [u8]) -> Option<usize> {
         let Some(to_send) = self.to_send.front_mut() else {
-            return 0;
+            return Some(0);
         };
         let len = to_send.payload.len();
         if len <= UNRELIABLE_STANDALONE_PAYLOAD_MAX_PAYLOAD_SIZE {
             // Standalone
+            if self.standalone_next == u32::MAX {
+                return None;
+            }
             let to_send = self.to_send.pop_front().unwrap();
             let message_id = self.standalone_next;
             self.standalone_next += 1;
@@ -126,9 +130,12 @@ impl UnreliableChannel {
                 message_id,
                 payload: &to_send.payload,
             };
-            packet.serialize(crypto, buf)
+            Some(packet.serialize(crypto, buf))
         } else {
             // Fragmented
+            if self.fragmented_next == u32::MAX {
+                return None;
+            }
             let payload_size =
                 (len - to_send.sent).min(UNRELIABLE_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE);
             to_send.sent += payload_size;
@@ -148,7 +155,7 @@ impl UnreliableChannel {
                 self.fragmented_fragment_next = 0;
                 self.to_send.pop_front();
             }
-            size
+            Some(size)
         }
     }
 
@@ -218,7 +225,7 @@ mod tests {
 
         let mut buf = [0; 1200];
         for _ in 0..num_messages {
-            let size = channel_client.pop(&crypto_client, &mut buf);
+            let size = channel_client.pop(&crypto_client, &mut buf).unwrap();
             let packet = UnreliablePayload::deserialize(&crypto_server, &mut buf[..size]).unwrap();
             let message = channel_server.handle(packet).unwrap().unwrap();
             if message.len() > 0 {
@@ -252,7 +259,7 @@ mod tests {
 
         let mut buf = [0; 1200];
         loop {
-            let size = channel_client.pop(&crypto_client, &mut buf);
+            let size = channel_client.pop(&crypto_client, &mut buf).unwrap();
             if size == 0 {
                 break;
             }

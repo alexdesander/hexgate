@@ -11,8 +11,8 @@ use std::{
 use assembler::MessageAssembler;
 use bitvec::{array::BitArray, order::Lsb0};
 use disassembler::MessageDisassembler;
-use either::Either;
 
+use super::Pop;
 use crate::common::{
     congestion::CongestionController,
     crypto::Crypto,
@@ -158,15 +158,15 @@ impl ReliableChannel {
     }
 
     /// Size of the next packet if one can be sent now, otherwise the time until a retransmission
-    /// is due (`None`: nothing in flight).
-    pub fn peek(&mut self, now: Instant) -> Either<usize, Option<Duration>> {
+    /// is due.
+    pub fn peek(&mut self, now: Instant) -> Pop {
         self.gather_in_flights();
         let Some(in_flight) = self.in_flights.peek() else {
-            return Either::Right(None);
+            return Pop::Idle;
         };
         match in_flight.resend_at() {
-            Some(resend_at) if resend_at > now => Either::Right(Some(resend_at - now)),
-            _ => Either::Left(in_flight.packet.serialized_size()),
+            Some(resend_at) if resend_at > now => Pop::Wait(resend_at - now),
+            _ => Pop::Packet(in_flight.packet.serialized_size()),
         }
     }
 

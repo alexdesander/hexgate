@@ -14,14 +14,13 @@ use std::{
 use ahash::HashMap;
 use crossbeam::channel::{Receiver, Sender, TryRecvError};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use either::Either;
 use mio::{Events, Interest, Poll, Waker};
 use rand::thread_rng;
 use siphasher::sip::SipHasher;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel},
+    channel::{scheduler::ChannelConfiguration, Channel, Pop, IDS_EXHAUSTED},
     congestion::CongestionConfiguration,
     crypto::Crypto,
     error::ProtocolViolation,
@@ -333,12 +332,12 @@ impl<R: AuthResult> ServerThreadState<R> {
                 &connection.crypto,
                 &mut self.buf,
             ) {
-                Either::Left(size) => {
+                Pop::Packet(size) => {
                     connection.last_sent = now;
                     self.socket.send_to(to, &self.buf[..size]);
                     connection.congestion.consume(size);
                 }
-                Either::Right(Some(time_till_resend)) => {
+                Pop::Wait(time_till_resend) => {
                     let deadline = (now + time_till_resend).max(connection.last_sent + downtime);
                     self.timed_events.push(
                         TimedEventKey::Send(to),
@@ -347,7 +346,16 @@ impl<R: AuthResult> ServerThreadState<R> {
                     );
                     return;
                 }
-                Either::Right(None) => {
+                Pop::Idle => return,
+                Pop::Exhausted => {
+                    let disconnect = Disconnect {
+                        data: IDS_EXHAUSTED,
+                    };
+                    let size = disconnect.serialize(&connection.crypto, &mut self.buf);
+                    self.socket.send_to(to, &self.buf[..size]);
+                    self.connections.remove(&to);
+                    self.event_tx
+                        .send(Event::Disconnected(to, IDS_EXHAUSTED.to_vec()));
                     return;
                 }
             }

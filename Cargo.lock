@@ -381,12 +381,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "either"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60b1af1c220855b6ceac025d3f6ecdd2b7c4894bfe9cd9bda4fbb4bc7c0d4cf0"
-
-[[package]]
 name = "equivalent"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -460,7 +454,6 @@ dependencies = [
  "chacha20poly1305",
  "crossbeam",
  "ed25519-dalek",
- "either",
  "hkdf",
  "integer-encoding",
  "mio",

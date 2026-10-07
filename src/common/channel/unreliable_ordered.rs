@@ -79,10 +79,14 @@ impl UnreliableOrderedChannel {
         }
     }
 
-    pub fn pop(&mut self, crypto: &Crypto, buf: &mut [u8]) -> usize {
+    /// `None` once the message ids are used up: the next one would wrap and reuse nonces.
+    pub fn pop(&mut self, crypto: &Crypto, buf: &mut [u8]) -> Option<usize> {
         let Some(to_send) = self.to_send.front_mut() else {
-            return 0;
+            return Some(0);
         };
+        if self.next_message_id == u32::MAX {
+            return None;
+        }
         let len = to_send.payload.len();
         if len <= UNRELIABLE_ORDERED_STANDALONE_PAYLOAD_MAX_PAYLOAD_SIZE {
             // Standalone
@@ -95,7 +99,7 @@ impl UnreliableOrderedChannel {
                 message_id,
                 payload: &to_send.payload,
             };
-            packet.serialize(crypto, buf)
+            Some(packet.serialize(crypto, buf))
         } else {
             // Fragmented
             let payload_size =
@@ -118,7 +122,7 @@ impl UnreliableOrderedChannel {
                 self.next_fragment_id = 0;
                 self.to_send.pop_front();
             }
-            size
+            Some(size)
         }
     }
 

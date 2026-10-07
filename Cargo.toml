@@ -37,7 +37,6 @@ x25519-dalek = { version = "2.0.1", features = ["reusable_secrets"] }
 rand_xoshiro = "0.6.0"
 bitvec = "1.0.1"
 priority-queue = "2.1.1"
-either = "1.13.0"
 
 [dev-dependencies]
 anyhow = "1.0.93"

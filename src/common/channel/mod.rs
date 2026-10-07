@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use either::Either;
 use reliable::ReliableChannel;
 use scheduler::{ChannelConfiguration, Scheduler};
 use unreliable::UnreliableChannel;
@@ -29,6 +28,20 @@ mod unreliable;
 mod unreliable_ordered;
 
 // TODO: Implement a scheduler and use it here to make the weights actually do something.
+
+/// Sent to the peer when a message id counter is used up.
+pub(crate) const IDS_EXHAUSTED: &[u8] = b"Message ids exhausted";
+
+pub(crate) enum Pop {
+    /// A packet of this size was written (`peek`: can be sent now).
+    Packet(usize),
+    /// Nothing can be sent before then (reliable retransmissions).
+    Wait(Duration),
+    /// Nothing is queued.
+    Idle,
+    /// A message id counter is used up, sending more would reuse AEAD nonces.
+    Exhausted,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Channel {
@@ -100,45 +113,47 @@ impl Channels {
         }
     }
 
-    /// Encrypts the next packet into `buf`. `Right(Some)` means nothing can be sent before then
-    /// (reliable retransmissions), `Right(None)` means nothing is queued.
+    /// Encrypts the next packet into `buf`.
     pub fn pop(
         &mut self,
         congestion: &mut CongestionController,
         crypto: &Crypto,
         buf: &mut [u8],
-    ) -> Either<usize, Option<Duration>> {
+    ) -> Pop {
         let now = Instant::now();
         let mut next: Option<(u64, usize)> = None;
         let mut wait: Option<Duration> = None;
         for slot in 0..self.scheduler.slots() {
             match self.peek(slot, now) {
-                Either::Left(size) => {
+                Pop::Packet(size) => {
                     let tag = self.scheduler.tag(slot, size);
                     if next.is_none_or(|(best, _)| tag < best) {
                         next = Some((tag, slot));
                     }
                 }
-                Either::Right(slot_wait) => {
+                other => {
                     self.scheduler.clear(slot);
-                    wait = wait.into_iter().chain(slot_wait).min();
+                    if let Pop::Wait(slot_wait) = other {
+                        wait = Some(wait.map_or(slot_wait, |wait| wait.min(slot_wait)));
+                    }
                 }
             }
         }
         let Some((_, slot)) = next else {
             self.scheduler.reset();
-            return Either::Right(wait);
+            return wait.map_or(Pop::Idle, Pop::Wait);
         };
         self.scheduler.served(slot);
         let ordered = self.unreliable_ordered.len();
-        Either::Left(match slot {
+        let size = match slot {
             0 => self.unreliable.pop(crypto, buf),
             slot if slot <= ordered => self.unreliable_ordered[slot - 1].pop(crypto, buf),
-            slot => self.reliable[slot - 1 - ordered].pop(now, congestion, crypto, buf),
-        })
+            slot => Some(self.reliable[slot - 1 - ordered].pop(now, congestion, crypto, buf)),
+        };
+        size.map_or(Pop::Exhausted, Pop::Packet)
     }
 
-    fn peek(&mut self, slot: usize, now: Instant) -> Either<usize, Option<Duration>> {
+    fn peek(&mut self, slot: usize, now: Instant) -> Pop {
         let ordered = self.unreliable_ordered.len();
         let size = match slot {
             0 => self.unreliable.peek_size(),
@@ -146,9 +161,9 @@ impl Channels {
             slot => return self.reliable[slot - 1 - ordered].peek(now),
         };
         if size > 0 {
-            Either::Left(size)
+            Pop::Packet(size)
         } else {
-            Either::Right(None)
+            Pop::Idle
         }
     }
 

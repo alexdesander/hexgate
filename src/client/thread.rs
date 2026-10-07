@@ -11,11 +11,10 @@ use std::{
 };
 
 use crossbeam::channel::{Receiver, TryRecvError};
-use either::Either;
 use mio::{Events, Poll, Waker};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel, Channels},
+    channel::{scheduler::ChannelConfiguration, Channel, Channels, Pop, IDS_EXHAUSTED},
     congestion::CongestionController,
     crypto::Crypto,
     error::ProtocolViolation,
@@ -156,7 +155,11 @@ impl ClientThreadState {
         {
             let (key, _event) = self.timed_events.pop().unwrap();
             match key {
-                TimedEventKey::Send => self.handle_event_send(),
+                TimedEventKey::Send => {
+                    if self.handle_event_send() {
+                        return true;
+                    }
+                }
                 TimedEventKey::SendAcks(channel_id) => self.handle_event_send_acks(channel_id),
                 TimedEventKey::CheckForTimeout => {
                     if self.last_received.elapsed() > self.timeout_dur {
@@ -213,7 +216,8 @@ impl ClientThreadState {
         Ok(false)
     }
 
-    fn handle_event_send(&mut self) {
+    /// Returns true when the connection had to be closed.
+    fn handle_event_send(&mut self) -> bool {
         let now = Instant::now();
         let downtime = self.congestion.downtime_between_batches();
         while self.congestion.can_send(now) {
@@ -221,19 +225,27 @@ impl ClientThreadState {
                 .channels
                 .pop(&mut self.congestion, &self.crypto, &mut self.buf)
             {
-                Either::Left(size) => {
+                Pop::Packet(size) => {
                     self.last_sent = now;
                     self.socket.send(&self.buf[..size]);
                     self.congestion.consume(size);
                 }
-                Either::Right(Some(time_till_resend)) => {
+                Pop::Wait(time_till_resend) => {
                     let deadline = (now + time_till_resend).max(self.last_sent + downtime);
                     self.timed_events
                         .push(TimedEventKey::Send, deadline, TimedEventData::Nothing);
-                    return;
+                    return false;
                 }
-                Either::Right(None) => {
-                    return;
+                Pop::Idle => return false,
+                Pop::Exhausted => {
+                    let disconnect = Disconnect {
+                        data: IDS_EXHAUSTED,
+                    };
+                    let size = disconnect.serialize(&self.crypto, &mut self.buf);
+                    self.socket.send(&self.buf[..size]);
+                    self.event_tx
+                        .send(Event::Disconnected(IDS_EXHAUSTED.to_vec()));
+                    return true;
                 }
             }
         }
@@ -242,6 +254,7 @@ impl ClientThreadState {
             now + self.congestion.time_until_send().max(downtime),
             TimedEventData::Nothing,
         );
+        false
     }
 
     fn handle_event_send_acks(&mut self, channel_id: u8) {
