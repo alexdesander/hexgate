@@ -19,9 +19,38 @@ struct ToSend {
     payload: Rc<Vec<u8>>,
 }
 
+/// Accepts every message id once, within 64 ids of the highest one (drops duplicates and replays).
+struct ReplayWindow {
+    highest: u32,
+    /// Bit `n` is set when `highest - n` was received.
+    seen: u64,
+}
+
+impl ReplayWindow {
+    fn new() -> Self {
+        // Id 0 is never sent.
+        Self {
+            highest: 0,
+            seen: 1,
+        }
+    }
+
+    fn accept(&mut self, id: u32) -> bool {
+        if id > self.highest {
+            self.seen = self.seen.checked_shl(id - self.highest).unwrap_or(0) | 1;
+            self.highest = id;
+            return true;
+        }
+        let bit = 1u64.checked_shl(self.highest - id).unwrap_or(0);
+        let fresh = bit != 0 && self.seen & bit == 0;
+        self.seen |= bit;
+        fresh
+    }
+}
+
 pub struct UnreliableChannel {
     // Standalone
-    standalone_highest_received: u32,
+    standalone_received: ReplayWindow,
     standalone_next: u32,
 
     // Fragmented
@@ -35,7 +64,7 @@ pub struct UnreliableChannel {
 impl UnreliableChannel {
     pub fn new(max_recv_msg_size: usize) -> Self {
         Self {
-            standalone_highest_received: 0,
+            standalone_received: ReplayWindow::new(),
             standalone_next: 1,
 
             fragmented_next: 1,
@@ -131,13 +160,10 @@ impl UnreliableChannel {
             UnreliablePayload::Standalone {
                 message_id,
                 payload,
-            } => {
-                if message_id < self.standalone_highest_received.saturating_sub(64) {
-                    return Ok(None);
-                }
-                self.standalone_highest_received = self.standalone_highest_received.max(message_id);
-                Ok(Some(payload.to_vec()))
-            }
+            } => Ok(self
+                .standalone_received
+                .accept(message_id)
+                .then(|| payload.to_vec())),
             UnreliablePayload::Fragmented {
                 message_id,
                 fragment_id,
