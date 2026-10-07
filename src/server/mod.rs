@@ -50,6 +50,7 @@ pub enum Event<R: AuthResult> {
 
 pub struct Server<R: AuthResult, A: Authenticator<R>> {
     send_limits: SendLimits,
+    local_addr: SocketAddr,
     inner: Arc<ServerInner<R, A>>,
 }
 
@@ -57,6 +58,7 @@ impl<R: AuthResult, A: Authenticator<R>> Clone for Server<R, A> {
     fn clone(&self) -> Self {
         Self {
             send_limits: self.send_limits,
+            local_addr: self.local_addr,
             inner: self.inner.clone(),
         }
     }
@@ -72,6 +74,11 @@ struct ServerInner<R: AuthResult, A: Authenticator<R>> {
 }
 
 impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
+    /// The address the server is bound to (e.g. the port chosen for `bind_addr` port 0).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     /// Sets the info that will be sent to clients on info requests (for server list pings etc).
     /// Info can be at most 256 bytes.
     pub fn set_info(&self, info: Vec<u8>) -> Result<(), TooLarge> {
@@ -187,6 +194,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
             .maybe_buffer_size_bytes(socket_buffer_size)
             .maybe_simulator(simulator)
             .build()?;
+        let local_addr = socket.local_addr()?;
         let (event_tx, event_rx) = events::channel(max_events);
 
         // TODO: Benchmark for optimal cipher
@@ -257,6 +265,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
 
         Ok(Server {
             send_limits,
+            local_addr,
             inner: Arc::new(ServerInner {
                 _phantom: PhantomData,
                 event_rx,

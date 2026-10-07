@@ -60,6 +60,10 @@ impl Socket {
 }
 
 impl Socket {
+    pub fn local_addr(&self) -> Result<SocketAddr, io::Error> {
+        self.inner.socket.local_addr()
+    }
+
     pub fn mio_socket(&mut self) -> &mut mio::net::UdpSocket {
         &mut self.inner.mio_socket
     }

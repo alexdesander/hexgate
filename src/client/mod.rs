@@ -137,6 +137,7 @@ pub enum Event {
 #[derive(Clone)]
 pub struct Client {
     send_limits: SendLimits,
+    local_addr: SocketAddr,
     inner: Arc<ClientInner>,
 }
 
@@ -173,6 +174,10 @@ impl Client {
     pub fn set_simulator(&self, simulator: Option<Box<dyn NetworkSimulator>>) {
         let _ = self.inner.cmd_tx.send(Cmd::SetSimulator(simulator));
         let _ = self.inner.waker.wake();
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 
     pub fn get_server_key(&self) -> [u8; 32] {
@@ -254,6 +259,7 @@ impl Client {
             .maybe_buffer_size_bytes(socket_buffer_size)
             .maybe_simulator(simulator)
             .build()?;
+        let local_addr = socket.local_addr()?;
         let mut poll = Poll::new()?;
         poll.registry()
             .register(socket.mio_socket(), RECV_TOKEN, Interest::READABLE)?;
@@ -423,6 +429,7 @@ impl Client {
 
             return Ok(Client {
                 send_limits,
+                local_addr,
                 inner: Arc::new(ClientInner {
                     server_ed25519_pubkey,
                     cmd_tx,
