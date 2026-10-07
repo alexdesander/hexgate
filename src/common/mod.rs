@@ -7,6 +7,8 @@ use mio::Token;
 pub mod channel;
 pub mod congestion;
 pub(crate) mod crypto;
+pub mod error;
+pub(crate) mod events;
 pub(crate) mod packets;
 pub mod socket;
 pub(crate) mod timed_event_queue;

@@ -12,7 +12,7 @@ use std::{
 
 use argon2::{Argon2, Params};
 use bon::bon;
-use crossbeam::channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
+use crossbeam::channel::{unbounded, Sender};
 use ed25519_dalek::VerifyingKey;
 use mio::{Poll, Waker};
 use rand::thread_rng;
@@ -23,6 +23,8 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, Channels},
     congestion::{CongestionConfiguration, CongestionController},
     crypto::Crypto,
+    error::RecvError,
+    events::{self, EventReceiver},
     packets::{
         client_hello::ClientHello, connection_request::ConnectionRequest,
         connection_response::ConnectionResponse, info_request::InfoRequest,
@@ -114,18 +116,14 @@ pub struct Client {
 }
 
 impl Client {
-    /// This is non-blocking, Err(()) means the client has shutdown
-    pub fn try_next(&self) -> Result<Option<Event>, ()> {
-        match self.inner.event_rx.try_recv() {
-            Ok(event) => Ok(Some(event)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(()),
-        }
+    /// This is non-blocking, an error means the client has shut down.
+    pub fn try_next(&self) -> Result<Option<Event>, RecvError> {
+        self.inner.event_rx.try_next()
     }
 
-    /// This is blocking, Err(()) means the client has shutdown
-    pub fn next(&self) -> Result<Event, ()> {
-        self.inner.event_rx.recv().map_err(|_| ())
+    /// This is blocking, an error means the client has shut down.
+    pub fn next(&self) -> Result<Event, RecvError> {
+        self.inner.event_rx.next()
     }
 
     pub fn send(&self, channel: Channel, message: Vec<u8>) -> Result<(), ()> {
@@ -162,9 +160,9 @@ impl Client {
 struct ClientInner {
     server_ed25519_pubkey: VerifyingKey,
     cmd_tx: Sender<Cmd>,
-    event_rx: Receiver<Event>,
+    event_rx: EventReceiver<Event>,
     waker: Arc<Waker>,
-    thread: Option<JoinHandle<Result<(), io::Error>>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Drop for ClientInner {
@@ -219,7 +217,7 @@ impl Client {
                 client_version,
             };
             let size = client_hello.serialize(&mut buf);
-            socket.send(&buf[..size])?;
+            socket.send(&buf[..size]);
 
             // Wait for ServerHello
             let timestamp: [u8; 8];
@@ -289,7 +287,7 @@ impl Client {
                 hkdf_salt,
             };
             let size = connection_request.serialize(&mut buf);
-            socket.send(&buf[..size])?;
+            socket.send(&buf[..size]);
 
             // Wait for ConnectionResponse
             let crypto: Crypto;
@@ -342,7 +340,7 @@ impl Client {
                 auth_data: &auth_data,
             };
             let size = login_request.serialize(&crypto, &mut buf);
-            socket.send(&buf[..size])?;
+            socket.send(&buf[..size]);
 
             // Receive LoginResponse
             let start = Instant::now();
@@ -372,7 +370,7 @@ impl Client {
             }
 
             // Handshake done, run thread
-            let (event_tx, event_rx) = bounded(1024);
+            let (event_tx, event_rx) = events::channel(1024);
             let (cmd_tx, cmd_rx) = unbounded();
             let poll = Poll::new()?;
             let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
@@ -401,7 +399,9 @@ impl Client {
                     congestion,
                     last_sent: Instant::now(),
                 };
-                state.run()
+                if let Err(e) = state.run() {
+                    state.event_tx.fail(e);
+                }
             });
 
             return Ok(Client {

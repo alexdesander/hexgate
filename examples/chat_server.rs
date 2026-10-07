@@ -83,7 +83,8 @@ fn main() -> anyhow::Result<()> {
                     (format!("{}: {}", clients.get(&addr).unwrap(), data), addr)
                 }
             },
-            Err(()) => {
+            Err(e) => {
+                println!("Server has shutdown: {e}");
                 break;
             }
         };
@@ -95,6 +96,5 @@ fn main() -> anyhow::Result<()> {
             let _ = server.send(*client_addr, Channel::Reliable(0), text.as_bytes().to_vec());
         }
     }
-    println!("Server has shutdown");
     Ok(())
 }

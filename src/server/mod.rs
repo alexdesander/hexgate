@@ -8,7 +8,7 @@ use std::{
 
 use auth::{AuthResult, AuthThreadState, Authenticator};
 use bon::bon;
-use crossbeam::channel::{bounded, unbounded, Receiver, TryRecvError};
+use crossbeam::channel::{bounded, unbounded};
 use ed25519_dalek::SigningKey;
 use mio::{Poll, Waker};
 use siphasher::sip::SipHasher;
@@ -18,6 +18,8 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel},
     congestion::CongestionConfiguration,
     crypto::sym::SymCipher,
+    error::RecvError,
+    events::{self, EventReceiver},
     socket::{net_sym::NetworkSimulator, Socket},
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
@@ -51,10 +53,10 @@ impl<R: AuthResult, A: Authenticator<R>> Clone for Server<R, A> {
 
 struct ServerInner<R: AuthResult, A: Authenticator<R>> {
     _phantom: PhantomData<A>,
-    event_rx: Receiver<Event<R>>,
+    event_rx: EventReceiver<Event<R>>,
     cmd_tx: crossbeam::channel::Sender<thread::Cmd<R>>,
     waker: Arc<Waker>,
-    thread: Option<JoinHandle<Result<(), io::Error>>>,
+    thread: Option<JoinHandle<()>>,
     auth_thread: Option<JoinHandle<()>>,
 }
 
@@ -66,18 +68,14 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         let _ = self.inner.waker.wake();
     }
 
-    /// This is non-blocking, Err(()) means the server has shutdown
-    pub fn try_next(&self) -> Result<Option<Event<R>>, ()> {
-        match self.inner.event_rx.try_recv() {
-            Ok(event) => Ok(Some(event)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(()),
-        }
+    /// This is non-blocking, an error means the server has shut down.
+    pub fn try_next(&self) -> Result<Option<Event<R>>, RecvError> {
+        self.inner.event_rx.try_next()
     }
 
-    /// This is blocking, Err(()) means the server has shutdown
-    pub fn next(&self) -> Result<Event<R>, ()> {
-        self.inner.event_rx.recv().map_err(|_| ())
+    /// This is blocking, an error means the server has shut down.
+    pub fn next(&self) -> Result<Event<R>, RecvError> {
+        self.inner.event_rx.next()
     }
 
     pub fn send(&self, to: SocketAddr, channel: Channel, message: Vec<u8>) -> Result<(), ()> {
@@ -147,7 +145,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
             .maybe_buffer_size_bytes(socket_buffer_size)
             .maybe_simulator(simulator)
             .build()?;
-        let (event_tx, event_rx) = bounded(max_events);
+        let (event_tx, event_rx) = events::channel(max_events);
 
         // TODO: Benchmark for optimal cipher
         let cipher = cipher.unwrap_or(SymCipher::better());
@@ -205,7 +203,9 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
                 channel_config,
                 congestion_config,
             };
-            state.run()
+            if let Err(e) = state.run() {
+                state.event_tx.fail(e);
+            }
         });
 
         Ok(Server {

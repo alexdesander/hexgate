@@ -99,38 +99,58 @@ impl Socket {
         self.inner.use_simulator = use_simulator;
     }
 
-    pub fn send_to(&self, to: SocketAddr, data: &[u8]) -> Result<(), io::Error> {
+    /// Send errors are treated like lost packets: transient conditions (full buffers, ICMP
+    /// errors, an unreachable peer) must not take down the connection, timeouts handle the rest.
+    pub fn send_to(&self, to: SocketAddr, data: &[u8]) {
         assert!(data.len() <= 1200);
         if self.inner.use_simulator && self.inner.simulator.is_some() {
             let (sim_cmd_tx, _) = self.inner.simulator.as_ref().unwrap();
-            sim_cmd_tx
-                .send(SimulatorThreadCmd::Send(to, data.to_vec()))
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        "Simulator thread not running anymore (sending packet failed)",
-                    )
-                })?;
+            let _ = sim_cmd_tx.send(SimulatorThreadCmd::Send(to, data.to_vec()));
         } else {
             // BSD-derived stacks reject send_to on connected sockets (EISCONN).
-            let sent = match self.inner.connected_to {
-                Some(_) => self.inner.socket.send(data)?,
-                None => self.inner.socket.send_to(data, to)?,
+            let _ = match self.inner.connected_to {
+                Some(_) => self.inner.socket.send(data),
+                None => self.inner.socket.send_to(data, to),
             };
-            if sent != data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Failed to send all data",
-                ));
-            }
         }
-        Ok(())
     }
 
-    pub fn send(&self, data: &[u8]) -> Result<(), io::Error> {
-        self.send_to(self.inner.connected_to.unwrap(), data)?;
-        Ok(())
+    pub fn send(&self, data: &[u8]) {
+        self.send_to(self.inner.connected_to.unwrap(), data);
     }
+
+    /// Receives the next datagram, `None` means there is none right now. Errors caused by a
+    /// single datagram or an ICMP message are skipped, only fatal errors are returned.
+    pub fn recv_from(&mut self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddr)>, io::Error> {
+        loop {
+            match self.inner.mio_socket.recv_from(buf) {
+                Ok(received) => return Ok(Some(received)),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(e) if is_transient(&e) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+fn is_transient(e: &io::Error) -> bool {
+    // WSAEMSGSIZE: Windows reports oversized datagrams as an error.
+    const WSAEMSGSIZE: i32 = 10040;
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+    ) || (cfg!(windows) && e.raw_os_error() == Some(WSAEMSGSIZE))
 }
 
 impl Drop for SocketInner {

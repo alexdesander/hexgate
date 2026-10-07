@@ -55,18 +55,13 @@ pub(crate) fn simulator_thread(
             if deadline.elapsed() > Duration::ZERO {
                 let (_key, event) = timed_events.pop().unwrap();
                 match event {
+                    // A failed send is a lost packet, like on the real network path.
                     Event::Send(socket_addr, packet) => {
-                        let result = if connected {
+                        let _ = if connected {
                             socket.send(&packet)
                         } else {
                             socket.send_to(&packet, socket_addr)
                         };
-                        match result {
-                            Ok(size) => assert_eq!(size, packet.len()),
-                            Err(e) => {
-                                todo!("Handle send errors in simulator_thread: {:?}", e);
-                            }
-                        }
                     }
                 }
                 continue;

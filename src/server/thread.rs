@@ -24,6 +24,7 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel},
     congestion::CongestionConfiguration,
     crypto::Crypto,
+    events::EventSender,
     packets::{
         acks::Acks, client_hello::ClientHello, connection_request::ConnectionRequest,
         connection_response::ConnectionResponse, disconnect::Disconnect, info_request::InfoRequest,
@@ -68,7 +69,7 @@ pub enum TimedEventData {
 }
 
 pub struct ServerThreadState<R: AuthResult> {
-    pub event_tx: Sender<Event<R>>,
+    pub event_tx: EventSender<Event<R>>,
     pub cmds: Receiver<Cmd<R>>,
     pub socket: Socket,
     pub poll: Poll,
@@ -110,9 +111,10 @@ impl<R: AuthResult> ServerThreadState<R> {
             .register(self.socket.mio_socket(), RECV_TOKEN, Interest::READABLE)?;
 
         loop {
-            if self.handle_all_cmds()? || self.handle_all_events()? {
+            if self.handle_all_cmds()? {
                 break;
             }
+            self.handle_all_events();
             let max_poll_time = self.timed_events.next().map(|deadline| {
                 deadline
                     .saturating_duration_since(Instant::now())
@@ -143,7 +145,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                     let disconnect = Disconnect { data: &reason };
                     for (addr, connection) in self.connections.drain() {
                         let size = disconnect.serialize(&connection.crypto, &mut self.buf);
-                        self.socket.send_to(addr, &self.buf[..size])?;
+                        self.socket.send_to(addr, &self.buf[..size]);
                     }
                     return Ok(true);
                 }
@@ -152,10 +154,10 @@ impl<R: AuthResult> ServerThreadState<R> {
                     self.info = info;
                 }
                 Cmd::AuthSuccess(socket_addr, auth_result) => {
-                    self.handle_cmd_auth_success(socket_addr, auth_result)?;
+                    self.handle_cmd_auth_success(socket_addr, auth_result);
                 }
                 Cmd::AuthFailed(socket_addr, vec) => {
-                    self.handle_cmd_auth_failure(socket_addr, vec)?;
+                    self.handle_cmd_auth_failure(socket_addr, vec);
                 }
                 Cmd::Send(socket_addr, channel, message) => {
                     let Some(connection) = self.connections.get_mut(&socket_addr) else {
@@ -170,9 +172,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                 }
                 Cmd::SetSimulator(network_simulator) => {
                     if let Some(network_simulator) = network_simulator {
-                        self.socket
-                            .set_network_simulator(network_simulator)
-                            .unwrap();
+                        self.socket.set_network_simulator(network_simulator)?;
                         self.socket.set_use_simulator(true);
                     } else {
                         self.socket.set_use_simulator(false);
@@ -183,7 +183,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         Ok(false)
     }
 
-    fn handle_all_events(&mut self) -> Result<bool, io::Error> {
+    fn handle_all_events(&mut self) {
         while self
             .timed_events
             .next()
@@ -195,36 +195,23 @@ impl<R: AuthResult> ServerThreadState<R> {
                     self.expecting_login_requests.remove(&(socket_addr, salt));
                 }
                 TimedEventKey::CheckForTimeouts => {
-                    self.handle_event_check_for_timeouts()?;
+                    self.handle_event_check_for_timeouts();
                 }
                 TimedEventKey::DiscoverLatencies => {
-                    self.handle_event_discover_latencies()?;
+                    self.handle_event_discover_latencies();
                 }
                 TimedEventKey::Send(socket_addr) => {
-                    self.handle_event_send(socket_addr)?;
+                    self.handle_event_send(socket_addr);
                 }
                 TimedEventKey::SendAcks(socket_addr, channel_id) => {
-                    self.handle_event_send_acks(socket_addr, channel_id)?;
+                    self.handle_event_send_acks(socket_addr, channel_id);
                 }
             }
         }
-        Ok(false)
     }
 
     fn handle_all_recvs(&mut self) -> Result<(), io::Error> {
-        loop {
-            let (size, from) = match self.socket.mio_socket().recv_from(&mut self.buf) {
-                Ok(x) => x,
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    break
-                }
-                // Windows shenanigans
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
-                Err(e) => return Err(e),
-            };
+        while let Some((size, from)) = self.socket.recv_from(&mut self.buf)? {
             if size == 0 || size > 1200 {
                 continue;
             }
@@ -232,15 +219,15 @@ impl<R: AuthResult> ServerThreadState<R> {
                 continue;
             };
             match packet_identifier {
-                PacketIdentifier::InfoRequest => self.handle_packet_info_request(size, from)?,
-                PacketIdentifier::ClientHello => self.handle_packet_client_hello(size, from)?,
+                PacketIdentifier::InfoRequest => self.handle_packet_info_request(size, from),
+                PacketIdentifier::ClientHello => self.handle_packet_client_hello(size, from),
                 PacketIdentifier::ConnectionRequest => {
-                    self.handle_packet_connection_request(size, from)?
+                    self.handle_packet_connection_request(size, from)
                 }
-                PacketIdentifier::LoginRequest => self.handle_packet_login_request(size, from)?,
-                PacketIdentifier::Disconnect => self.handle_packet_disconnect(size, from)?,
+                PacketIdentifier::LoginRequest => self.handle_packet_login_request(size, from),
+                PacketIdentifier::Disconnect => self.handle_packet_disconnect(size, from),
                 PacketIdentifier::LatencyDiscoveryResponse => {
-                    self.handle_packet_latency_discovery_response(size, from)?
+                    self.handle_packet_latency_discovery_response(size, from)
                 }
                 PacketIdentifier::UnreliableStandalonePayload
                 | PacketIdentifier::UnreliableFragmentedPayload
@@ -248,26 +235,26 @@ impl<R: AuthResult> ServerThreadState<R> {
                 | PacketIdentifier::UnreliableOrderedStandalonePayload
                 | PacketIdentifier::UnreliableOrderedFragmentedPayload
                 | PacketIdentifier::UnreliableOrderedFragmentedPayloadLast => {
-                    self.handle_packet_unreliable_payload(size, from)?
+                    self.handle_packet_unreliable_payload(size, from)
                 }
                 PacketIdentifier::ReliablePayloadNoAcks => {
-                    self.handle_packet_reliable_payload(size, from)?
+                    self.handle_packet_reliable_payload(size, from)
                 }
-                PacketIdentifier::Acks => self.handle_packet_acks(size, from)?,
+                PacketIdentifier::Acks => self.handle_packet_acks(size, from),
                 _ => continue,
             }
         }
         Ok(())
     }
 
-    fn handle_event_check_for_timeouts(&mut self) -> Result<(), io::Error> {
+    fn handle_event_check_for_timeouts(&mut self) {
         let mut timed_outs = Vec::new();
         for (addr, connection) in &self.connections {
             if connection.last_received.elapsed() > self.timeout_dur {
                 let disconnect = Disconnect { data: b"Timeout" };
                 let size = disconnect.serialize(&connection.crypto, &mut self.buf);
-                self.socket.send_to(*addr, &self.buf[..size])?;
-                let _ = self.event_tx.send(Event::TimedOut(*addr));
+                self.socket.send_to(*addr, &self.buf[..size]);
+                self.event_tx.send(Event::TimedOut(*addr));
                 timed_outs.push(*addr);
             }
         }
@@ -283,10 +270,9 @@ impl<R: AuthResult> ServerThreadState<R> {
         } else {
             self.is_checking_for_timeouts = false;
         }
-        Ok(())
     }
 
-    fn handle_event_discover_latencies(&mut self) -> Result<(), io::Error> {
+    fn handle_event_discover_latencies(&mut self) {
         let sequence_number = self
             .latency_discoveries_sent
             .last_entry()
@@ -302,7 +288,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         }
         for (addr, connection) in self.connections.iter() {
             let size = latency_discovery.serialize(&connection.crypto, &mut self.buf);
-            self.socket.send_to(*addr, &self.buf[..size])?;
+            self.socket.send_to(*addr, &self.buf[..size]);
         }
         if self.connections.len() > 0 {
             self.timed_events.push(
@@ -313,12 +299,11 @@ impl<R: AuthResult> ServerThreadState<R> {
         } else {
             self.is_discovering_latencies = false;
         }
-        Ok(())
     }
 
-    fn handle_event_send(&mut self, to: SocketAddr) -> Result<(), io::Error> {
+    fn handle_event_send(&mut self, to: SocketAddr) {
         let Some(connection) = self.connections.get_mut(&to) else {
-            return Ok(());
+            return;
         };
         let now = Instant::now();
         let mut batch_size = connection.congestion.allowed_to_send_this_batch();
@@ -331,7 +316,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             ) {
                 Either::Left(size) => {
                     connection.last_sent = now;
-                    self.socket.send_to(to, &self.buf[..size])?;
+                    self.socket.send_to(to, &self.buf[..size]);
                     batch_size = batch_size.saturating_sub(size as u32);
                 }
                 Either::Right(Some(time_till_resend)) => {
@@ -348,7 +333,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                     break;
                 }
                 Either::Right(None) => {
-                    return Ok(());
+                    return;
                 }
             }
         }
@@ -357,37 +342,31 @@ impl<R: AuthResult> ServerThreadState<R> {
             now + connection.congestion.downtime_between_batches(),
             TimedEventData::Nothing,
         );
-        Ok(())
     }
 
-    fn handle_event_send_acks(&mut self, to: SocketAddr, channel_id: u8) -> Result<(), io::Error> {
+    fn handle_event_send_acks(&mut self, to: SocketAddr, channel_id: u8) {
         let Some(connection) = self.connections.get_mut(&to) else {
-            return Ok(());
+            return;
         };
         let acks = connection.channels.acks(Channel::Reliable(channel_id));
         let size = acks.serialize(&connection.crypto, &mut self.buf);
-        self.socket.send_to(to, &self.buf[..size])?;
-        Ok(())
+        self.socket.send_to(to, &self.buf[..size]);
     }
 
-    fn handle_cmd_auth_success(
-        &mut self,
-        from: SocketAddr,
-        auth_result: R,
-    ) -> Result<(), io::Error> {
+    fn handle_cmd_auth_success(&mut self, from: SocketAddr, auth_result: R) {
         let Some(crypto) = self.expecting_auth_result.remove(&from) else {
-            return Ok(());
+            return;
         };
         let login_response = LoginResponse::Success;
         let size = login_response.serialize(&crypto, &mut self.buf);
-        self.socket.send_to(from, &self.buf[..size])?;
+        self.socket.send_to(from, &self.buf[..size]);
         if let Some(_old_connection) = self.connections.insert(
             from,
             Connection::new(crypto, &self.channel_config, self.congestion_config),
         ) {
             todo!("Handle old connection");
         };
-        let _ = self.event_tx.send(Event::Connected(from, auth_result));
+        self.event_tx.send(Event::Connected(from, auth_result));
 
         self.timed_events.push(
             TimedEventKey::DiscoverLatencies,
@@ -400,46 +379,31 @@ impl<R: AuthResult> ServerThreadState<R> {
             Instant::now() + self.timeout_dur + Duration::from_secs(1),
             TimedEventData::Nothing,
         );
-        Ok(())
     }
 
-    fn handle_cmd_auth_failure(
-        &mut self,
-        from: SocketAddr,
-        failure_data: Vec<u8>,
-    ) -> Result<(), io::Error> {
+    fn handle_cmd_auth_failure(&mut self, from: SocketAddr, failure_data: Vec<u8>) {
         let Some(crypto) = self.expecting_auth_result.remove(&from) else {
-            return Ok(());
+            return;
         };
         let login_response = LoginResponse::Failure {
             failure_data: &failure_data,
         };
         let size = login_response.serialize(&crypto, &mut self.buf);
-        self.socket.send_to(from, &self.buf[..size])?;
-        Ok(())
+        self.socket.send_to(from, &self.buf[..size]);
     }
 
-    fn handle_packet_info_request(
-        &mut self,
-        size: usize,
-        from: SocketAddr,
-    ) -> Result<(), io::Error> {
+    fn handle_packet_info_request(&mut self, size: usize, from: SocketAddr) {
         let Ok(_) = InfoRequest::deserialize(&self.buf[..size]) else {
-            return Ok(());
+            return;
         };
         let info_response = InfoResponse::new(&self.info);
         let size = info_response.serialize(&mut self.buf);
-        self.socket.send_to(from, &self.buf[..size])?;
-        Ok(())
+        self.socket.send_to(from, &self.buf[..size]);
     }
 
-    fn handle_packet_client_hello(
-        &mut self,
-        size: usize,
-        from: SocketAddr,
-    ) -> Result<(), io::Error> {
+    fn handle_packet_client_hello(&mut self, size: usize, from: SocketAddr) {
         let Ok(client_hello) = ClientHello::deserialize(&self.buf[..size]) else {
-            return Ok(());
+            return;
         };
         let server_hello = match (self.allowed_client_versions)(client_hello.client_version) {
             Ok(()) => {
@@ -461,20 +425,15 @@ impl<R: AuthResult> ServerThreadState<R> {
             },
         };
         let size = server_hello.serialize(&self.siphasher, &mut self.buf);
-        self.socket.send_to(from, &self.buf[..size])?;
-        Ok(())
+        self.socket.send_to(from, &self.buf[..size]);
     }
 
-    fn handle_packet_connection_request(
-        &mut self,
-        size: usize,
-        from: SocketAddr,
-    ) -> Result<(), io::Error> {
+    fn handle_packet_connection_request(&mut self, size: usize, from: SocketAddr) {
         let Ok(connection_request) = ConnectionRequest::deserialize(&self.buf[..size]) else {
-            return Ok(());
+            return;
         };
         if connection_request.siphash != self.siphasher.hash(&self.buf[1..45]).to_le_bytes() {
-            return Ok(());
+            return;
         }
         if !self.disable_timestamp_age_check {
             let min_time_stamp = SystemTime::now()
@@ -484,7 +443,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                 .as_secs();
             let time_stamp = u64::from_le_bytes(connection_request.timestamp);
             if time_stamp < min_time_stamp {
-                return Ok(());
+                return;
             }
         }
         let x25519_secret_key = EphemeralSecret::random_from_rng(&mut thread_rng());
@@ -504,7 +463,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             auth_salt: self.auth_salt,
         };
         let size = connection_response.serialize(&crypto, &self.signing_key, &mut self.buf);
-        self.socket.send_to(from, &self.buf[..size])?;
+        self.socket.send_to(from, &self.buf[..size]);
         self.expecting_login_requests
             .insert((from, connection_request.salt), crypto);
         self.timed_events.push(
@@ -512,22 +471,17 @@ impl<R: AuthResult> ServerThreadState<R> {
             Instant::now() + Duration::from_secs(8),
             TimedEventData::Nothing,
         );
-        Ok(())
     }
 
-    fn handle_packet_login_request(
-        &mut self,
-        size: usize,
-        from: SocketAddr,
-    ) -> Result<(), io::Error> {
+    fn handle_packet_login_request(&mut self, size: usize, from: SocketAddr) {
         let Some(salt) = LoginRequest::deserialize_salt(&self.buf[..size]) else {
-            return Ok(());
+            return;
         };
         let Some(crypto) = self.expecting_login_requests.get_mut(&(from, salt)) else {
-            return Ok(());
+            return;
         };
         let Ok(login_request) = LoginRequest::deserialize(&crypto, &mut self.buf[..size]) else {
-            return Ok(());
+            return;
         };
         let crypto = self.expecting_login_requests.remove(&(from, salt)).unwrap();
         self.expecting_auth_result.insert(from, crypto);
@@ -537,47 +491,40 @@ impl<R: AuthResult> ServerThreadState<R> {
                 login_request.auth_data.to_vec(),
             ))
             .unwrap();
-        Ok(())
     }
 
-    fn handle_packet_disconnect(&mut self, size: usize, from: SocketAddr) -> Result<(), io::Error> {
+    fn handle_packet_disconnect(&mut self, size: usize, from: SocketAddr) {
         let Some(connection) = self.connections.get(&from) else {
-            return Ok(());
+            return;
         };
         let Ok(disconnect) = Disconnect::deserialize(&connection.crypto, &mut self.buf[..size])
         else {
-            return Ok(());
+            return;
         };
         self.connections.remove(&from);
-        let _ = self
-            .event_tx
+        self.event_tx
             .send(Event::Disconnected(from, disconnect.data.to_vec()));
-        Ok(())
     }
 
-    fn handle_packet_latency_discovery_response(
-        &mut self,
-        size: usize,
-        from: SocketAddr,
-    ) -> Result<(), io::Error> {
+    fn handle_packet_latency_discovery_response(&mut self, size: usize, from: SocketAddr) {
         let Some(connection) = self.connections.get_mut(&from) else {
-            return Ok(());
+            return;
         };
         let Ok(latency_discovery_response) =
             LatencyDiscoveryResponse::deserialize(&connection.crypto, &mut self.buf[..size])
         else {
-            return Ok(());
+            return;
         };
         if latency_discovery_response.sequence_number <= connection.last_latency_discovery_response
         {
-            return Ok(());
+            return;
         }
         let Some(sent) = self
             .latency_discoveries_sent
             .get(&latency_discovery_response.sequence_number)
         else {
             // TODO: Think about what to do with really, really bad connections
-            return Ok(());
+            return;
         };
         connection.last_latency_discovery_response = latency_discovery_response.sequence_number;
         let latency = sent.elapsed();
@@ -588,46 +535,35 @@ impl<R: AuthResult> ServerThreadState<R> {
             truncated_siphash: 0,
         };
         let size = latency_discovery_response_2.serialize(&connection.crypto, &mut self.buf);
-        self.socket.send_to(from, &self.buf[..size])?;
+        self.socket.send_to(from, &self.buf[..size]);
 
         connection.last_received = Instant::now();
-
-        Ok(())
     }
 
-    fn handle_packet_unreliable_payload(
-        &mut self,
-        size: usize,
-        from: SocketAddr,
-    ) -> Result<(), io::Error> {
+    fn handle_packet_unreliable_payload(&mut self, size: usize, from: SocketAddr) {
         let Some(connection) = self.connections.get_mut(&from) else {
-            return Ok(());
+            return;
         };
         let Ok(packet) = UnreliablePayload::deserialize(&connection.crypto, &mut self.buf[0..size])
         else {
-            return Ok(());
+            return;
         };
         let Some(message) = connection.channels.handle_unreliable(packet) else {
-            return Ok(());
+            return;
         };
-        let _ = self.event_tx.send(Event::Received(from, message));
-        Ok(())
+        self.event_tx.send(Event::Received(from, message));
     }
 
-    fn handle_packet_reliable_payload(
-        &mut self,
-        size: usize,
-        from: SocketAddr,
-    ) -> Result<(), io::Error> {
+    fn handle_packet_reliable_payload(&mut self, size: usize, from: SocketAddr) {
         let Some(connection) = self.connections.get_mut(&from) else {
-            return Ok(());
+            return;
         };
         let Ok(packet) = ReliablePayload::deserialize(&connection.crypto, &mut self.buf[..size])
         else {
-            return Ok(());
+            return;
         };
         if packet.channel_id() as usize >= self.channel_config.weights_reliable.len() {
-            return Ok(());
+            return;
         }
         self.timed_events.push(
             TimedEventKey::SendAcks(from, packet.channel_id()),
@@ -635,19 +571,17 @@ impl<R: AuthResult> ServerThreadState<R> {
             TimedEventData::Nothing,
         );
         for message in connection.channels.handle_reliable(packet) {
-            self.event_tx.send(Event::Received(from, message)).unwrap();
+            self.event_tx.send(Event::Received(from, message));
         }
-        Ok(())
     }
 
-    fn handle_packet_acks(&mut self, size: usize, from: SocketAddr) -> Result<(), io::Error> {
+    fn handle_packet_acks(&mut self, size: usize, from: SocketAddr) {
         let Some(connection) = self.connections.get_mut(&from) else {
-            return Ok(());
+            return;
         };
         let Ok(packet) = Acks::deserialize(&connection.crypto, &self.buf[..size]) else {
-            return Ok(());
+            return;
         };
         connection.channels.handle_acks(packet);
-        Ok(())
     }
 }

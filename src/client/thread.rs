@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam::channel::{Receiver, Sender, TryRecvError};
+use crossbeam::channel::{Receiver, TryRecvError};
 use either::Either;
 use mio::{Events, Interest, Poll, Waker};
 
@@ -18,6 +18,7 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, Channels},
     congestion::CongestionController,
     crypto::Crypto,
+    events::EventSender,
     packets::{
         acks::Acks, disconnect::Disconnect, latency_discovery::LatencyDiscovery,
         latency_discovery_response::LatencyDiscoveryResponse,
@@ -51,7 +52,7 @@ pub enum TimedEventData {
 
 pub struct ClientThreadState {
     pub cmds: Receiver<Cmd>,
-    pub event_tx: Sender<Event>,
+    pub event_tx: EventSender<Event>,
     pub poll: Poll,
     pub _waker: Arc<Waker>,
     pub socket: Socket,
@@ -86,7 +87,7 @@ impl ClientThreadState {
             .register(self.socket.mio_socket(), RECV_TOKEN, Interest::READABLE)?;
 
         'outer: loop {
-            if self.handle_all_cmds()? || self.handle_all_events()? {
+            if self.handle_all_cmds()? || self.handle_all_events() {
                 break;
             }
             let max_poll_time = self.timed_events.next().map(|deadline| {
@@ -122,7 +123,7 @@ impl ClientThreadState {
                 Cmd::Disconnect(data) => {
                     let disconnect = Disconnect { data: &data };
                     let size = disconnect.serialize(&self.crypto, &mut self.buf);
-                    self.socket.send(&self.buf[..size])?;
+                    self.socket.send(&self.buf[..size]);
                     return Ok(true);
                 }
                 Cmd::Send(channel, payload) => {
@@ -135,9 +136,7 @@ impl ClientThreadState {
                 }
                 Cmd::SetSimulator(network_simulator) => {
                     if let Some(network_simulator) = network_simulator {
-                        self.socket
-                            .set_network_simulator(network_simulator)
-                            .unwrap();
+                        self.socket.set_network_simulator(network_simulator)?;
                         self.socket.set_use_simulator(true);
                     } else {
                         self.socket.set_use_simulator(false);
@@ -148,7 +147,7 @@ impl ClientThreadState {
         Ok(false)
     }
 
-    fn handle_all_events(&mut self) -> Result<bool, io::Error> {
+    fn handle_all_events(&mut self) -> bool {
         while self
             .timed_events
             .next()
@@ -156,15 +155,15 @@ impl ClientThreadState {
         {
             let (key, _event) = self.timed_events.pop().unwrap();
             match key {
-                TimedEventKey::Send => self.handle_event_send()?,
-                TimedEventKey::SendAcks(channel_id) => self.handle_event_send_acks(channel_id)?,
+                TimedEventKey::Send => self.handle_event_send(),
+                TimedEventKey::SendAcks(channel_id) => self.handle_event_send_acks(channel_id),
                 TimedEventKey::CheckForTimeout => {
                     if self.last_received.elapsed() > self.timeout_dur {
                         let disconnect = Disconnect { data: b"Timeout" };
                         let size = disconnect.serialize(&self.crypto, &mut self.buf);
-                        self.socket.send(&self.buf[..size])?;
-                        let _ = self.event_tx.send(Event::TimedOut);
-                        return Ok(true);
+                        self.socket.send(&self.buf[..size]);
+                        self.event_tx.send(Event::TimedOut);
+                        return true;
                     } else {
                         self.timed_events.push(
                             TimedEventKey::CheckForTimeout,
@@ -175,23 +174,11 @@ impl ClientThreadState {
                 }
             }
         }
-        Ok(false)
+        false
     }
 
     fn handle_all_recvs(&mut self) -> Result<bool, io::Error> {
-        loop {
-            let size = match self.socket.mio_socket().recv(&mut self.buf) {
-                Ok(x) => x,
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    break
-                }
-                // Windows shenanigans
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
-                Err(e) => return Err(e),
-            };
+        while let Some((size, _)) = self.socket.recv_from(&mut self.buf)? {
             if size == 0 || size > 1200 {
                 continue;
             }
@@ -199,10 +186,10 @@ impl ClientThreadState {
                 continue;
             };
             let shutdown = match packet_identifier {
-                PacketIdentifier::Disconnect => self.handle_packet_disconnect(size)?,
-                PacketIdentifier::LatencyDiscovery => self.handle_packet_latency_discovery(size)?,
+                PacketIdentifier::Disconnect => self.handle_packet_disconnect(size),
+                PacketIdentifier::LatencyDiscovery => self.handle_packet_latency_discovery(size),
                 PacketIdentifier::LatencyDiscoveryResponse2 => {
-                    self.handle_packet_latency_response_2(size)?
+                    self.handle_packet_latency_response_2(size)
                 }
                 PacketIdentifier::UnreliableStandalonePayload
                 | PacketIdentifier::UnreliableFragmentedPayload
@@ -210,12 +197,12 @@ impl ClientThreadState {
                 | PacketIdentifier::UnreliableOrderedStandalonePayload
                 | PacketIdentifier::UnreliableOrderedFragmentedPayload
                 | PacketIdentifier::UnreliableOrderedFragmentedPayloadLast => {
-                    self.handle_packet_unreliable_payload(size)?
+                    self.handle_packet_unreliable_payload(size)
                 }
                 PacketIdentifier::ReliablePayloadNoAcks => {
-                    self.handle_packet_reliable_payload(size)?
+                    self.handle_packet_reliable_payload(size)
                 }
-                PacketIdentifier::Acks => self.handle_packet_acks(size)?,
+                PacketIdentifier::Acks => self.handle_packet_acks(size),
                 _ => false,
             };
             if shutdown {
@@ -225,7 +212,7 @@ impl ClientThreadState {
         Ok(false)
     }
 
-    fn handle_event_send(&mut self) -> Result<(), io::Error> {
+    fn handle_event_send(&mut self) {
         let now = Instant::now();
         let mut batch_size = self.congestion.allowed_to_send_this_batch();
         while batch_size > 0 {
@@ -237,7 +224,7 @@ impl ClientThreadState {
             ) {
                 Either::Left(size) => {
                     self.last_sent = now;
-                    self.socket.send(&self.buf[..size])?;
+                    self.socket.send(&self.buf[..size]);
                     batch_size = batch_size.saturating_sub(size as u32);
                 }
                 Either::Right(Some(time_till_resend)) => {
@@ -253,7 +240,7 @@ impl ClientThreadState {
                     break;
                 }
                 Either::Right(None) => {
-                    return Ok(());
+                    return;
                 }
             }
         }
@@ -262,41 +249,34 @@ impl ClientThreadState {
             now + self.congestion.downtime_between_batches(),
             TimedEventData::Nothing,
         );
-        Ok(())
     }
 
-    fn handle_event_send_acks(&mut self, channel_id: u8) -> Result<(), io::Error> {
+    fn handle_event_send_acks(&mut self, channel_id: u8) {
         let acks = self.channels.acks(Channel::Reliable(channel_id));
         let size = acks.serialize(&self.crypto, &mut self.buf);
-        self.socket.send(&self.buf[..size])?;
-        Ok(())
+        self.socket.send(&self.buf[..size]);
     }
 
-    fn handle_packet_disconnect(&mut self, size: usize) -> Result<bool, io::Error> {
+    fn handle_packet_disconnect(&mut self, size: usize) -> bool {
         let Ok(disconnect) = Disconnect::deserialize(&self.crypto, &mut self.buf[..size]) else {
-            return Ok(false);
+            return false;
         };
-        if self
-            .event_tx
-            .send(Event::Disconnected(disconnect.data.to_vec()))
-            .is_err()
-        {
-            return Ok(true);
-        }
-        Ok(true)
+        self.event_tx
+            .send(Event::Disconnected(disconnect.data.to_vec()));
+        true
     }
 
-    fn handle_packet_latency_discovery(&mut self, size: usize) -> Result<bool, io::Error> {
+    fn handle_packet_latency_discovery(&mut self, size: usize) -> bool {
         let Ok(latency_discovery) =
             LatencyDiscovery::deserialize(&self.crypto, &mut self.buf[..size])
         else {
-            return Ok(false);
+            return false;
         };
         if self
             .latency_discoveries
             .contains_key(&latency_discovery.sequence_number)
         {
-            return Ok(false);
+            return false;
         }
         self.latency_discoveries
             .insert(latency_discovery.sequence_number, Instant::now());
@@ -309,30 +289,30 @@ impl ClientThreadState {
             truncated_siphash: 0,
         };
         let size = latency_discovery_response.serialize(&self.crypto, &mut self.buf);
-        self.socket.send(&self.buf[..size])?;
+        self.socket.send(&self.buf[..size]);
 
         self.last_received = Instant::now();
-        Ok(false)
+        false
     }
 
-    fn handle_packet_latency_response_2(&mut self, size: usize) -> Result<bool, io::Error> {
+    fn handle_packet_latency_response_2(&mut self, size: usize) -> bool {
         let Ok(latency_discovery_response_2) =
             LatencyDiscoveryResponse2::deserialize(&self.crypto, &mut self.buf[..size])
         else {
-            return Ok(false);
+            return false;
         };
         if self
             .latencies
             .contains(&latency_discovery_response_2.sequence_number)
         {
-            return Ok(false);
+            return false;
         }
         let Some(sent) = self
             .latency_discoveries
             .get(&latency_discovery_response_2.sequence_number)
         else {
             // TODO: Deal with really bad connections
-            return Ok(false);
+            return false;
         };
         let latency = sent.elapsed();
         self.congestion.update_latency(latency);
@@ -343,27 +323,27 @@ impl ClientThreadState {
         }
 
         self.last_received = Instant::now();
-        Ok(false)
+        false
     }
 
-    fn handle_packet_unreliable_payload(&mut self, size: usize) -> Result<bool, io::Error> {
+    fn handle_packet_unreliable_payload(&mut self, size: usize) -> bool {
         let Ok(packet) = UnreliablePayload::deserialize(&self.crypto, &mut self.buf[0..size])
         else {
-            return Ok(false);
+            return false;
         };
         let Some(message) = self.channels.handle_unreliable(packet) else {
-            return Ok(false);
+            return false;
         };
-        let _ = self.event_tx.send(Event::Received(message));
-        Ok(false)
+        self.event_tx.send(Event::Received(message));
+        false
     }
 
-    fn handle_packet_reliable_payload(&mut self, size: usize) -> Result<bool, io::Error> {
+    fn handle_packet_reliable_payload(&mut self, size: usize) -> bool {
         let Ok(packet) = ReliablePayload::deserialize(&self.crypto, &mut self.buf[..size]) else {
-            return Ok(false);
+            return false;
         };
         if packet.channel_id() as usize >= self.channel_config.weights_reliable.len() {
-            return Ok(false);
+            return false;
         }
         self.timed_events.push(
             TimedEventKey::SendAcks(packet.channel_id()),
@@ -371,16 +351,16 @@ impl ClientThreadState {
             TimedEventData::Nothing,
         );
         for message in self.channels.handle_reliable(packet) {
-            self.event_tx.send(Event::Received(message)).unwrap();
+            self.event_tx.send(Event::Received(message));
         }
-        Ok(false)
+        false
     }
 
-    fn handle_packet_acks(&mut self, size: usize) -> Result<bool, io::Error> {
+    fn handle_packet_acks(&mut self, size: usize) -> bool {
         let Ok(acks) = Acks::deserialize(&self.crypto, &self.buf[..size]) else {
-            return Ok(false);
+            return false;
         };
         self.channels.handle_acks(acks);
-        Ok(false)
+        false
     }
 }
