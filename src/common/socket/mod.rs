@@ -112,7 +112,12 @@ impl Socket {
                     )
                 })?;
         } else {
-            if self.inner.socket.send_to(data, to)? != data.len() {
+            // BSD-derived stacks reject send_to on connected sockets (EISCONN).
+            let sent = match self.inner.connected_to {
+                Some(_) => self.inner.socket.send(data)?,
+                None => self.inner.socket.send_to(data, to)?,
+            };
+            if sent != data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     "Failed to send all data",

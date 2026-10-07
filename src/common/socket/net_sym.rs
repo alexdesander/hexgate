@@ -47,6 +47,7 @@ pub(crate) fn simulator_thread(
     socket: UdpSocket,
     mut simulator: Box<dyn NetworkSimulator>,
 ) {
+    let connected = socket.peer_addr().is_ok();
     let mut timed_events: TimedEventQueue<EventKey, Event> = TimedEventQueue::new();
     let mut send_key_counter = 0;
     loop {
@@ -55,7 +56,12 @@ pub(crate) fn simulator_thread(
                 let (_key, event) = timed_events.pop().unwrap();
                 match event {
                     Event::Send(socket_addr, packet) => {
-                        match socket.send_to(&packet, socket_addr) {
+                        let result = if connected {
+                            socket.send(&packet)
+                        } else {
+                            socket.send_to(&packet, socket_addr)
+                        };
+                        match result {
                             Ok(size) => assert_eq!(size, packet.len()),
                             Err(e) => {
                                 todo!("Handle send errors in simulator_thread: {:?}", e);
