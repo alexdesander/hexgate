@@ -142,6 +142,7 @@ pub enum ServerKey {
     Unverified,
 }
 
+#[derive(Debug)]
 pub enum Event {
     Disconnected(Vec<u8>),
     TimedOut,

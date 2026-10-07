@@ -4,12 +4,17 @@
 
 #![allow(dead_code)]
 
-use std::{net::SocketAddr, ops::Range, time::Duration};
+use std::{
+    net::SocketAddr,
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use hexgate::{
     client::{Client, ServerKey},
     common::{
-        channel::scheduler::ChannelConfiguration, socket::net_sym::NetworkSimulator, ClientVersion,
+        channel::scheduler::ChannelConfiguration, error::RecvError,
+        socket::net_sym::NetworkSimulator, ClientVersion,
     },
     server::{self, auth::Authenticator, Server},
 };
@@ -81,6 +86,50 @@ impl NetworkSimulator for Lossy {
             self.rng.gen_range(self.network.delay_ms.clone()),
         ))
     }
+}
+
+/// Drops the `n`-th packet (counting from 0) and nothing else.
+pub struct DropNth {
+    n: usize,
+    seen: usize,
+}
+
+impl DropNth {
+    pub fn new(n: usize) -> Box<Self> {
+        Box::new(Self { n, seen: 0 })
+    }
+}
+
+impl NetworkSimulator for DropNth {
+    fn simulate(&mut self, _: SocketAddr, _: usize) -> Option<Duration> {
+        self.seen += 1;
+        (self.seen - 1 != self.n).then_some(Duration::ZERO)
+    }
+}
+
+/// Drops every packet.
+pub struct Blackhole;
+
+impl NetworkSimulator for Blackhole {
+    fn simulate(&mut self, _: SocketAddr, _: usize) -> Option<Duration> {
+        None
+    }
+}
+
+/// The next event within `timeout`, `None` on timeout or once the network thread stopped.
+pub fn next_event<E>(
+    try_next: impl Fn() -> Result<Option<E>, RecvError>,
+    timeout: Duration,
+) -> Option<E> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match try_next() {
+            Ok(Some(event)) => return Some(event),
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 pub fn server(timeout_dur: Duration) -> TestServer {

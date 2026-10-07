@@ -64,6 +64,48 @@ fn unreliable_ordered_transfer(network: Option<Network>, amount: u32) -> u32 {
     received
 }
 
+/// Fragmented messages are delivered whole and unmixed (each one's length and fill byte encode
+/// its index) or not at all. Returns the received indices.
+fn fragmented_transfer(channel: Channel, network: Network) -> Vec<u32> {
+    const QUIET: Duration = Duration::from_secs(2);
+    let size = |i: u32| 3000 + 7 * i as usize;
+    let (server, client) = connected(Some(network), TIMEOUT);
+    for i in 0..200 {
+        client.send(channel, vec![i as u8; size(i)]).unwrap();
+    }
+    let mut received = Vec::new();
+    let mut last_received = Instant::now();
+    while last_received.elapsed() < QUIET {
+        match server.try_next().unwrap() {
+            Some(Event::Connected(..)) => {}
+            Some(Event::Received(_, message)) => {
+                let i = ((message.len() - 3000) / 7) as u32;
+                assert_eq!(message, vec![i as u8; size(i)]);
+                received.push(i);
+                last_received = Instant::now();
+            }
+            Some(event) => panic!("unexpected event {event:?}"),
+            None => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert!(!received.is_empty());
+    received
+}
+
+#[test]
+fn unreliable_fragments_survive_loss_and_reordering() {
+    fragmented_transfer(Channel::Unreliable, BAD);
+}
+
+#[test]
+fn unreliable_ordered_fragments_survive_loss_and_reordering() {
+    let received = fragmented_transfer(Channel::UnreliableOrdered(1), BAD);
+    assert!(
+        received.windows(2).all(|pair| pair[0] < pair[1]),
+        "{received:?}"
+    );
+}
+
 #[test]
 fn reliable_no_simulator() {
     reliable_transfer(None, 50_000, TIMEOUT);
