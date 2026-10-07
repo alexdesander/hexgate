@@ -18,7 +18,7 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel},
     congestion::CongestionConfiguration,
     crypto::sym::SymCipher,
-    error::RecvError,
+    error::{ProtocolViolation, RecvError},
     events::{self, EventReceiver},
     socket::{net_sym::NetworkSimulator, Socket},
     timed_event_queue::TimedEventQueue,
@@ -35,6 +35,8 @@ pub enum Event<R: AuthResult> {
     Disconnected(SocketAddr, Vec<u8>),
     TimedOut(SocketAddr),
     Received(SocketAddr, Vec<u8>),
+    /// The client violated the protocol and was disconnected.
+    Violation(SocketAddr, ProtocolViolation),
 }
 
 pub struct Server<R: AuthResult, A: Authenticator<R>> {
@@ -139,6 +141,10 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
+        /// Maximum size of a received message. A peer sending a larger one violates the protocol
+        /// and is disconnected.
+        #[builder(default = 1048576)]
+        max_recv_msg_size: usize,
         #[builder(default = false)] disable_timestamp_age_check: bool,
         #[builder(default = Duration::from_secs(10))]
         connection_request_max_timestamp_age: Duration,
@@ -192,6 +198,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
                 connection_request_max_timestamp_age,
                 disable_timestamp_age_check,
                 timeout_dur,
+                max_recv_msg_size,
                 is_checking_for_timeouts: false,
                 latency_discovery_interval,
 

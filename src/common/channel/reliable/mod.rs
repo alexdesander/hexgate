@@ -16,6 +16,7 @@ use either::Either;
 use crate::common::{
     congestion::CongestionController,
     crypto::Crypto,
+    error::ProtocolViolation,
     packets::{
         acks::{Acks, ACK_BITFIELD_SIZE},
         reliable_payload::ReliablePayloadOwned,
@@ -119,10 +120,15 @@ pub struct ReliableChannel {
 }
 
 impl ReliableChannel {
-    pub fn new(channel_id: u8, resend_cooldown: Duration, max_in_flight: usize) -> Self {
+    pub fn new(
+        channel_id: u8,
+        resend_cooldown: Duration,
+        max_in_flight: usize,
+        max_recv_msg_size: usize,
+    ) -> Self {
         Self {
             channel_id,
-            assembler: MessageAssembler::new(),
+            assembler: MessageAssembler::new(max_recv_msg_size),
             disassembler: MessageDisassembler::new(),
 
             next: 0,
@@ -223,13 +229,16 @@ impl ReliableChannel {
         Either::Left(size)
     }
 
-    pub fn handle(&mut self, packet: ReliablePayloadOwned) -> Vec<Vec<u8>> {
+    pub fn handle(
+        &mut self,
+        packet: ReliablePayloadOwned,
+    ) -> Result<Vec<Vec<u8>>, ProtocolViolation> {
         let pid = packet.packet_id();
         if self.ack_data.is_acked(pid) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if pid > self.ack_data.lowest_unreceived + self.max_in_flight as u64 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.ack_data.ack(pid);
         self.has_acks_to_send = true;
@@ -237,11 +246,11 @@ impl ReliableChannel {
         self.received.insert(pid, packet.take_payload());
         let mut messages = Vec::new();
         while let Some(payload) = self.received.remove(&self.next_to_assemble) {
-            let mut new_messages = self.assembler.assemble_packet(payload);
+            let mut new_messages = self.assembler.assemble_packet(payload)?;
             messages.append(&mut new_messages);
             self.next_to_assemble += 1;
         }
-        messages
+        Ok(messages)
     }
 
     pub fn acks(&mut self) -> Acks {

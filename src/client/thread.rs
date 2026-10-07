@@ -18,6 +18,7 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, Channels},
     congestion::CongestionController,
     crypto::Crypto,
+    error::ProtocolViolation,
     events::EventSender,
     packets::{
         acks::Acks, disconnect::Disconnect, latency_discovery::LatencyDiscovery,
@@ -334,10 +335,11 @@ impl ClientThreadState {
         else {
             return false;
         };
-        let Some(message) = self.channels.handle_unreliable(packet) else {
-            return false;
-        };
-        self.event_tx.send(Event::Received(message));
+        match self.channels.handle_unreliable(packet) {
+            Ok(Some(message)) => self.event_tx.send(Event::Received(message)),
+            Ok(None) => {}
+            Err(violation) => return self.handle_violation(violation),
+        }
         false
     }
 
@@ -356,8 +358,13 @@ impl ClientThreadState {
             Instant::now() + self.congestion.ack_delay(),
             TimedEventData::Nothing,
         );
-        for message in self.channels.handle_reliable(packet) {
-            self.event_tx.send(Event::Received(message));
+        match self.channels.handle_reliable(packet) {
+            Ok(messages) => {
+                for message in messages {
+                    self.event_tx.send(Event::Received(message));
+                }
+            }
+            Err(violation) => return self.handle_violation(violation),
         }
         false
     }
@@ -368,5 +375,16 @@ impl ClientThreadState {
         };
         self.channels.handle_acks(acks);
         false
+    }
+
+    fn handle_violation(&mut self, violation: ProtocolViolation) -> bool {
+        let reason = violation.to_string();
+        let disconnect = Disconnect {
+            data: reason.as_bytes(),
+        };
+        let size = disconnect.serialize(&self.crypto, &mut self.buf);
+        self.socket.send(&self.buf[..size]);
+        self.event_tx.send(Event::Violation(violation));
+        true
     }
 }

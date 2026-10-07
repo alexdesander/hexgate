@@ -62,6 +62,10 @@ fn main() -> anyhow::Result<()> {
                     let text = String::from_utf8_lossy(&message);
                     println!("{}", text);
                 }
+                Event::Violation(violation) => {
+                    println!("Disconnected: {}", violation);
+                    break;
+                }
             }
         }
     });

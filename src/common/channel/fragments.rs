@@ -4,10 +4,13 @@
 
 use ahash::HashSet;
 
+use crate::common::error::ProtocolViolation;
+
 /// Reassembles one fragmented message at a time: fragments of older messages are dropped, a
 /// fragment of a newer message discards the incomplete one.
 pub(crate) struct FragmentAssembler {
     fragment_size: usize,
+    max_size: usize,
     message_id: u32,
     // TODO: Use a more efficient data structure
     fragments: HashSet<u32>,
@@ -16,9 +19,10 @@ pub(crate) struct FragmentAssembler {
 }
 
 impl FragmentAssembler {
-    pub fn new(fragment_size: usize) -> Self {
+    pub fn new(fragment_size: usize, max_size: usize) -> Self {
         Self {
             fragment_size,
+            max_size,
             message_id: 0,
             fragments: HashSet::default(),
             needed_fragments: u32::MAX,
@@ -32,15 +36,19 @@ impl FragmentAssembler {
         fragment_id: u32,
         is_last: bool,
         payload: &[u8],
-    ) -> Option<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>, ProtocolViolation> {
         if message_id < self.message_id {
-            return None;
+            return Ok(None);
         }
         if message_id > self.message_id {
             self.reset(message_id);
         }
-        let offset = (fragment_id as usize).checked_mul(self.fragment_size)?;
-        let end = offset + payload.len();
+        let end = (fragment_id as usize)
+            .checked_mul(self.fragment_size)
+            .and_then(|offset| offset.checked_add(payload.len()))
+            .filter(|&end| end <= self.max_size)
+            .ok_or(ProtocolViolation::MessageTooLarge { max: self.max_size })?;
+        let offset = end - payload.len();
         // Only the last fragment may be short, and no fragment may lie beyond it.
         let fits = if is_last {
             end >= self.buffer.len()
@@ -48,7 +56,7 @@ impl FragmentAssembler {
             payload.len() == self.fragment_size
         };
         if !fits || fragment_id >= self.needed_fragments || !self.fragments.insert(fragment_id) {
-            return None;
+            return Ok(None);
         }
         if is_last {
             self.needed_fragments = fragment_id + 1;
@@ -58,11 +66,11 @@ impl FragmentAssembler {
         }
         self.buffer[offset..end].copy_from_slice(payload);
         if self.fragments.len() < self.needed_fragments as usize {
-            return None;
+            return Ok(None);
         }
         let message = std::mem::take(&mut self.buffer);
         self.reset(message_id.saturating_add(1));
-        Some(message)
+        Ok(Some(message))
     }
 
     fn reset(&mut self, message_id: u32) {

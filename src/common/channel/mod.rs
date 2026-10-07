@@ -16,6 +16,7 @@ use unreliable_ordered::UnreliableOrderedChannel;
 use super::{
     congestion::CongestionController,
     crypto::Crypto,
+    error::ProtocolViolation,
     packets::{
         acks::Acks, reliable_payload::ReliablePayload, unreliable_payload::UnreliablePayload,
     },
@@ -37,6 +38,7 @@ pub enum Channel {
 }
 
 pub(crate) struct Channels {
+    max_recv_msg_size: usize,
     scheduler: Scheduler,
     unreliable: UnreliableChannel,
     unreliable_ordered: Vec<UnreliableOrderedChannel>,
@@ -44,12 +46,17 @@ pub(crate) struct Channels {
 }
 
 impl Channels {
-    pub fn new(congestion: &CongestionController, config: &ChannelConfiguration) -> Self {
+    pub fn new(
+        congestion: &CongestionController,
+        config: &ChannelConfiguration,
+        max_recv_msg_size: usize,
+    ) -> Self {
         Self {
+            max_recv_msg_size,
             scheduler: Scheduler::new(),
-            unreliable: UnreliableChannel::new(),
+            unreliable: UnreliableChannel::new(max_recv_msg_size),
             unreliable_ordered: (0..config.weights_unreliable_ordered.len())
-                .map(|i| UnreliableOrderedChannel::new(i.try_into().unwrap()))
+                .map(|i| UnreliableOrderedChannel::new(i.try_into().unwrap(), max_recv_msg_size))
                 .collect(),
             reliable: (0..config.weights_reliable.len())
                 .map(|i| {
@@ -57,6 +64,7 @@ impl Channels {
                         i.try_into().unwrap(),
                         congestion.resend_cooldown(),
                         congestion.max_in_flight(),
+                        max_recv_msg_size,
                     )
                 })
                 .collect(),
@@ -140,24 +148,38 @@ impl Channels {
         Either::Right(None)
     }
 
-    pub fn handle_unreliable(&mut self, packet: UnreliablePayload) -> Option<Vec<u8>> {
+    pub fn handle_unreliable(
+        &mut self,
+        packet: UnreliablePayload,
+    ) -> Result<Option<Vec<u8>>, ProtocolViolation> {
         match packet {
+            UnreliablePayload::Standalone { payload, .. }
+            | UnreliablePayload::OrderedStandalone { payload, .. }
+                if payload.len() > self.max_recv_msg_size =>
+            {
+                Err(ProtocolViolation::MessageTooLarge {
+                    max: self.max_recv_msg_size,
+                })
+            }
             UnreliablePayload::Standalone { .. } | UnreliablePayload::Fragmented { .. } => {
                 self.unreliable.handle(packet)
             }
             UnreliablePayload::OrderedStandalone { channel_id, .. }
             | UnreliablePayload::OrderedFragmented { channel_id, .. } => {
                 if channel_id as usize >= self.unreliable_ordered.len() {
-                    return None;
+                    return Ok(None);
                 }
                 self.unreliable_ordered[channel_id as usize].handle(packet)
             }
         }
     }
 
-    pub fn handle_reliable(&mut self, packet: ReliablePayload) -> Vec<Vec<u8>> {
+    pub fn handle_reliable(
+        &mut self,
+        packet: ReliablePayload,
+    ) -> Result<Vec<Vec<u8>>, ProtocolViolation> {
         if packet.channel_id() as usize >= self.reliable.len() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.reliable[packet.channel_id() as usize].handle(packet.to_owned())
     }

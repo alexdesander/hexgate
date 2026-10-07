@@ -7,6 +7,7 @@ use std::{collections::VecDeque, rc::Rc};
 use super::fragments::FragmentAssembler;
 use crate::common::{
     crypto::Crypto,
+    error::ProtocolViolation,
     packets::unreliable_payload::{
         UnreliablePayload, UNRELIABLE_ORDERED_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE,
         UNRELIABLE_ORDERED_STANDALONE_PAYLOAD_MAX_PAYLOAD_SIZE,
@@ -29,12 +30,13 @@ pub struct UnreliableOrderedChannel {
 }
 
 impl UnreliableOrderedChannel {
-    pub fn new(channel_id: u8) -> Self {
+    pub fn new(channel_id: u8, max_recv_msg_size: usize) -> Self {
         Self {
             channel_id,
             lowest_acceptable_message_id: 0,
             assembler: FragmentAssembler::new(
                 UNRELIABLE_ORDERED_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE,
+                max_recv_msg_size,
             ),
 
             to_send: VecDeque::new(),
@@ -120,7 +122,10 @@ impl UnreliableOrderedChannel {
         }
     }
 
-    pub fn handle(&mut self, packet: UnreliablePayload) -> Option<Vec<u8>> {
+    pub fn handle(
+        &mut self,
+        packet: UnreliablePayload,
+    ) -> Result<Option<Vec<u8>>, ProtocolViolation> {
         match packet {
             UnreliablePayload::OrderedStandalone {
                 channel_id,
@@ -129,10 +134,10 @@ impl UnreliableOrderedChannel {
             } => {
                 assert!(channel_id == self.channel_id);
                 if message_id < self.lowest_acceptable_message_id {
-                    return None;
+                    return Ok(None);
                 }
                 self.lowest_acceptable_message_id = message_id.saturating_add(1);
-                Some(payload.to_vec())
+                Ok(Some(payload.to_vec()))
             }
             UnreliablePayload::OrderedFragmented {
                 channel_id,
@@ -143,14 +148,16 @@ impl UnreliableOrderedChannel {
             } => {
                 assert!(channel_id == self.channel_id);
                 if message_id < self.lowest_acceptable_message_id {
-                    return None;
+                    return Ok(None);
                 }
                 self.lowest_acceptable_message_id = message_id;
                 let message = self
                     .assembler
                     .handle(message_id, fragment_id, is_last, payload)?;
-                self.lowest_acceptable_message_id = message_id.saturating_add(1);
-                Some(message)
+                if message.is_some() {
+                    self.lowest_acceptable_message_id = message_id.saturating_add(1);
+                }
+                Ok(message)
             }
             _ => unreachable!(),
         }

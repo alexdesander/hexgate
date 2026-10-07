@@ -7,6 +7,7 @@ use std::{collections::VecDeque, rc::Rc};
 use super::fragments::FragmentAssembler;
 use crate::common::{
     crypto::Crypto,
+    error::ProtocolViolation,
     packets::unreliable_payload::{
         UnreliablePayload, UNRELIABLE_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE,
         UNRELIABLE_STANDALONE_PAYLOAD_MAX_PAYLOAD_SIZE,
@@ -32,14 +33,17 @@ pub struct UnreliableChannel {
 }
 
 impl UnreliableChannel {
-    pub fn new() -> Self {
+    pub fn new(max_recv_msg_size: usize) -> Self {
         Self {
             standalone_highest_received: 0,
             standalone_next: 1,
 
             fragmented_next: 1,
             fragmented_fragment_next: 0,
-            assembler: FragmentAssembler::new(UNRELIABLE_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE),
+            assembler: FragmentAssembler::new(
+                UNRELIABLE_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE,
+                max_recv_msg_size,
+            ),
 
             to_send: VecDeque::new(),
         }
@@ -119,17 +123,20 @@ impl UnreliableChannel {
         }
     }
 
-    pub fn handle(&mut self, packet: UnreliablePayload) -> Option<Vec<u8>> {
+    pub fn handle(
+        &mut self,
+        packet: UnreliablePayload,
+    ) -> Result<Option<Vec<u8>>, ProtocolViolation> {
         match packet {
             UnreliablePayload::Standalone {
                 message_id,
                 payload,
             } => {
                 if message_id < self.standalone_highest_received.saturating_sub(64) {
-                    return None;
+                    return Ok(None);
                 }
                 self.standalone_highest_received = self.standalone_highest_received.max(message_id);
-                Some(payload.to_vec())
+                Ok(Some(payload.to_vec()))
             }
             UnreliablePayload::Fragmented {
                 message_id,
@@ -173,8 +180,8 @@ mod tests {
         let crypto_server = Crypto::new(shared_secret_0, [44u8; 32], true, Cipher::AES256GCM);
         let crypto_client = Crypto::new(shared_secret_1, [44u8; 32], false, Cipher::AES256GCM);
 
-        let mut channel_server = UnreliableChannel::new();
-        let mut channel_client = UnreliableChannel::new();
+        let mut channel_server = UnreliableChannel::new(usize::MAX);
+        let mut channel_client = UnreliableChannel::new(usize::MAX);
 
         let num_messages = 4444;
         for _ in 0..num_messages {
@@ -187,7 +194,7 @@ mod tests {
         for _ in 0..num_messages {
             let size = channel_client.pop(&crypto_client, &mut buf);
             let packet = UnreliablePayload::deserialize(&crypto_server, &mut buf[..size]).unwrap();
-            let message = channel_server.handle(packet).unwrap();
+            let message = channel_server.handle(packet).unwrap().unwrap();
             if message.len() > 0 {
                 assert_eq!(message.len() % 256, message[0] as usize);
             }
@@ -204,8 +211,8 @@ mod tests {
         let crypto_server = Crypto::new(shared_secret_0, [44u8; 32], true, Cipher::AES256GCM);
         let crypto_client = Crypto::new(shared_secret_1, [44u8; 32], false, Cipher::AES256GCM);
 
-        let mut channel_server = UnreliableChannel::new();
-        let mut channel_client = UnreliableChannel::new();
+        let mut channel_server = UnreliableChannel::new(usize::MAX);
+        let mut channel_client = UnreliableChannel::new(usize::MAX);
 
         let num_messages = 4444;
         for _ in 0..num_messages {
@@ -224,7 +231,7 @@ mod tests {
                 break;
             }
             let packet = UnreliablePayload::deserialize(&crypto_server, &mut buf[..size]).unwrap();
-            let message = channel_server.handle(packet);
+            let message = channel_server.handle(packet).unwrap();
             if let Some(message) = message {
                 assert_eq!(message.len() % 256, message[0] as usize);
                 if channel_client.to_send.is_empty() {

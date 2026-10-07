@@ -23,7 +23,7 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, Channels},
     congestion::{CongestionConfiguration, CongestionController},
     crypto::Crypto,
-    error::RecvError,
+    error::{ProtocolViolation, RecvError},
     events::{self, EventReceiver},
     packets::{
         client_hello::ClientHello, connection_request::ConnectionRequest,
@@ -107,6 +107,8 @@ pub enum Event {
     Disconnected(Vec<u8>),
     TimedOut,
     Received(Vec<u8>),
+    /// The server violated the protocol and was disconnected.
+    Violation(ProtocolViolation),
 }
 
 #[derive(Clone)]
@@ -199,6 +201,10 @@ impl Client {
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
+        /// Maximum size of a received message. A peer sending a larger one violates the protocol
+        /// and is disconnected.
+        #[builder(default = 1048576)]
+        max_recv_msg_size: usize,
         #[builder(default = Duration::from_secs(4))] handshake_timeout: Duration,
         #[builder(default = 2)] mut handshake_tries: u8,
     ) -> Result<Self, ConnectError> {
@@ -399,7 +405,7 @@ impl Client {
                     last_received: Instant::now(),
                     timeout_dur,
 
-                    channels: Channels::new(&congestion, &channel_config),
+                    channels: Channels::new(&congestion, &channel_config, max_recv_msg_size),
                     channel_config,
                     congestion,
                     last_sent: Instant::now(),

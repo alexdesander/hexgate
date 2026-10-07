@@ -24,6 +24,7 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel},
     congestion::CongestionConfiguration,
     crypto::Crypto,
+    error::ProtocolViolation,
     events::EventSender,
     packets::{
         acks::Acks, client_hello::ClientHello, connection_request::ConnectionRequest,
@@ -88,6 +89,7 @@ pub struct ServerThreadState<R: AuthResult> {
     pub connection_request_max_timestamp_age: Duration,
     pub disable_timestamp_age_check: bool,
     pub timeout_dur: Duration,
+    pub max_recv_msg_size: usize,
     pub is_checking_for_timeouts: bool,
     pub latency_discovery_interval: Duration,
 
@@ -362,7 +364,12 @@ impl<R: AuthResult> ServerThreadState<R> {
         self.socket.send_to(from, &self.buf[..size]);
         if let Some(_old_connection) = self.connections.insert(
             from,
-            Connection::new(crypto, &self.channel_config, self.congestion_config),
+            Connection::new(
+                crypto,
+                &self.channel_config,
+                self.congestion_config,
+                self.max_recv_msg_size,
+            ),
         ) {
             todo!("Handle old connection");
         };
@@ -554,10 +561,11 @@ impl<R: AuthResult> ServerThreadState<R> {
         else {
             return;
         };
-        let Some(message) = connection.channels.handle_unreliable(packet) else {
-            return;
-        };
-        self.event_tx.send(Event::Received(from, message));
+        match connection.channels.handle_unreliable(packet) {
+            Ok(Some(message)) => self.event_tx.send(Event::Received(from, message)),
+            Ok(None) => {}
+            Err(violation) => self.handle_violation(from, violation),
+        }
     }
 
     fn handle_packet_reliable_payload(&mut self, size: usize, from: SocketAddr) {
@@ -579,8 +587,13 @@ impl<R: AuthResult> ServerThreadState<R> {
             Instant::now() + connection.congestion.ack_delay(),
             TimedEventData::Nothing,
         );
-        for message in connection.channels.handle_reliable(packet) {
-            self.event_tx.send(Event::Received(from, message));
+        match connection.channels.handle_reliable(packet) {
+            Ok(messages) => {
+                for message in messages {
+                    self.event_tx.send(Event::Received(from, message));
+                }
+            }
+            Err(violation) => self.handle_violation(from, violation),
         }
     }
 
@@ -592,5 +605,18 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         connection.channels.handle_acks(packet);
+    }
+
+    fn handle_violation(&mut self, addr: SocketAddr, violation: ProtocolViolation) {
+        let Some(connection) = self.connections.remove(&addr) else {
+            return;
+        };
+        let reason = violation.to_string();
+        let disconnect = Disconnect {
+            data: reason.as_bytes(),
+        };
+        let size = disconnect.serialize(&connection.crypto, &mut self.buf);
+        self.socket.send_to(addr, &self.buf[..size]);
+        self.event_tx.send(Event::Violation(addr, violation));
     }
 }

@@ -4,28 +4,35 @@
 
 use integer_encoding::VarInt;
 
+use crate::common::error::ProtocolViolation;
+
 pub struct MessageAssembler {
+    max_size: usize,
     needed: usize,
     message_buffer: Vec<u8>,
 }
 
 impl MessageAssembler {
-    pub fn new() -> Self {
+    pub fn new(max_size: usize) -> Self {
         Self {
+            max_size,
             needed: 0,
             message_buffer: Vec::new(),
         }
     }
 
-    pub fn assemble_packet(&mut self, payload: Vec<u8>) -> Vec<Vec<u8>> {
+    pub fn assemble_packet(&mut self, payload: Vec<u8>) -> Result<Vec<Vec<u8>>, ProtocolViolation> {
         let mut messages = Vec::new();
         let mut cursor = 0;
         while cursor < payload.len() {
             if self.needed == 0 {
-                let Some((need, varint_size)) = u32::decode_var(&payload[cursor..]) else {
+                let Some((need, varint_size)) = u64::decode_var(&payload[cursor..]) else {
                     break;
                 };
-                self.needed = need as usize;
+                self.needed = usize::try_from(need)
+                    .ok()
+                    .filter(|&need| need <= self.max_size)
+                    .ok_or(ProtocolViolation::MessageTooLarge { max: self.max_size })?;
                 cursor += varint_size;
                 if cursor >= payload.len() {
                     break;
@@ -40,6 +47,6 @@ impl MessageAssembler {
                 messages.push(std::mem::take(&mut self.message_buffer));
             }
         }
-        messages
+        Ok(messages)
     }
 }

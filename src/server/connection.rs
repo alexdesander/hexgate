@@ -26,6 +26,7 @@ impl Connection {
         crypto: Crypto,
         channel_config: &ChannelConfiguration,
         congestion_config: CongestionConfiguration,
+        max_recv_msg_size: usize,
     ) -> Self {
         let congestion = CongestionController::new(congestion_config);
         Self {
@@ -34,7 +35,7 @@ impl Connection {
             last_received: Instant::now(),
             last_sent: Instant::now(),
 
-            channels: Channels::new(&congestion, channel_config),
+            channels: Channels::new(&congestion, channel_config, max_recv_msg_size),
             congestion,
         }
     }

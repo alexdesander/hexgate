@@ -82,6 +82,14 @@ fn main() -> anyhow::Result<()> {
                     let data = String::from_utf8_lossy(&vec);
                     (format!("{}: {}", clients.get(&addr).unwrap(), data), addr)
                 }
+                Event::Violation(addr, violation) => (
+                    format!(
+                        "{} was kicked: {}",
+                        clients.remove(&addr).unwrap(),
+                        violation
+                    ),
+                    addr,
+                ),
             },
             Err(e) => {
                 println!("Server has shutdown: {e}");

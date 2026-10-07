@@ -13,3 +13,10 @@ pub enum RecvError {
     #[error("the network thread failed: {0}")]
     Io(#[from] io::Error),
 }
+
+/// The peer broke the protocol and was disconnected.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ProtocolViolation {
+    #[error("received a message larger than max_recv_msg_size ({max} bytes)")]
+    MessageTooLarge { max: usize },
+}
