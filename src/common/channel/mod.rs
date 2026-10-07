@@ -21,6 +21,7 @@ use super::{
     },
 };
 
+mod fragments;
 mod reliable;
 pub mod scheduler;
 mod unreliable;

@@ -2,10 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{collections::VecDeque, rc::Rc, u32};
+use std::{collections::VecDeque, rc::Rc};
 
-use ahash::HashSet;
-
+use super::fragments::FragmentAssembler;
 use crate::common::{
     crypto::Crypto,
     packets::unreliable_payload::{
@@ -25,14 +24,9 @@ pub struct UnreliableChannel {
     standalone_next: u32,
 
     // Fragmented
-    fragmented_highest_received: u32,
     fragmented_next: u32,
     fragmented_fragment_next: u32,
-
-    // TODO: Use a more efficient data structure
-    fragments_in_assembly: HashSet<u32>,
-    needed_fragments: u32,
-    assembly: Vec<u8>,
+    assembler: FragmentAssembler,
 
     to_send: VecDeque<ToSend>,
 }
@@ -43,13 +37,9 @@ impl UnreliableChannel {
             standalone_highest_received: 0,
             standalone_next: 1,
 
-            fragmented_highest_received: 0,
             fragmented_next: 1,
             fragmented_fragment_next: 0,
-
-            fragments_in_assembly: HashSet::default(),
-            needed_fragments: u32::MAX,
-            assembly: Vec::new(),
+            assembler: FragmentAssembler::new(UNRELIABLE_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE),
 
             to_send: VecDeque::new(),
         }
@@ -148,30 +138,8 @@ impl UnreliableChannel {
                 payload,
             } => {
                 // TODO: FIX Fragmented being ordered because we don't have multiple assemblies.
-                if message_id < self.fragmented_highest_received {
-                    return None;
-                }
-                self.fragmented_highest_received = self.fragmented_highest_received.max(message_id);
-                if self.fragments_in_assembly.contains(&fragment_id) {
-                    return None;
-                }
-                self.fragments_in_assembly.insert(fragment_id);
-                let offset = fragment_id as usize * UNRELIABLE_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE;
-                if offset + payload.len() > self.assembly.len() {
-                    self.assembly.resize(offset + payload.len(), 0);
-                }
-                self.assembly[offset..offset + payload.len()].copy_from_slice(payload);
-                if is_last {
-                    self.needed_fragments = fragment_id + 1;
-                }
-                if self.needed_fragments as usize == self.fragments_in_assembly.len() {
-                    self.fragments_in_assembly.clear();
-                    self.needed_fragments = u32::MAX;
-                    let message = std::mem::take(&mut self.assembly);
-                    Some(message)
-                } else {
-                    None
-                }
+                self.assembler
+                    .handle(message_id, fragment_id, is_last, payload)
             }
             _ => unreachable!(),
         }

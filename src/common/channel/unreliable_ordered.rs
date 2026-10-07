@@ -4,8 +4,7 @@
 
 use std::{collections::VecDeque, rc::Rc};
 
-use ahash::HashSet;
-
+use super::fragments::FragmentAssembler;
 use crate::common::{
     crypto::Crypto,
     packets::unreliable_payload::{
@@ -22,10 +21,7 @@ struct ToSend {
 pub struct UnreliableOrderedChannel {
     channel_id: u8,
     lowest_acceptable_message_id: u32,
-    // TODO: Use a more efficient data structure
-    fragments_in_assembly: HashSet<u32>,
-    needed_fragments: u32,
-    assembly: Vec<u8>,
+    assembler: FragmentAssembler,
 
     to_send: VecDeque<ToSend>,
     next_message_id: u32,
@@ -37,9 +33,9 @@ impl UnreliableOrderedChannel {
         Self {
             channel_id,
             lowest_acceptable_message_id: 0,
-            fragments_in_assembly: HashSet::default(),
-            needed_fragments: u32::MAX,
-            assembly: Vec::new(),
+            assembler: FragmentAssembler::new(
+                UNRELIABLE_ORDERED_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE,
+            ),
 
             to_send: VecDeque::new(),
             next_message_id: 0,
@@ -135,11 +131,7 @@ impl UnreliableOrderedChannel {
                 if message_id < self.lowest_acceptable_message_id {
                     return None;
                 }
-                self.lowest_acceptable_message_id = message_id + 1;
-
-                self.fragments_in_assembly.clear();
-                self.needed_fragments = u32::MAX;
-                self.assembly.clear();
+                self.lowest_acceptable_message_id = message_id.saturating_add(1);
                 Some(payload.to_vec())
             }
             UnreliablePayload::OrderedFragmented {
@@ -154,28 +146,11 @@ impl UnreliableOrderedChannel {
                     return None;
                 }
                 self.lowest_acceptable_message_id = message_id;
-                if self.fragments_in_assembly.contains(&fragment_id) {
-                    return None;
-                }
-                self.fragments_in_assembly.insert(fragment_id);
-                let offset =
-                    fragment_id as usize * UNRELIABLE_ORDERED_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE;
-                if offset + payload.len() > self.assembly.len() {
-                    self.assembly.resize(offset + payload.len(), 0);
-                }
-                self.assembly[offset..offset + payload.len()].copy_from_slice(payload);
-                if is_last {
-                    self.needed_fragments = fragment_id + 1;
-                }
-                if self.needed_fragments as usize == self.fragments_in_assembly.len() {
-                    self.lowest_acceptable_message_id = message_id + 1;
-                    self.fragments_in_assembly.clear();
-                    self.needed_fragments = u32::MAX;
-                    let message = std::mem::take(&mut self.assembly);
-                    Some(message)
-                } else {
-                    None
-                }
+                let message = self
+                    .assembler
+                    .handle(message_id, fragment_id, is_last, payload)?;
+                self.lowest_acceptable_message_id = message_id.saturating_add(1);
+                Some(message)
             }
             _ => unreachable!(),
         }
