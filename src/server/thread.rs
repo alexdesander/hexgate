@@ -39,7 +39,7 @@ use crate::common::{
         login_request::LoginRequest,
         login_response::LoginResponse,
         reliable_payload::ReliablePayload,
-        server_hello::ServerHello,
+        server_hello::{self, ServerHello},
         unreliable_payload::UnreliablePayload,
         PacketIdentifier,
     },
@@ -51,11 +51,13 @@ use crate::common::{
 use super::{
     auth::{AuthCmd, AuthResult, LoginAttempt},
     connection::Connection,
+    rate_limit::RateLimiter,
     Event, Socket,
 };
 
 /// Timeouts are checked this many times per timeout duration.
 const TIMEOUT_CHECKS: u32 = 4;
+const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long handshake state is kept to answer retransmitted requests.
 const HANDSHAKE_STATE_TTL: Duration = Duration::from_secs(8);
 
@@ -86,6 +88,7 @@ pub enum TimedEventKey {
     Send(SocketAddr),
     SendAcks(SocketAddr, u8),
     CloseDeadline(SocketAddr),
+    PruneRateLimits,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -117,6 +120,8 @@ pub struct ServerThreadState<R: AuthResult> {
     pub is_checking_for_timeouts: bool,
     pub latency_discovery_interval: Duration,
 
+    /// Limits new key exchanges per client IP.
+    pub connection_requests: RateLimiter,
     pub auth_cmd_tx: Sender<AuthCmd>,
     pub expecting_login_requests: HashMap<LoginAttempt, PendingLogin>,
     pub expecting_auth_result: HashMap<LoginAttempt, Crypto>,
@@ -249,6 +254,9 @@ impl<R: AuthResult> ServerThreadState<R> {
                 }
                 TimedEventKey::CloseDeadline(socket_addr) => {
                     self.finish_close(socket_addr);
+                }
+                TimedEventKey::PruneRateLimits => {
+                    self.connection_requests.prune(Instant::now());
                 }
             }
         }
@@ -542,7 +550,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                 allowed_versions,
             },
         };
-        let size = server_hello.serialize(&self.siphasher, &mut self.buf);
+        let size = server_hello.serialize(&self.siphasher, from, &mut self.buf);
         self.socket.send_to(from, &self.buf[..size]);
     }
 
@@ -550,7 +558,9 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Ok(connection_request) = ConnectionRequest::deserialize(&self.buf[..size]) else {
             return;
         };
-        if connection_request.siphash != self.siphasher.hash(&self.buf[1..45]).to_le_bytes() {
+        if connection_request.siphash
+            != server_hello::cookie(&self.siphasher, &self.buf[1..45], from).to_le_bytes()
+        {
             return;
         }
         if !self.disable_timestamp_age_check {
@@ -573,6 +583,16 @@ impl<R: AuthResult> ServerThreadState<R> {
             }
             return;
         }
+        // Each new request costs a key exchange and a signature.
+        let now = Instant::now();
+        if !self.connection_requests.allow(from.ip(), now) {
+            return;
+        }
+        self.timed_events.push(
+            TimedEventKey::PruneRateLimits,
+            now + RATE_LIMIT_PRUNE_INTERVAL,
+            TimedEventData::Nothing,
+        );
         let x25519_secret_key = EphemeralSecret::random_from_rng(&mut thread_rng());
         let x25519_public_key = PublicKey::from(&x25519_secret_key);
         let shared_secret =

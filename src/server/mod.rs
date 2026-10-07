@@ -11,6 +11,7 @@ use bon::bon;
 use crossbeam::channel::{bounded, unbounded};
 use ed25519_dalek::SigningKey;
 use mio::{Poll, Waker};
+use rate_limit::RateLimiter;
 use siphasher::sip::SipHasher;
 use thread::{Cmd, ServerThreadState};
 
@@ -28,7 +29,12 @@ use crate::common::{
 
 pub mod auth;
 mod connection;
+mod rate_limit;
 mod thread;
+
+/// New key exchanges allowed per client IP (IPv6: per /64): sustained rate and burst.
+const CONNECTION_REQUESTS_PER_SECOND: f64 = 10.0;
+const CONNECTION_REQUEST_BURST: f64 = 20.0;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
@@ -243,6 +249,10 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
                 latency_discovery_interval,
 
                 siphasher: SipHasher::new_with_key(&rand::random()),
+                connection_requests: RateLimiter::new(
+                    CONNECTION_REQUESTS_PER_SECOND,
+                    CONNECTION_REQUEST_BURST,
+                ),
                 expecting_login_requests: Default::default(),
                 auth_cmd_tx,
                 expecting_auth_result: Default::default(),

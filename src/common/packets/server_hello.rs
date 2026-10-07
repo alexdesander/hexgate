@@ -2,6 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::{
+    hash::Hasher,
+    net::{IpAddr, SocketAddr},
+};
+
 use ed25519_dalek::VerifyingKey;
 use siphasher::sip::SipHasher;
 
@@ -25,8 +30,21 @@ pub enum ServerHello {
     },
 }
 
+/// The cookie a client echoes in its ConnectionRequest: a MAC over the echoed salt, timestamp
+/// and server key, bound to the client's address so it can't be used from anywhere else.
+pub fn cookie(siphasher: &SipHasher, echoed: &[u8], client: SocketAddr) -> u64 {
+    let mut hasher = *siphasher;
+    hasher.write(echoed);
+    match client.ip() {
+        IpAddr::V4(ip) => hasher.write(&ip.octets()),
+        IpAddr::V6(ip) => hasher.write(&ip.octets()),
+    }
+    hasher.write(&client.port().to_le_bytes());
+    hasher.finish()
+}
+
 impl ServerHello {
-    pub fn serialize(&self, siphasher: &SipHasher, buf: &mut [u8]) -> usize {
+    pub fn serialize(&self, siphasher: &SipHasher, client: SocketAddr, buf: &mut [u8]) -> usize {
         match self {
             ServerHello::VersionSupported {
                 salt,
@@ -40,7 +58,7 @@ impl ServerHello {
                 buf[1..5].copy_from_slice(salt);
                 buf[5..13].copy_from_slice(timestamp);
                 buf[13..45].copy_from_slice(server_ed25519_pubkey.as_bytes());
-                let siphash = siphash.unwrap_or_else(|| siphasher.hash(&buf[1..45]));
+                let siphash = siphash.unwrap_or_else(|| cookie(siphasher, &buf[1..45], client));
                 buf[45..53].copy_from_slice(&siphash.to_le_bytes());
                 buf[53] = *cipher as u8;
                 buf[54..56].copy_from_slice(&channel_counts[0].to_le_bytes());
