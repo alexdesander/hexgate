@@ -16,7 +16,7 @@ use hexgate::{
     server,
     sim::{Fate, NetworkSimulator},
 };
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
@@ -82,10 +82,10 @@ impl Lossy {
 
 impl NetworkSimulator for Lossy {
     fn simulate(&mut self, now: Instant, _: SocketAddr, _: &mut [u8]) -> Fate {
-        if self.rng.gen_bool(self.network.loss) {
+        if self.rng.random_bool(self.network.loss) {
             return Fate::Drop;
         }
-        let delay = self.rng.gen_range(self.network.delay_ms.clone());
+        let delay = self.rng.random_range(self.network.delay_ms.clone());
         Fate::Deliver(now + Duration::from_millis(delay))
     }
 }

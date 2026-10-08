@@ -7,7 +7,6 @@ use std::sync::Arc;
 use crossbeam_channel::{Receiver, Sender};
 use ed25519_dalek::SigningKey;
 use mio::Waker;
-use rand::thread_rng;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use super::auth::LoginAttempt;
@@ -48,7 +47,7 @@ pub(crate) struct HandshakeThreadState {
 pub(crate) fn handshake_thread(state: HandshakeThreadState) {
     let mut buf = [0; 1201];
     while let Ok(exchange) = state.requests.recv() {
-        let secret = EphemeralSecret::random_from_rng(thread_rng());
+        let secret = EphemeralSecret::random_from_rng(&mut rand::rng());
         let public = PublicKey::from(&secret);
         let crypto = Crypto::new(
             secret.diffie_hellman(&exchange.client_x25519_pubkey),

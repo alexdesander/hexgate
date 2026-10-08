@@ -39,7 +39,7 @@ const MAX_MESSAGE_SIZE: usize = 1 << 20;
 
 fn secret() -> &'static ReusableSecret {
     static SECRET: OnceLock<ReusableSecret> = OnceLock::new();
-    SECRET.get_or_init(|| ReusableSecret::random_from_rng(StdRng::seed_from_u64(0)))
+    SECRET.get_or_init(|| ReusableSecret::random_from_rng(&mut StdRng::seed_from_u64(0)))
 }
 
 fn crypto() -> Crypto {

@@ -12,7 +12,6 @@ use argon2::{Argon2, Params};
 use crossbeam_channel::Receiver;
 use ed25519_dalek::VerifyingKey;
 use mio::{Events, Poll};
-use rand::thread_rng;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, ReusableSecret};
 
@@ -125,7 +124,7 @@ impl Handshake {
             }
 
             // ConnectionRequest -> ConnectionResponse
-            let client_x25519_key = ReusableSecret::random_from_rng(thread_rng());
+            let client_x25519_key = ReusableSecret::random_from_rng(&mut rand::rng());
             let hkdf_salt: [u8; 32] = rand::random();
             let connection_request = ConnectionRequest {
                 salt: real_salt,

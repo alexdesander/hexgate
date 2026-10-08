@@ -14,7 +14,6 @@ use std::{
 };
 
 use ed25519_dalek::{SigningKey, ed25519::signature::Signer};
-use rand::thread_rng;
 use x25519_dalek::{EphemeralSecret, PublicKey, ReusableSecret};
 
 use crate::common::{
@@ -32,8 +31,8 @@ use crate::common::{
 
 /// The keys of both ends of a connection.
 fn crypto_pair(cipher: Cipher) -> (Crypto, Crypto) {
-    let client = ReusableSecret::random_from_rng(thread_rng());
-    let server = ReusableSecret::random_from_rng(thread_rng());
+    let client = ReusableSecret::random_from_rng(&mut rand::rng());
+    let server = ReusableSecret::random_from_rng(&mut rand::rng());
     let salt = rand::random();
     (
         Crypto::new(
@@ -54,7 +53,7 @@ fn crypto_pair(cipher: Cipher) -> (Crypto, Crypto) {
 /// The server's work for a new ConnectionRequest: an x25519 key exchange, key derivation and
 /// an ed25519 signature.
 pub fn key_exchange(signing_key: &SigningKey, client_key: &PublicKey) -> [u8; 64] {
-    let secret = EphemeralSecret::random_from_rng(thread_rng());
+    let secret = EphemeralSecret::random_from_rng(&mut rand::rng());
     let crypto = Crypto::new(
         secret.diffie_hellman(client_key),
         [0; 32],

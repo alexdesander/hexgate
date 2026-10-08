@@ -945,7 +945,6 @@ impl<R: AuthResult> ServerThreadState<R> {
 mod tests {
     use std::{net::UdpSocket, sync::mpsc};
 
-    use rand::thread_rng;
     use x25519_dalek::{PublicKey, ReusableSecret};
 
     use super::*;
@@ -1028,7 +1027,7 @@ mod tests {
         else {
             panic!("hello refused")
         };
-        let secret = ReusableSecret::random_from_rng(thread_rng());
+        let secret = ReusableSecret::random_from_rng(&mut rand::rng());
         let hkdf_salt = [8; 32];
         let mut request = ConnectionRequest {
             salt,
@@ -1073,7 +1072,7 @@ mod tests {
         socket.send(&buffer[..size]).unwrap();
         assert_no_reply(&socket);
         request.client_x25519_pubkey =
-            PublicKey::from(&ReusableSecret::random_from_rng(thread_rng()));
+            PublicKey::from(&ReusableSecret::random_from_rng(&mut rand::rng()));
         let size = request.serialize(&mut buffer);
         socket.send(&buffer[..size]).unwrap();
         assert_no_reply(&socket);

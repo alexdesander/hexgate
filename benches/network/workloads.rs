@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use hexgate::{Channel, ChannelConfiguration, sim::Profile};
-use rand::Rng;
+use rand::RngExt;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use serde::Serialize;
 
@@ -57,10 +57,10 @@ impl Size {
     pub fn sample(self, seq: u32, rng: &mut Xoshiro256PlusPlus) -> usize {
         match self {
             Size::Fixed(size) => size,
-            Size::Uniform(min, max) => rng.gen_range(min..=max),
+            Size::Uniform(min, max) => rng.random_range(min..=max),
             Size::LogUniform(min, max) => {
                 let (min, max) = ((min as f64).ln(), (max as f64).ln());
-                rng.gen_range(min..=max).exp().round() as usize
+                rng.random_range(min..=max).exp().round() as usize
             }
             Size::Cycle(sizes) => sizes[seq as usize % sizes.len()],
         }

@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Exp1, Pareto, StandardNormal};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
@@ -314,8 +314,8 @@ impl LinkState {
             self.stats.lost += 1;
             return Fate::Drop;
         }
-        if !packet.is_empty() && self.rng.r#gen::<f64>() < self.config.corrupt {
-            let bit = self.rng.gen_range(0..packet.len() * 8);
+        if !packet.is_empty() && self.rng.random::<f64>() < self.config.corrupt {
+            let bit = self.rng.random_range(0..packet.len() * 8);
             packet[bit / 8] ^= 1 << (bit % 8);
             self.stats.corrupted += 1;
         }
@@ -346,7 +346,7 @@ impl LinkState {
         let reordered = self
             .config
             .reorder
-            .filter(|reorder| self.rng.r#gen::<f64>() < reorder.probability);
+            .filter(|reorder| self.rng.random::<f64>() < reorder.probability);
         if let Some(reorder) = reordered {
             delivery += reorder.delay;
             self.stats.reordered += 1;
@@ -363,9 +363,9 @@ impl LinkState {
         }
 
         match self.config.duplicate {
-            Some(duplicate) if self.rng.r#gen::<f64>() < duplicate.probability => {
+            Some(duplicate) if self.rng.random::<f64>() < duplicate.probability => {
                 self.stats.duplicated += 1;
-                let delay = duplicate.max_delay.mul_f64(self.rng.r#gen());
+                let delay = duplicate.max_delay.mul_f64(self.rng.random());
                 Fate::Duplicate(delivery, delivery + delay)
             }
             _ => Fate::Deliver(delivery),
@@ -377,11 +377,11 @@ impl LinkState {
             return false;
         };
         let change = if self.bad_state { loss.r } else { loss.p };
-        if self.rng.r#gen::<f64>() < change {
+        if self.rng.random::<f64>() < change {
             self.bad_state = !self.bad_state;
         }
         let rate = if self.bad_state { loss.bad } else { loss.good };
-        self.rng.r#gen::<f64>() < rate
+        self.rng.random::<f64>() < rate
     }
 
     fn jitter(&mut self, now: Instant) -> Duration {
@@ -400,7 +400,7 @@ impl LinkState {
                 .map_or(0.0, |pareto| pareto.sample(rng) - scale)
         };
         let sample = match jitter.distribution {
-            JitterDistribution::Uniform => self.rng.r#gen::<f64>() * 2.0 * mean,
+            JitterDistribution::Uniform => self.rng.random::<f64>() * 2.0 * mean,
             JitterDistribution::Normal => normal(),
             JitterDistribution::Exponential => {
                 let sample: f64 = Exp1.sample(&mut self.rng);
@@ -418,7 +418,7 @@ impl LinkState {
             0.0 => 0.0,
             correlation => (-elapsed / correlation).exp(),
         };
-        let value = if self.rng.r#gen::<f64>() < weight {
+        let value = if self.rng.random::<f64>() < weight {
             previous
         } else {
             sample
@@ -437,7 +437,7 @@ pub(super) struct Schedule {
 impl Schedule {
     pub fn new(config: Episodes, start: Instant, rng: &mut Xoshiro256PlusPlus) -> Self {
         let first = match config.interval {
-            Interval::Periodic(period) => period.mul_f64(rng.r#gen()),
+            Interval::Periodic(period) => period.mul_f64(rng.random()),
             Interval::Random(mean) => exponential(mean, rng),
         };
         let start = start + first;

@@ -39,7 +39,7 @@ use hexgate::{
         NetworkSimulator, Profile,
     },
 };
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 const HEADER: usize = 14;
@@ -801,7 +801,7 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
         for spec in specs {
             let id = u16::try_from(streams.len()).expect("too many benchmark streams");
             let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed ^ u64::from(id) << 32);
-            let phase = Duration::from_secs_f64(rng.r#gen::<f64>() / 64.0);
+            let phase = Duration::from_secs_f64(rng.random::<f64>() / 64.0);
             let start = scenario.stagger * flow as u32 + phase + spec.offset;
             let (samples, bursts) = spec.kind.samples(args.seconds);
             streams.push(Stream {
@@ -863,7 +863,7 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
                     stream.next = now + tick;
                 }
                 Kind::Periodic { hz, min, max } => {
-                    let size = stream.rng.gen_range(min..=max);
+                    let size = stream.rng.random_range(min..=max);
                     let msg = message(stream.id, stream.sent, now_us, size);
                     pairs.send(stream.pair, stream.spec.from, stream.spec.channel, msg);
                     stream.sent += 1;
@@ -871,7 +871,7 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
                 }
                 Kind::Tick { hz, sizes } => {
                     for &(min, max) in sizes {
-                        let size = stream.rng.gen_range(min..=max);
+                        let size = stream.rng.random_range(min..=max);
                         let msg = message(stream.id, stream.sent, now_us, size);
                         pairs.send(stream.pair, stream.spec.from, stream.spec.channel, msg);
                         stream.sent += 1;

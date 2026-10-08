@@ -21,7 +21,7 @@ use hexgate::{
     error::SendError,
     server as hexserver,
 };
-use rand::Rng;
+use rand::RngExt;
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -339,7 +339,7 @@ fn many_clients() {
 fn survives_malformed_packets() {
     let (server, client) = connected(None, TIMEOUT);
     let attacker = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for identifier in 0..=30u8 {
         for size in [
             1, 2, 5, 9, 17, 18, 19, 54, 58, 117, 133, 257, 1199, 1200, 1300,

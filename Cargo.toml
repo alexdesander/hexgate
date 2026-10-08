@@ -19,25 +19,25 @@ include = [
 ]
 
 [dependencies]
-aes-gcm = "0.10.3"
-ahash = "0.8.11"
-argon2 = "0.5.3"
-bon = "3.1.1"
-chacha20poly1305 = "0.10.1"
-crossbeam-channel = "0.5.15"
-ed25519-dalek = "2.1.1"
-hkdf = "0.12.4"
-mio = { version = "1.0.2", features = ["net", "os-poll"] }
-rand = "0.8.5"
-sha2 = "0.10.8"
-siphasher = "1.0.1"
-socket2 = { version = "0.5.8", features = ["all"] }
-thiserror = "2.0.3"
-x25519-dalek = { version = "2.0.1", features = ["reusable_secrets"] }
-rand_xoshiro = "0.6.0"
-priority-queue = "2.1.1"
+aes-gcm = "0.11.1"
+ahash = "0.8.12"
+argon2 = "0.6.0"
+bon = "3.9.1"
+chacha20poly1305 = "0.11.0"
+crossbeam-channel = "0.5.17"
+ed25519-dalek = "3.0.0"
+hkdf = "0.13.0"
+mio = { version = "1.2.4", features = ["net", "os-poll"] }
+rand = "0.10.3"
+sha2 = "0.11.0"
+siphasher = "1.0.4"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2.0.21"
+x25519-dalek = { version = "3.0.0", features = ["reusable_secrets"] }
+rand_xoshiro = "0.8.1"
+priority-queue = "2.7.0"
 tracing = { version = "0.1.44", optional = true }
-rand_distr = "0.4.3"
+rand_distr = "0.6.0"
 num_enum = { version = "0.7.6", default-features = false }
 
 [features]
@@ -54,11 +54,11 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 ] }
 
 [dev-dependencies]
-anyhow = "1.0.93"
+anyhow = "1.0.104"
 criterion = "0.8.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-text_io = "0.1.12"
+text_io = "0.1.13"
 
 [[bench]]
 name = "packets"

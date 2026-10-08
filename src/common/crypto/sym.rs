@@ -4,7 +4,7 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{self, AeadInPlace},
+    aead::{self, AeadInOut},
 };
 use chacha20poly1305::ChaCha20Poly1305;
 
@@ -28,11 +28,11 @@ impl SymCipher {
     pub fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], to_encrypt: &mut [u8]) -> [u8; 16] {
         match self {
             SymCipher::AES256GCM(cipher) => cipher
-                .encrypt_in_place_detached(nonce.into(), aad, to_encrypt)
+                .encrypt_inout_detached(nonce.into(), aad, to_encrypt.into())
                 .unwrap()
                 .into(),
             SymCipher::ChaCha20Poly1305(cipher) => cipher
-                .encrypt_in_place_detached(nonce.into(), aad, to_encrypt)
+                .encrypt_inout_detached(nonce.into(), aad, to_encrypt.into())
                 .unwrap()
                 .into(),
         }
@@ -47,10 +47,10 @@ impl SymCipher {
     ) -> Result<(), aead::Error> {
         match self {
             SymCipher::AES256GCM(cipher) => {
-                cipher.decrypt_in_place_detached(nonce.into(), aad, to_decrypt, tag.into())
+                cipher.decrypt_inout_detached(nonce.into(), aad, to_decrypt.into(), tag.into())
             }
             SymCipher::ChaCha20Poly1305(cipher) => {
-                cipher.decrypt_in_place_detached(nonce.into(), aad, to_decrypt, tag.into())
+                cipher.decrypt_inout_detached(nonce.into(), aad, to_decrypt.into(), tag.into())
             }
         }
     }

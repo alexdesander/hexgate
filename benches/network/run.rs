@@ -19,7 +19,7 @@ use hexgate::{
     server,
     sim::{LinkStats, Profile, Simulator},
 };
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Exp1};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
@@ -431,7 +431,7 @@ fn send_phase(
                 _ => None,
             };
             // Ticks of different streams don't line up.
-            let phase = gap.map_or(Duration::ZERO, |gap| gap.mul_f64(rng.r#gen()));
+            let phase = gap.map_or(Duration::ZERO, |gap| gap.mul_f64(rng.random()));
             StreamState {
                 seq: 0,
                 next_at: start + phase,

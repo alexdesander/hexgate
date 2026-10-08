@@ -12,7 +12,7 @@ use std::{
     path::Path,
 };
 
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 
 /// Reading or writing a key file failed.
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +31,9 @@ pub enum KeyFileError {
 /// Random bytes from the operating system, e.g. a `secret_key` or `auth_salt`.
 pub fn generate<const N: usize>() -> [u8; N] {
     let mut key = [0u8; N];
-    OsRng.fill_bytes(&mut key);
+    SysRng
+        .try_fill_bytes(&mut key)
+        .expect("the operating system's random number generator failed");
     key
 }
 

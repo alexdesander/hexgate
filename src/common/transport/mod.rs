@@ -763,8 +763,8 @@ mod tests {
     use x25519_dalek::{PublicKey, ReusableSecret};
 
     fn pair(now: Instant) -> (Connection, Connection) {
-        let client = ReusableSecret::random_from_rng(rand::thread_rng());
-        let server = ReusableSecret::random_from_rng(rand::thread_rng());
+        let client = ReusableSecret::random_from_rng(&mut rand::rng());
+        let server = ReusableSecret::random_from_rng(&mut rand::rng());
         let config = Config {
             channels: ChannelConfiguration::default(),
             congestion: CongestionConfig::default(),
