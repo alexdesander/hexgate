@@ -18,6 +18,15 @@ pub(crate) struct EventSender<E> {
     max_events: usize,
 }
 
+impl<E> Clone for EventSender<E> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            max_events: self.max_events,
+        }
+    }
+}
+
 impl<E> EventSender<E> {
     pub fn send(&self, event: E) {
         let _ = self.tx.send(Ok(event));

@@ -6,44 +6,31 @@ use std::{
     io::{self, ErrorKind},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     panic::{self, AssertUnwindSafe},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, OnceLock},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 use ahash::HashSet;
-use argon2::{Argon2, Params};
 use bon::bon;
 use crossbeam::channel::{bounded, unbounded, Sender};
-use ed25519_dalek::VerifyingKey;
-use mio::{Events, Interest, Poll, Waker};
-use rand::thread_rng;
-use sha2::{Digest, Sha256};
+use handshake::{Handshake, Link};
+use mio::{Interest, Poll, Waker};
 use thread::{ClientThreadState, Cmd};
-use x25519_dalek::{PublicKey, ReusableSecret};
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, Channels, SendLimits},
     congestion::{CongestionConfiguration, CongestionController},
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver},
-    packets::{
-        client_hello::ClientHello,
-        connection_request::ConnectionRequest,
-        connection_response::{self, ConnectionResponse, Transcript},
-        disconnect,
-        info_request::InfoRequest,
-        info_response::InfoResponse,
-        login_request::{self, LoginRequest},
-        login_response::LoginResponse,
-        server_hello::ServerHello,
-    },
+    packets::{disconnect, info_request::InfoRequest, info_response::InfoResponse, login_request},
     socket::{is_transient, net_sym::NetworkSimulator, Socket},
     stats::Stats,
     timed_event_queue::TimedEventQueue,
-    AllowedClientVersions, ClientVersion, PROTOCOL_VERSION, RECV_TOKEN, WAKE_TOKEN,
+    AllowedClientVersions, ClientVersion, RECV_TOKEN, WAKE_TOKEN,
 };
 
+mod handshake;
 mod thread;
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +55,8 @@ pub enum ConnectError {
     /// Counts of unreliable ordered and reliable channels.
     #[error("Channel configuration differs from the server's (client: {client:?}, server: {server:?} unreliable ordered and reliable channels)")]
     ChannelMismatch { client: [u16; 2], server: [u16; 2] },
+    #[error("The client was disconnected during the handshake")]
+    Cancelled,
 }
 
 /// Requests the info of every server in `server_addrs` and sends each server's answer to
@@ -150,6 +139,10 @@ pub enum ServerKey {
 
 #[derive(Debug)]
 pub enum Event {
+    /// The handshake succeeded (`start()` only, `connect()` consumes it).
+    Connected,
+    /// The handshake failed (`start()` only), the client has stopped.
+    ConnectFailed(ConnectError),
     Disconnected(Vec<u8>),
     TimedOut,
     Received(Vec<u8>),
@@ -199,7 +192,8 @@ impl Client {
         let _ = self.inner.waker.wake();
     }
 
-    /// Asks the network thread for the connection statistics, `None` once it has stopped.
+    /// Asks the network thread for the connection statistics, `None` before it is connected
+    /// and once it has stopped.
     pub fn stats(&self) -> Option<Stats> {
         let (reply_tx, reply_rx) = bounded(1);
         self.inner.cmd_tx.send(Cmd::Stats(reply_tx)).ok()?;
@@ -211,13 +205,14 @@ impl Client {
         self.local_addr
     }
 
-    pub fn get_server_key(&self) -> [u8; 32] {
-        self.inner.server_ed25519_pubkey.to_bytes()
+    /// The server's public key, `None` until connected.
+    pub fn get_server_key(&self) -> Option<[u8; 32]> {
+        self.inner.server_key.get().copied()
     }
 }
 
 struct ClientInner {
-    server_ed25519_pubkey: VerifyingKey,
+    server_key: Arc<OnceLock<[u8; 32]>>,
     cmd_tx: Sender<Cmd>,
     event_rx: EventReceiver<Event>,
     waker: Arc<Waker>,
@@ -234,16 +229,16 @@ impl Drop for ClientInner {
 
 #[bon]
 impl Client {
-    /// Prepares the client and connects to the server (when connect is called).
-    /// This is blocking as long as the handshake with the server is not done.
-    /// You can freely run this on a different thread and then send the client back to your main thread.
-    #[builder(finish_fn = connect)]
-    pub fn prepare(
+    /// Prepares the client. `start()` returns right away and connects on the network thread,
+    /// which reports `Event::Connected` or `Event::ConnectFailed`; messages sent before are
+    /// queued. `connect()` blocks until the handshake is done instead.
+    #[builder(finish_fn = start)]
+    pub fn prepare<A: ToSocketAddrs>(
         /// Defaults to any address of the server's IP version, with a random port.
         bind_addr: Option<SocketAddr>,
         /// An address or a host name with port, e.g. `"example.com:44444"`. The first resolved
         /// address (of `bind_addr`'s IP version, if set) is used.
-        server_socket_addr: impl ToSocketAddrs,
+        server_socket_addr: A,
         server_key: ServerKey,
         /// At most 1177 bytes unless hashed.
         auth_data: Vec<u8>,
@@ -274,9 +269,8 @@ impl Client {
         #[builder(default = Duration::from_secs(1))]
         close_linger: Duration,
         #[builder(default = Duration::from_secs(4))] handshake_timeout: Duration,
-        #[builder(default = 2)] mut handshake_tries: u8,
+        #[builder(default = 2)] handshake_tries: u8,
     ) -> Result<Self, ConnectError> {
-        let max_handshake_tries = handshake_tries;
         channel_config.validate()?;
         congestion_config.validate()?;
         if !hash_auth_data {
@@ -308,162 +302,43 @@ impl Client {
         let mut poll = Poll::new()?;
         poll.registry()
             .register(socket.mio_socket(), RECV_TOKEN, Interest::READABLE)?;
-        let mut buf = [0u8; 1201];
 
-        'outer: while handshake_tries > 0 {
-            handshake_tries -= 1;
-            // ClientHello -> ServerHello
-            let real_salt: [u8; 4] = rand::random();
-            let client_hello = ClientHello {
-                salt: real_salt,
-                client_version,
-            };
-            let size = client_hello.serialize(&mut buf);
-            let server_hello = handshake_step(
-                &mut socket,
-                &mut poll,
-                &buf[..size],
-                handshake_timeout,
-                |packet| match ServerHello::deserialize(packet).ok()? {
-                    ServerHello::VersionNotSupported {
-                        salt,
-                        allowed_versions,
-                    } => (salt == real_salt)
-                        .then_some(Err(ConnectError::VersionNotSupported(allowed_versions))),
-                    ServerHello::ServerFull { salt } => {
-                        (salt == real_salt).then_some(Err(ConnectError::ServerFull))
-                    }
-                    ServerHello::ProtocolMismatch {
-                        salt,
-                        server_version,
-                    } => (salt == real_salt).then_some(Err(ConnectError::ProtocolMismatch {
-                        client: PROTOCOL_VERSION,
-                        server: server_version,
-                    })),
-                    ServerHello::VersionSupported {
-                        salt,
-                        timestamp,
-                        cipher,
-                        server_ed25519_pubkey,
-                        siphash,
-                        channel_counts,
-                    } => (salt == real_salt).then_some(Ok((
-                        timestamp,
-                        cipher,
-                        server_ed25519_pubkey,
-                        siphash,
-                        channel_counts,
-                    ))),
-                },
-            )?;
-            let Some((timestamp, cipher, server_ed25519_pubkey, siphash, channel_counts)) =
-                server_hello
-            else {
-                continue 'outer;
-            };
-
-            if let ServerKey::Pinned(key) = server_key {
-                if server_ed25519_pubkey.to_bytes() != key {
-                    return Err(ConnectError::ServerKeyMismatch {
-                        received_key: server_ed25519_pubkey.to_bytes(),
-                    });
-                }
-            }
-            if channel_counts != channel_config.counts() {
-                return Err(ConnectError::ChannelMismatch {
-                    client: channel_config.counts(),
-                    server: channel_counts,
-                });
-            }
-
-            // ConnectionRequest -> ConnectionResponse
-            let client_x25519_key = ReusableSecret::random_from_rng(thread_rng());
-            let hkdf_salt: [u8; 32] = rand::random();
-            let connection_request = ConnectionRequest {
-                salt: real_salt,
-                timestamp,
-                server_ed25519_pubkey,
-                siphash: siphash.unwrap().to_le_bytes(),
-                client_x25519_pubkey: PublicKey::from(&client_x25519_key),
-                hkdf_salt,
-            };
-            let size = connection_request.serialize(&mut buf);
-            let transcript = Transcript {
-                request: &buf[connection_response::SIGNED_REQUEST],
-                cipher,
-                channel_counts,
-            };
-            let connection_response = handshake_step(
-                &mut socket,
-                &mut poll,
-                &buf[..size],
-                handshake_timeout,
-                |packet| {
-                    let (response, crypto) = ConnectionResponse::deserialize(
-                        packet,
-                        server_ed25519_pubkey,
-                        &client_x25519_key,
-                        hkdf_salt,
-                        &transcript,
-                    )
-                    .ok()?;
-                    (response.salt == real_salt).then_some(Ok((crypto, response.auth_salt)))
-                },
-            )?;
-            let Some((crypto, auth_salt)) = connection_response else {
-                continue 'outer;
-            };
-
-            // LoginRequest -> LoginResponse
-            let hashed_auth_data;
-            let login_auth_data = if hash_auth_data {
-                // A rogue server reusing another server's auth_salt must not get hashes valid there.
-                let argon2_salt = Sha256::new()
-                    .chain_update(server_ed25519_pubkey.as_bytes())
-                    .chain_update(auth_salt)
-                    .finalize();
-                let mut hashed = vec![0u8; 20];
-                Argon2::new(
-                    argon2::Algorithm::Argon2id,
-                    argon2::Version::V0x13,
-                    Params::new(65536, 2, 1, Some(20)).unwrap(),
-                )
-                .hash_password_into(&auth_data, &argon2_salt, &mut hashed)
-                .unwrap();
-                hashed_auth_data = hashed;
-                &hashed_auth_data
-            } else {
-                &auth_data
-            };
-            let login_request = LoginRequest {
-                salt: real_salt,
-                auth_data: login_auth_data,
-            };
-            let size = login_request.serialize(&crypto, &mut buf);
-            let login = handshake_step(
-                &mut socket,
-                &mut poll,
-                &buf[..size],
-                handshake_timeout,
-                |packet| match LoginResponse::deserialize(&crypto, packet).ok()? {
-                    LoginResponse::Failure { failure_data } => {
-                        Some(Err(ConnectError::ServerDeniedLogin(failure_data.to_vec())))
-                    }
-                    LoginResponse::Success => Some(Ok(())),
-                },
-            )?;
-            if login.is_none() {
-                continue 'outer;
-            }
-
-            // Handshake done, run thread
-            let (event_tx, event_rx) = events::channel(max_events);
-            let (cmd_tx, cmd_rx) = unbounded();
-            let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
-            let _waker = waker.clone();
-            let thread = std::thread::Builder::new()
-                .name("hexgate-client".into())
-                .spawn(move || {
+        let handshake = Handshake {
+            server_key,
+            auth_data,
+            hash_auth_data,
+            client_version,
+            channel_counts: channel_config.counts(),
+            timeout: handshake_timeout,
+            tries: handshake_tries,
+        };
+        let (event_tx, event_rx) = events::channel(max_events);
+        let fail_tx = event_tx.clone();
+        let (cmd_tx, cmd_rx) = unbounded();
+        let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
+        let _waker = waker.clone();
+        let server_key = Arc::new(OnceLock::new());
+        let thread_server_key = server_key.clone();
+        let thread = std::thread::Builder::new()
+            .name("hexgate-client".into())
+            .spawn(move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let mut link = Link {
+                        socket: &mut socket,
+                        poll: &mut poll,
+                        cmds: &cmd_rx,
+                        pending: Vec::new(),
+                    };
+                    let (crypto, key) = match handshake.run(&mut link) {
+                        Ok(connected) => connected,
+                        Err(e) => {
+                            event_tx.send(Event::ConnectFailed(e));
+                            return Ok(());
+                        }
+                    };
+                    let pending = link.pending;
+                    let _ = thread_server_key.set(key.to_bytes());
+                    event_tx.send(Event::Connected);
                     let mut state = ClientThreadState {
                         cmds: cmd_rx,
                         event_tx,
@@ -490,75 +365,38 @@ impl Client {
                         close_linger,
                         closing: None,
                     };
-                    let result = panic::catch_unwind(AssertUnwindSafe(|| state.run()))
-                        .unwrap_or_else(|payload| Err(RecvError::panicked(payload)));
-                    if let Err(e) = result {
-                        state.event_tx.fail(e);
-                    }
-                })?;
+                    state.run(pending)
+                }))
+                .unwrap_or_else(|payload| Err(RecvError::panicked(payload)));
+                if let Err(e) = result {
+                    fail_tx.fail(e);
+                }
+            })?;
 
-            return Ok(Client {
-                send_limits,
-                local_addr,
-                inner: Arc::new(ClientInner {
-                    server_ed25519_pubkey,
-                    cmd_tx,
-                    event_rx,
-                    waker,
-                    thread: Some(thread),
-                }),
-            });
-        }
-        Err(ConnectError::IoError(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "Hexgate Handshake timed out after {} tries",
-                max_handshake_tries
-            ),
-        )))
+        Ok(Client {
+            send_limits,
+            local_addr,
+            inner: Arc::new(ClientInner {
+                server_key,
+                cmd_tx,
+                event_rx,
+                waker,
+                thread: Some(thread),
+            }),
+        })
     }
 }
 
-/// First retransmission interval of a handshake step, doubled up to the maximum.
-const HANDSHAKE_RESEND_INTERVAL: Duration = Duration::from_millis(250);
-const MAX_HANDSHAKE_RESEND_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Sends `packet` with backoff until `parse` accepts a response, `Ok(None)` after `timeout`.
-fn handshake_step<T>(
-    socket: &mut Socket,
-    poll: &mut Poll,
-    packet: &[u8],
-    timeout: Duration,
-    mut parse: impl FnMut(&mut [u8]) -> Option<Result<T, ConnectError>>,
-) -> Result<Option<T>, ConnectError> {
-    let mut events = Events::with_capacity(4);
-    let mut buf = [0u8; 1201];
-    let deadline = Instant::now() + timeout;
-    let mut resend_interval = HANDSHAKE_RESEND_INTERVAL;
-    let mut resend_at = Instant::now();
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(None);
-        }
-        if now >= resend_at {
-            socket.send(packet);
-            resend_at = now + resend_interval;
-            resend_interval = (resend_interval * 2).min(MAX_HANDSHAKE_RESEND_INTERVAL);
-        }
-        while let Some((size, _)) = socket.recv_from(&mut buf)? {
-            if (1..=1200).contains(&size) {
-                if let Some(result) = parse(&mut buf[..size]) {
-                    return result.map(Some);
-                }
-            }
-        }
-        let wait = resend_at
-            .min(deadline)
-            .saturating_duration_since(Instant::now());
-        match poll.poll(&mut events, Some(wait)) {
-            Err(e) if e.kind() != ErrorKind::Interrupted => return Err(e.into()),
-            _ => {}
+impl<A: ToSocketAddrs, S: client_prepare_builder::IsComplete> ClientPrepareBuilder<A, S> {
+    /// Starts the client and blocks until the handshake is done (this consumes the
+    /// `Event::Connected`). Can run on another thread, the client can be sent back afterwards.
+    pub fn connect(self) -> Result<Client, ConnectError> {
+        let client = self.start()?;
+        match client.next() {
+            Ok(Event::Connected) => Ok(client),
+            Ok(Event::ConnectFailed(e)) => Err(e),
+            Ok(event) => unreachable!("{event:?} before the handshake ended"),
+            Err(e) => Err(io::Error::other(e).into()),
         }
     }
 }

@@ -89,7 +89,11 @@ pub struct ClientThreadState {
 }
 
 impl ClientThreadState {
-    pub fn run(&mut self) -> Result<(), RecvError> {
+    /// `pending`: commands sent during the handshake.
+    pub fn run(&mut self, pending: Vec<Cmd>) -> Result<(), RecvError> {
+        for cmd in pending {
+            self.handle_cmd(cmd)?;
+        }
         self.timed_events.push(
             TimedEventKey::CheckForTimeout,
             Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
@@ -129,53 +133,55 @@ impl ClientThreadState {
 
     fn handle_all_cmds(&mut self) -> Result<bool, io::Error> {
         loop {
-            let cmd = match self.cmds.try_recv() {
-                Ok(cmd) => cmd,
-                Err(TryRecvError::Empty) => break,
+            match self.cmds.try_recv() {
+                Ok(cmd) => self.handle_cmd(cmd)?,
+                Err(TryRecvError::Empty) => return Ok(false),
                 Err(TryRecvError::Disconnected) => return Ok(true),
-            };
+            }
+        }
+    }
 
-            match cmd {
-                Cmd::Disconnect(data) => {
-                    if self.closing.is_none() {
-                        let now = Instant::now();
-                        self.closing = Some(data);
-                        self.timed_events.push(
-                            TimedEventKey::CloseDeadline,
-                            now + self.close_linger,
-                            TimedEventData::Nothing,
-                        );
-                        self.timed_events
-                            .push(TimedEventKey::Send, now, TimedEventData::Nothing);
-                    }
-                }
-                Cmd::Send(..) if self.closing.is_some() => {}
-                Cmd::Send(channel, payload) => {
-                    self.channels.push(channel, Rc::new(payload));
+    fn handle_cmd(&mut self, cmd: Cmd) -> Result<(), io::Error> {
+        match cmd {
+            Cmd::Disconnect(data) => {
+                if self.closing.is_none() {
+                    let now = Instant::now();
+                    self.closing = Some(data);
                     self.timed_events.push(
-                        TimedEventKey::Send,
-                        self.last_sent + self.congestion.downtime_between_batches(),
+                        TimedEventKey::CloseDeadline,
+                        now + self.close_linger,
                         TimedEventData::Nothing,
                     );
+                    self.timed_events
+                        .push(TimedEventKey::Send, now, TimedEventData::Nothing);
                 }
-                Cmd::Stats(reply) => {
-                    let _ = reply.send(Stats::new(
-                        &self.congestion,
-                        &self.channels,
-                        &self.probe_loss,
-                    ));
-                }
-                Cmd::SetSimulator(network_simulator) => {
-                    if let Some(network_simulator) = network_simulator {
-                        self.socket.set_network_simulator(network_simulator)?;
-                        self.socket.set_use_simulator(true);
-                    } else {
-                        self.socket.set_use_simulator(false);
-                    }
+            }
+            Cmd::Send(..) if self.closing.is_some() => {}
+            Cmd::Send(channel, payload) => {
+                self.channels.push(channel, Rc::new(payload));
+                self.timed_events.push(
+                    TimedEventKey::Send,
+                    self.last_sent + self.congestion.downtime_between_batches(),
+                    TimedEventData::Nothing,
+                );
+            }
+            Cmd::Stats(reply) => {
+                let _ = reply.send(Stats::new(
+                    &self.congestion,
+                    &self.channels,
+                    &self.probe_loss,
+                ));
+            }
+            Cmd::SetSimulator(network_simulator) => {
+                if let Some(network_simulator) = network_simulator {
+                    self.socket.set_network_simulator(network_simulator)?;
+                    self.socket.set_use_simulator(true);
+                } else {
+                    self.socket.set_use_simulator(false);
                 }
             }
         }
-        Ok(false)
+        Ok(())
     }
 
     fn handle_all_events(&mut self) -> bool {

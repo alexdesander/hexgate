@@ -48,8 +48,7 @@ fn main() -> anyhow::Result<()> {
             weights_reliable: vec![10, 10, 10, 10, 10],
         })
         .connect()?;
-    if known_server_key.is_none() {
-        let server_key = client.get_server_key();
+    if let (None, Some(server_key)) = (known_server_key, client.get_server_key()) {
         println!("Trusting server key {}", fingerprint(&server_key));
         keys::save(KNOWN_SERVER_KEY, &server_key)?;
     }
@@ -76,6 +75,8 @@ fn main() -> anyhow::Result<()> {
                     println!("Disconnected: {}", violation);
                     break;
                 }
+                // Only reported to clients started with `start()`.
+                Event::Connected | Event::ConnectFailed(_) => {}
             }
         }
     });
