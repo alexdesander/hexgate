@@ -29,7 +29,7 @@ use crate::common::{
         acks::Acks,
         client_hello::ClientHello,
         connection_request::ConnectionRequest,
-        connection_response::ConnectionResponse,
+        connection_response::{self, ConnectionResponse, Transcript},
         disconnect::{self, Disconnect},
         info_request::InfoRequest,
         info_response::InfoResponse,
@@ -611,7 +611,10 @@ impl<R: AuthResult> ServerThreadState<R> {
             }
         }
         let attempt = (from, connection_request.salt);
-        let request: [u8; 64] = self.buf[53..117].try_into().unwrap();
+        let signed_request: [u8; 116] = self.buf[connection_response::SIGNED_REQUEST]
+            .try_into()
+            .unwrap();
+        let request: [u8; 64] = signed_request[52..].try_into().unwrap();
         if let Some(pending) = self.expecting_login_requests.get(&attempt) {
             // A retransmission must get the same keys, a different request is ignored.
             if pending.request == request {
@@ -645,7 +648,13 @@ impl<R: AuthResult> ServerThreadState<R> {
             server_x25519_pubkey: x25519_public_key,
             auth_salt: self.auth_salt,
         };
-        let size = connection_response.serialize(&crypto, &self.signing_key, &mut self.buf);
+        let transcript = Transcript {
+            request: &signed_request,
+            cipher: self.cipher,
+            channel_counts: self.channel_config.counts(),
+        };
+        let size =
+            connection_response.serialize(&crypto, &self.signing_key, &transcript, &mut self.buf);
         self.socket.send_to(from, &self.buf[..size]);
         self.expecting_login_requests.insert(
             attempt,

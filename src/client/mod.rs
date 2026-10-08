@@ -28,7 +28,7 @@ use crate::common::{
     packets::{
         client_hello::ClientHello,
         connection_request::ConnectionRequest,
-        connection_response::ConnectionResponse,
+        connection_response::{self, ConnectionResponse, Transcript},
         disconnect,
         info_request::InfoRequest,
         info_response::InfoResponse,
@@ -361,6 +361,11 @@ impl Client {
                 hkdf_salt,
             };
             let size = connection_request.serialize(&mut buf);
+            let transcript = Transcript {
+                request: &buf[connection_response::SIGNED_REQUEST],
+                cipher,
+                channel_counts,
+            };
             let connection_response = handshake_step(
                 &mut socket,
                 &mut poll,
@@ -372,7 +377,7 @@ impl Client {
                         server_ed25519_pubkey,
                         &client_x25519_key,
                         hkdf_salt,
-                        cipher,
+                        &transcript,
                     )
                     .ok()?;
                     (response.salt == real_salt).then_some(Ok((crypto, response.auth_salt)))

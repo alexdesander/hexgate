@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::ops::Range;
+
 use ed25519_dalek::{ed25519::signature::Signer, SigningKey, VerifyingKey};
+use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey, ReusableSecret};
 
 use crate::common::{crypto::Crypto, Cipher};
@@ -17,12 +20,39 @@ pub struct ConnectionResponse {
 
 pub const SIZE: usize = 133;
 
+/// The ConnectionRequest bytes the signature covers: the echoed ServerHello fields, the
+/// client's x25519 key and the HKDF salt.
+pub const SIGNED_REQUEST: Range<usize> = 1..117;
+
+/// Everything besides the response itself that the server signs, so neither side's key
+/// exchange parameters nor the cipher and channel counts can be changed on the path.
+pub struct Transcript<'a> {
+    pub request: &'a [u8],
+    pub cipher: Cipher,
+    pub channel_counts: [u16; 2],
+}
+
+impl Transcript<'_> {
+    fn digest(&self, response: &[u8]) -> [u8; 64] {
+        Sha512::new()
+            .chain_update(b"hexgate ConnectionResponse")
+            .chain_update(self.request)
+            .chain_update([self.cipher as u8])
+            .chain_update(self.channel_counts[0].to_le_bytes())
+            .chain_update(self.channel_counts[1].to_le_bytes())
+            .chain_update(response)
+            .finalize()
+            .into()
+    }
+}
+
 const NONCE: [u8; 12] = [0xff; 12];
 impl ConnectionResponse {
     pub fn serialize(
         &self,
         crypto: &Crypto,
         server_ed25519_key: &SigningKey,
+        transcript: &Transcript,
         buf: &mut [u8],
     ) -> usize {
         buf[0] = PacketIdentifier::ConnectionResponse as u8;
@@ -33,17 +63,17 @@ impl ConnectionResponse {
         let tag = crypto.encrypt(&NONCE, &[], &mut buf[37..53]);
         buf[53..69].copy_from_slice(&tag);
 
-        let signature = server_ed25519_key.sign(&buf[..69]);
+        let signature = server_ed25519_key.sign(&transcript.digest(&buf[..69]));
         buf[69..SIZE].copy_from_slice(&signature.to_bytes());
         SIZE
     }
 
     pub fn deserialize(
         buf: &[u8],
-        served_ed25519_pub_key: VerifyingKey,
+        server_ed25519_pubkey: VerifyingKey,
         client_x25519_key: &ReusableSecret,
         hkdf_salt: [u8; 32],
-        cipher: Cipher,
+        transcript: &Transcript,
     ) -> Result<(Self, Crypto), &'static str> {
         if buf.len() != SIZE {
             return Err(ERROR_INVALID_BUFFER_SIZE);
@@ -54,8 +84,8 @@ impl ConnectionResponse {
         }
 
         let signature = buf[69..SIZE].try_into().unwrap();
-        if served_ed25519_pub_key
-            .verify_strict(&buf[..69], &signature)
+        if server_ed25519_pubkey
+            .verify_strict(&transcript.digest(&buf[..69]), &signature)
             .is_err()
         {
             return Err(ERROR_INVALID_SIGNATURE);
@@ -65,7 +95,7 @@ impl ConnectionResponse {
         let server_x25519_pubkey = PublicKey::from(server_x25519_pubkey);
 
         let shared_secret = client_x25519_key.diffie_hellman(&server_x25519_pubkey);
-        let crypto = Crypto::new(shared_secret, hkdf_salt, false, cipher);
+        let crypto = Crypto::new(shared_secret, hkdf_salt, false, transcript.cipher);
 
         let tag: [u8; 16] = buf[53..69].try_into().unwrap();
         let mut auth_salt: [u8; 16] = buf[37..53].try_into().unwrap();

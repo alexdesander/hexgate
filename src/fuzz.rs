@@ -16,13 +16,22 @@ use crate::common::{
     congestion::{CongestionConfiguration, CongestionController},
     crypto::Crypto,
     packets::{
-        acks::Acks, client_hello::ClientHello, connection_request::ConnectionRequest,
-        connection_response::ConnectionResponse, disconnect::Disconnect, info_request::InfoRequest,
-        info_response::InfoResponse, latency_discovery::LatencyDiscovery,
+        acks::Acks,
+        client_hello::ClientHello,
+        connection_request::ConnectionRequest,
+        connection_response::{ConnectionResponse, Transcript},
+        disconnect::Disconnect,
+        info_request::InfoRequest,
+        info_response::InfoResponse,
+        latency_discovery::LatencyDiscovery,
         latency_discovery_response::LatencyDiscoveryResponse,
-        latency_discovery_response_2::LatencyDiscoveryResponse2, login_request::LoginRequest,
-        login_response::LoginResponse, reliable_payload::ReliablePayload,
-        server_hello::ServerHello, unreliable_payload::UnreliablePayload, PacketIdentifier,
+        latency_discovery_response_2::LatencyDiscoveryResponse2,
+        login_request::LoginRequest,
+        login_response::LoginResponse,
+        reliable_payload::ReliablePayload,
+        server_hello::ServerHello,
+        unreliable_payload::UnreliablePayload,
+        PacketIdentifier,
     },
     Cipher,
 };
@@ -60,15 +69,21 @@ pub fn packets(data: &[u8]) {
         if let ServerHello::VersionSupported {
             server_ed25519_pubkey,
             cipher,
+            channel_counts,
             ..
         } = server_hello
         {
+            let transcript = Transcript {
+                request: &[0; 116],
+                cipher,
+                channel_counts,
+            };
             let _ = ConnectionResponse::deserialize(
                 &buf,
                 server_ed25519_pubkey,
                 secret(),
                 [0; 32],
-                cipher,
+                &transcript,
             );
         }
     }
