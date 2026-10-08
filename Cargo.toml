@@ -38,7 +38,6 @@ siphasher = "1.0.4"
 socket2 = { version = "0.6.5", features = ["all"] }
 thiserror = "2.0.21"
 x25519-dalek = { version = "3.0.0", features = ["reusable_secrets"] }
-rand_xoshiro = { version = "0.8.1", optional = true }
 priority-queue = "2.7.0"
 tracing = { version = "0.1.44", optional = true }
 rand_distr = { version = "0.6.0", optional = true }
@@ -51,7 +50,7 @@ argon2 = ["dep:argon2"]
 # Debug and trace events for handshakes, connection changes and rejected packets.
 tracing = ["dep:tracing"]
 # Network simulation (`hexgate::sim`, `set_simulator`, the `simulator` builder settings).
-sim = ["dep:rand_distr", "dep:rand_xoshiro"]
+sim = ["dep:rand_distr"]
 # Internal entry points for the benchmarks in benches/, not part of the API.
 bench = ["sim"]
 
@@ -67,7 +66,6 @@ anyhow = "1.0.104"
 criterion = "0.8.2"
 serde = { version = "1.0.229", features = ["derive"] }
 rand_distr = "0.6.0"
-rand_xoshiro = "0.8.1"
 serde_json = "1.0.151"
 text_io = "0.1.13"
 

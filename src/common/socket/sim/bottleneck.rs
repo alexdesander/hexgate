@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rand_xoshiro::Xoshiro256PlusPlus;
+use rand::rngs::Xoshiro256PlusPlus;
 
 use super::link::{Episodes, FAR_FUTURE, Schedule};
 

@@ -39,8 +39,8 @@ use hexgate::{
         NetworkSimulator, Profile,
     },
 };
+use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
-use rand_xoshiro::Xoshiro256PlusPlus;
 
 const HEADER: usize = 14;
 const KIB: usize = 1024;

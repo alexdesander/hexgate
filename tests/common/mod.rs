@@ -16,8 +16,8 @@ use hexgate::{
     server,
     sim::{Fate, NetworkSimulator},
 };
+use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
-use rand_xoshiro::Xoshiro256PlusPlus;
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// The transfer tests queue tens of thousands of messages at once and poll with sleeps: a

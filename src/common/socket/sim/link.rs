@@ -9,9 +9,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Exp1, Pareto, StandardNormal};
-use rand_xoshiro::Xoshiro256PlusPlus;
 
 use super::{
     Fate, NetworkSimulator,

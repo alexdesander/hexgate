@@ -19,9 +19,9 @@ use hexgate::{
     server,
     sim::{LinkStats, Profile, Simulator},
 };
+use rand::rngs::Xoshiro256PlusPlus;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Exp1};
-use rand_xoshiro::Xoshiro256PlusPlus;
 
 use crate::workloads::{CONTROL, Dir, Pattern, Workload, channel_config};
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hexgate::{Channel, ChannelConfiguration, sim::Profile};
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256PlusPlus;
+use rand::rngs::Xoshiro256PlusPlus;
 use serde::Serialize;
 
 pub const KIB: usize = 1024;
