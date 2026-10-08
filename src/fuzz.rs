@@ -58,6 +58,7 @@ pub fn packets(data: &[u8]) {
     let _ = InfoRequest::deserialize(&buf);
     let _ = InfoResponse::deserialize(&buf);
     let _ = ClientHello::deserialize(&buf);
+    let _ = ClientHello::other_protocol_salt(&buf);
     let _ = ServerHello::deserialize(&buf);
     let _ = ConnectionRequest::deserialize(&buf);
     let _ = LoginRequest::deserialize_salt(&buf);

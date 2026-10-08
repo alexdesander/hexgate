@@ -46,7 +46,7 @@ use crate::common::{
     socket::net_sym::NetworkSimulator,
     stats::Stats,
     timed_event_queue::TimedEventQueue,
-    AllowedClientVersions, Cipher, ClientVersion, RECV_TOKEN, WAKE_TOKEN,
+    AllowedClientVersions, Cipher, ClientVersion, PROTOCOL_VERSION, RECV_TOKEN, WAKE_TOKEN,
 };
 
 use super::{
@@ -571,14 +571,30 @@ impl<R: AuthResult> ServerThreadState<R> {
     }
 
     fn handle_packet_client_hello(&mut self, size: usize, from: SocketAddr) {
-        let Ok(client_hello) = ClientHello::deserialize(&self.buf[..size]) else {
-            return;
+        let client_hello = match ClientHello::deserialize(&self.buf[..size]) {
+            Ok(client_hello) => Ok(client_hello),
+            Err(_) => match ClientHello::other_protocol_salt(&self.buf[..size]) {
+                Some(salt) => Err(salt),
+                None => return,
+            },
         };
         let now = Instant::now();
         if !self.client_hellos.allow(from.ip(), now) {
             return;
         }
         self.schedule_rate_limit_prune(now);
+        let client_hello = match client_hello {
+            Ok(client_hello) => client_hello,
+            Err(salt) => {
+                let mismatch = ServerHello::ProtocolMismatch {
+                    salt,
+                    server_version: PROTOCOL_VERSION,
+                };
+                let size = mismatch.serialize(&self.siphasher, from, &mut self.buf);
+                self.socket.send_to(from, &self.buf[..size]);
+                return;
+            }
+        };
         let server_hello = match (self.allowed_client_versions)(client_hello.client_version) {
             Ok(()) if self.is_full_for(from) => ServerHello::ServerFull {
                 salt: client_hello.salt,

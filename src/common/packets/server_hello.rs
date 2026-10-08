@@ -35,6 +35,11 @@ pub enum ServerHello {
     ServerFull {
         salt: [u8; 4],
     },
+    /// The client speaks another protocol version.
+    ProtocolMismatch {
+        salt: [u8; 4],
+        server_version: u8,
+    },
 }
 
 /// The cookie a client echoes in its ConnectionRequest: a MAC over the echoed salt, timestamp
@@ -90,6 +95,15 @@ impl ServerHello {
                 buf[0] = PacketIdentifier::ServerHelloServerFull as u8;
                 buf[1..5].copy_from_slice(salt);
                 5
+            }
+            ServerHello::ProtocolMismatch {
+                salt,
+                server_version,
+            } => {
+                buf[0] = PacketIdentifier::ServerHelloProtocolMismatch as u8;
+                buf[1..5].copy_from_slice(salt);
+                buf[5] = *server_version;
+                6
             }
         }
     }
@@ -155,6 +169,16 @@ impl ServerHello {
             }
             return Ok(ServerHello::ServerFull {
                 salt: buf[1..5].try_into().unwrap(),
+            });
+        }
+
+        if buf[0] == PacketIdentifier::ServerHelloProtocolMismatch as u8 {
+            if buf.len() != 6 {
+                return Err(ERROR_INVALID_BUFFER_SIZE);
+            }
+            return Ok(ServerHello::ProtocolMismatch {
+                salt: buf[1..5].try_into().unwrap(),
+                server_version: buf[5],
             });
         }
 

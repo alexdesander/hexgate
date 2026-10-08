@@ -14,7 +14,7 @@ pub mod socket;
 pub mod stats;
 pub(crate) mod timed_event_queue;
 
-const PROTOCOL_VERSION: u8 = 0;
+pub(crate) const PROTOCOL_VERSION: u8 = 0;
 pub(crate) const RECV_TOKEN: Token = Token(0);
 pub(crate) const WAKE_TOKEN: Token = Token(1);
 

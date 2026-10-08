@@ -12,6 +12,16 @@ pub struct ClientHello {
 }
 
 impl ClientHello {
+    /// The salt of a ClientHello of another protocol version. Every version starts with the
+    /// identifier, magic, protocol version and salt.
+    pub fn other_protocol_salt(buf: &[u8]) -> Option<[u8; 4]> {
+        (buf.len() >= 13
+            && buf[0] == PacketIdentifier::ClientHello as u8
+            && &buf[1..8] == MAGIC.as_bytes()
+            && buf[8] != PROTOCOL_VERSION)
+            .then(|| buf[9..13].try_into().unwrap())
+    }
+
     pub fn serialize(&self, buf: &mut [u8]) -> usize {
         buf[0] = PacketIdentifier::ClientHello as u8;
         buf[1..8].copy_from_slice(MAGIC.as_bytes());
@@ -38,7 +48,6 @@ impl ClientHello {
         }
 
         if buf[8] != PROTOCOL_VERSION {
-            // TODO: Handle protocol version mismatch better
             return Err(ERROR_INVALID_PROTOCOL_VERSION);
         }
 

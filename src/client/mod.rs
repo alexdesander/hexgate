@@ -40,7 +40,7 @@ use crate::common::{
     socket::{is_transient, net_sym::NetworkSimulator, Socket},
     stats::Stats,
     timed_event_queue::TimedEventQueue,
-    AllowedClientVersions, ClientVersion, RECV_TOKEN, WAKE_TOKEN,
+    AllowedClientVersions, ClientVersion, PROTOCOL_VERSION, RECV_TOKEN, WAKE_TOKEN,
 };
 
 mod thread;
@@ -55,6 +55,9 @@ pub enum ConnectError {
     ServerDeniedLogin(Vec<u8>),
     #[error("Server is full")]
     ServerFull,
+    /// The server speaks another version of the hexgate protocol.
+    #[error("Hexgate protocol version {client} is not supported by the server (version {server})")]
+    ProtocolMismatch { client: u8, server: u8 },
     #[error("The server's public key does not match the expected key (possible SECURITY IMPLICATIONS!!!)")]
     ServerKeyMismatch { received_key: [u8; 32] },
     #[error("Invalid configuration: {0}")]
@@ -70,6 +73,7 @@ pub enum ConnectError {
 /// `results` once, e.g. for a server browser. Requests are resent every 500 ms to servers that
 /// have not answered yet. Blocks until all servers answered, `duration` elapsed or `results` was
 /// dropped. `socket` must be blocking, its read timeout is restored before returning.
+/// Servers of another hexgate protocol version don't answer.
 pub fn request_infos(
     socket: &UdpSocket,
     duration: Duration,
@@ -317,6 +321,13 @@ impl Client {
                     ServerHello::ServerFull { salt } => {
                         (salt == real_salt).then_some(Err(ConnectError::ServerFull))
                     }
+                    ServerHello::ProtocolMismatch {
+                        salt,
+                        server_version,
+                    } => (salt == real_salt).then_some(Err(ConnectError::ProtocolMismatch {
+                        client: PROTOCOL_VERSION,
+                        server: server_version,
+                    })),
                     ServerHello::VersionSupported {
                         salt,
                         timestamp,

@@ -35,7 +35,6 @@ impl InfoRequest {
         }
 
         if buf[8] != PROTOCOL_VERSION {
-            // TODO: Handle protocol version mismatch better
             return Err(ERROR_INVALID_PROTOCOL_VERSION);
         }
 
