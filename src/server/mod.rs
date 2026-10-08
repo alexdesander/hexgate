@@ -32,7 +32,7 @@ use crate::common::{
     congestion::CongestionConfig,
     crypto::sym::SymCipher,
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
-    events::{self, EventReceiver},
+    events::{self, EventReceiver, Payload},
     packets::info_response::MAX_INFO_SIZE,
     socket::{sim::Simulator, Socket},
     stats::Stats,
@@ -87,6 +87,15 @@ pub enum Event<R: AuthResult> {
     Received(SocketAddr, Vec<u8>),
     /// The client violated the protocol and was disconnected.
     Violation(SocketAddr, ProtocolViolation),
+}
+
+impl<R: AuthResult> Payload for Event<R> {
+    fn payload_len(&self) -> usize {
+        match self {
+            Event::Received(_, message) => message.len(),
+            _ => 0,
+        }
+    }
 }
 
 /// A server and its connections, `R` being what the [`Authenticator`] returns for a client.
@@ -153,7 +162,7 @@ impl<R: AuthResult> Server<R> {
 
     /// Ends a server tick: the messages sent to each client since the last flush leave
     /// together, as one paced burst. Optional; once called, sent messages wait for the next
-    /// flush (at most two tick intervals).
+    /// flush (at most two tick intervals, or 100 ms).
     pub fn flush(&self) {
         let _ = self.inner.cmd_tx.send(Cmd::Flush);
         let _ = self.inner.waker.wake();
@@ -322,10 +331,11 @@ impl<R: AuthResult> Server<R> {
         timeout_dur: Duration,
         /// Further clients are turned away (`ConnectError::ServerFull`). Unlimited by default.
         max_connections: Option<usize>,
-        /// Limit for queued, undrained events. While reached, received unreliable messages are
-        /// dropped and reliable packets are left unacknowledged (the peer resends them later).
-        /// Connection events are always delivered.
-        #[builder(default = 1024)]
+        /// Limit for queued, undrained events. While reached, or while the queued messages take
+        /// 64 MiB (at least 4 × `max_recv_msg_size`), received unreliable messages are dropped and
+        /// reliable packets are left unacknowledged (the peer resends them later). Connection
+        /// events are always delivered.
+        #[builder(default = 65536)]
         max_events: usize,
         /// The channels, clients need the same counts.
         channel_config: ChannelConfiguration,
@@ -361,7 +371,7 @@ impl<R: AuthResult> Server<R> {
             .maybe_simulator(simulator)
             .build()?;
         let local_addr = socket.local_addr()?;
-        let (event_tx, event_rx) = events::channel(max_events);
+        let (event_tx, event_rx) = events::channel(max_events, max_recv_msg_size);
         let connected = ConnectedSet::default();
         let thread_connected = connected.clone();
 

@@ -28,7 +28,7 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, SendLimits},
     congestion::CongestionConfig,
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
-    events::{self, EventReceiver},
+    events::{self, EventReceiver, Payload},
     packets::{info_request::InfoRequest, info_response::InfoResponse, login_request},
     socket::{is_transient, sim::Simulator, Socket},
     stats::Stats,
@@ -183,6 +183,15 @@ pub enum Event {
     Violation(ProtocolViolation),
 }
 
+impl Payload for Event {
+    fn payload_len(&self) -> usize {
+        match self {
+            Event::Received(message) => message.len(),
+            _ => 0,
+        }
+    }
+}
+
 /// A connection to a server. Cloning gives another handle to the same connection; dropping the
 /// last one disconnects gracefully.
 #[derive(Clone)]
@@ -219,7 +228,7 @@ impl Client {
 
     /// Ends a tick: the messages sent since the last flush leave together, as one paced burst.
     /// Optional; once called, sent messages wait for the next flush (at most two tick
-    /// intervals). Without it, messages leave as soon as the send rate allows.
+    /// intervals, or 100 ms). Without it, messages leave as soon as the send rate allows.
     pub fn flush(&self) {
         let _ = self.inner.cmd_tx.send(Cmd::Flush);
         let _ = self.inner.waker.wake();
@@ -323,10 +332,11 @@ impl Client {
         /// The connection times out when nothing arrives from the server for this long.
         #[builder(default = Duration::from_secs(10))]
         timeout_dur: Duration,
-        /// Limit for queued, undrained events. While reached, received unreliable messages are
-        /// dropped and reliable packets are left unacknowledged (the peer resends them later).
-        /// Connection events are always delivered.
-        #[builder(default = 1024)]
+        /// Limit for queued, undrained events. While reached, or while the queued messages take
+        /// 64 MiB (at least 4 × `max_recv_msg_size`), received unreliable messages are dropped and
+        /// reliable packets are left unacknowledged (the peer resends them later). Connection
+        /// events are always delivered.
+        #[builder(default = 65536)]
         max_events: usize,
         /// The channels, the counts must match the server's.
         channel_config: ChannelConfiguration,
@@ -393,7 +403,7 @@ impl Client {
             timeout: handshake_timeout,
             tries: handshake_tries,
         };
-        let (event_tx, event_rx) = events::channel(max_events);
+        let (event_tx, event_rx) = events::channel(max_events, max_recv_msg_size);
         let fail_tx = event_tx.clone();
         let (cmd_tx, cmd_rx) = unbounded();
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);

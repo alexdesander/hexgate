@@ -92,10 +92,11 @@
 //! # Backpressure
 //!
 //! Events are queued for the app. Connection events are always delivered; received messages
-//! only while fewer than `max_events` events are queued. Above that, unreliable messages are
-//! dropped and reliable packets stay unacknowledged until the app catches up, so the peer resends
-//! them. Sent reliable messages are queued without a limit and leave at the congestion
-//! controller's rate; [`Stats::queued_bytes`] tells how much is waiting.
+//! only while fewer than `max_events` (65536 by default) events and 64 MiB of messages (at least
+//! 4 × `max_recv_msg_size`) are queued. Above that, unreliable messages are dropped and reliable
+//! packets stay unacknowledged until the app catches up, so the peer resends them. Sent reliable
+//! messages are queued without a limit and leave at the congestion controller's rate;
+//! [`Stats::queued_bytes`] tells how much is waiting.
 //!
 //! # Size limits
 //!
