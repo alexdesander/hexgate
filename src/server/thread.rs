@@ -8,7 +8,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::{Arc, PoisonError},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use ahash::HashMap;
@@ -145,8 +145,9 @@ pub struct ServerThreadState<R: AuthResult> {
     pub veryifying_key: VerifyingKey,
     pub siphasher: SipHasher,
 
+    /// Handshake cookie timestamps are milliseconds since this instant.
+    pub cookie_epoch: Instant,
     pub connection_request_max_timestamp_age: Duration,
-    pub disable_timestamp_age_check: bool,
     pub timeout_dur: Duration,
     pub max_connections: Option<usize>,
     pub max_recv_msg_size: usize,
@@ -687,13 +688,10 @@ impl<R: AuthResult> ServerThreadState<R> {
                 }
             }
             Ok(()) => {
-                let time_stamp = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
+                let timestamp = self.cookie_epoch.elapsed().as_millis() as u64;
                 ServerHello::VersionSupported {
                     salt: client_hello.salt,
-                    timestamp: time_stamp.to_le_bytes(),
+                    timestamp: timestamp.to_le_bytes(),
                     cipher: self.cipher,
                     server_ed25519_pubkey: self.veryifying_key,
                     siphash: None,
@@ -724,17 +722,12 @@ impl<R: AuthResult> ServerThreadState<R> {
             log!(debug, %from, "invalid handshake cookie");
             return;
         }
-        if !self.disable_timestamp_age_check {
-            let min_time_stamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .saturating_sub(self.connection_request_max_timestamp_age)
-                .as_secs();
-            let time_stamp = u64::from_le_bytes(connection_request.timestamp);
-            if time_stamp < min_time_stamp {
-                log!(debug, %from, "expired handshake cookie");
-                return;
-            }
+        let issued = Duration::from_millis(u64::from_le_bytes(connection_request.timestamp));
+        if self.cookie_epoch.elapsed().saturating_sub(issued)
+            > self.connection_request_max_timestamp_age
+        {
+            log!(debug, %from, "expired handshake cookie");
+            return;
         }
         let attempt = (from, connection_request.salt);
         let signed_request: [u8; 116] = self.buf[connection_response::SIGNED_REQUEST]

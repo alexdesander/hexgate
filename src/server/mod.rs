@@ -10,7 +10,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ahash::HashSet;
@@ -327,9 +327,6 @@ impl<R: AuthResult> Server<R> {
         /// and acknowledged before the connections are closed.
         #[builder(default = Duration::from_secs(1))]
         close_linger: Duration,
-        /// Accepts handshake cookies of any age (for servers with an unreliable clock).
-        #[builder(default = false)]
-        disable_timestamp_age_check: bool,
         /// How long a handshake cookie from a ServerHello stays valid.
         #[builder(default = Duration::from_secs(10))]
         connection_request_max_timestamp_age: Duration,
@@ -393,8 +390,8 @@ impl<R: AuthResult> Server<R> {
                     signing_key,
                     auth_salt,
 
+                    cookie_epoch: Instant::now(),
                     connection_request_max_timestamp_age,
-                    disable_timestamp_age_check,
                     timeout_dur,
                     max_connections,
                     max_recv_msg_size,
