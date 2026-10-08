@@ -243,14 +243,17 @@ impl<R: AuthResult> Drop for ServerInner<R> {
 #[bon]
 impl<R: AuthResult> Server<R> {
     #[builder(finish_fn = run)]
-    pub fn prepare<A: Authenticator<R>>(
+    pub fn prepare<A, V>(
         authenticator: A,
         bind_addr: SocketAddr,
         socket_buffer_size: Option<usize>,
         simulator: Option<Box<dyn NetworkSimulator>>,
         /// At most 256 bytes.
         info: Vec<u8>,
-        allowed_client_versions: fn(ClientVersion) -> Result<(), AllowedClientVersions>,
+        /// Decides which client versions may connect, e.g. `|_| Ok(())` or
+        /// `move |version| allowed.check(version)` for an `AllowedClientVersions` range. Rejected
+        /// clients get the returned range.
+        allowed_client_versions: V,
         cipher: Option<Cipher>,
         secret_key: [u8; 32],
         /// Salts the Argon2 hash of clients with `hash_auth_data`, together with the server's
@@ -281,7 +284,11 @@ impl<R: AuthResult> Server<R> {
         #[builder(default = false)] disable_timestamp_age_check: bool,
         #[builder(default = Duration::from_secs(10))]
         connection_request_max_timestamp_age: Duration,
-    ) -> Result<Self, StartError> {
+    ) -> Result<Self, StartError>
+    where
+        A: Authenticator<R>,
+        V: Fn(ClientVersion) -> Result<(), AllowedClientVersions> + Send + 'static,
+    {
         TooLarge::check(info.len(), MAX_INFO_SIZE).map_err(ConfigError::InfoTooLarge)?;
         channel_config.validate()?;
         congestion_config.validate()?;
@@ -331,7 +338,7 @@ impl<R: AuthResult> Server<R> {
                     buf: [0; 1201],
 
                     info,
-                    allowed_client_versions,
+                    allowed_client_versions: Box::new(allowed_client_versions),
                     cipher,
                     veryifying_key: signing_key.verifying_key(),
                     signing_key,

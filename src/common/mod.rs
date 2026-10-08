@@ -61,8 +61,20 @@ impl ClientVersion {
     };
 }
 
+/// An inclusive range of client versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AllowedClientVersions {
     pub min: ClientVersion,
     pub max: ClientVersion,
+}
+
+impl AllowedClientVersions {
+    /// A version check for the server's `allowed_client_versions`.
+    pub fn check(&self, version: ClientVersion) -> Result<(), Self> {
+        if (self.min..=self.max).contains(&version) {
+            Ok(())
+        } else {
+            Err(*self)
+        }
+    }
 }

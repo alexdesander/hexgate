@@ -83,6 +83,8 @@ pub enum Cmd<R: AuthResult> {
     Failed(RecvError),
 }
 
+type VersionCheck = Box<dyn Fn(ClientVersion) -> Result<(), AllowedClientVersions> + Send>;
+
 pub enum Recipients {
     One(SocketAddr),
     Many(Vec<SocketAddr>),
@@ -135,7 +137,7 @@ pub struct ServerThreadState<R: AuthResult> {
     pub buf: [u8; 1201],
 
     pub info: Vec<u8>,
-    pub allowed_client_versions: fn(ClientVersion) -> Result<(), AllowedClientVersions>,
+    pub allowed_client_versions: VersionCheck,
     pub cipher: Cipher,
     pub auth_salt: [u8; 16],
     pub signing_key: SigningKey,
