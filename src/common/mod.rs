@@ -9,6 +9,7 @@ pub mod congestion;
 pub(crate) mod crypto;
 pub mod error;
 pub(crate) mod events;
+pub mod keys;
 pub(crate) mod packets;
 pub mod socket;
 pub mod stats;
