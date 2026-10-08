@@ -11,32 +11,30 @@ CHECK OUT THE [ISSUES](https://github.com/alexdesander/hexgate/issues) FOR MORE 
 
 ---
 
-## Features
-- Userfriendly API
-    - with blocking and polling api calls
-- Pure UDP
-- Multi-platform (check out [mio's supported platforms](https://github.com/tokio-rs/mio#platforms))
-- Connection oriented
-- Message oriented
-- Different delivery guarantees:
-    - Unreliable
-    - UnreliableOrdered (aka Sequenced)
-    - Reliable
-- Multiple virtual channels with weights (to avoid head-of-line blocking (problem in TCP))
-    - Up to 256 reliable channels
-    - Up to 256 unreliable ordered channels
-- Runs on a dedicated thread
-- Simple but powerful network simulation
-- Cryptography:
-    - SipHash authenticated initial server-hello (ddos protection)
-    - Server auth based on ed25519 signatures
-    - x25519 diffie hellman key exchange
-    - AES256GCM / ChaCha20Poly1305 authenticated encryption
-    - SipHash authenticated acks (for performance reasons)
-- Timeout detection
-- Latency (Delay/Ping) probing
-- Congestion control
+Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
 
+## Features
+- Simple API: builders, blocking (`next`) and polling (`try_next`) event queues, cheap cloneable handles
+- Pure UDP, multi-platform (see [mio's supported platforms](https://github.com/tokio-rs/mio#platforms))
+- Connection and message oriented
+- Delivery guarantees per channel:
+    - Unreliable
+    - UnreliableOrdered (sequenced, up to 256 channels)
+    - Reliable (ordered, up to 256 channels)
+- Weighted fair queueing between channels, so a busy channel doesn't block the others
+- Runs on its own network thread; non-blocking connect (`start()`) or blocking (`connect()`)
+- Server: per-client kick, broadcast, connection limit, connection queries
+- Security:
+    - Server identity: ed25519 key pinned by the client, signed x25519 key exchange over the whole handshake
+    - AES-256-GCM or ChaCha20-Poly1305 encryption, one key per direction, replay protection
+    - Client authentication through your own `Authenticator` (optionally Argon2id-hashed passwords)
+    - DoS hardening: stateless handshake cookies bound to the client address, per-IP rate limits, requests padded
+      so the server never amplifies traffic
+    - Key file helpers (`hexgate::keys`)
+- Timeouts, latency probes and connection statistics (RTT, jitter, loss, send rate, queued bytes)
+- Basic send-rate control (a delay-based congestion controller is being designed)
+- Network simulation (loss, delay, reordering)
+- Optional `tracing` instrumentation (`tracing` feature)
 
 Hexgate does NOT do:
 - Serialization (recommendations: [bitcode](https://crates.io/crates/bitcode), [bincode](https://crates.io/crates/bincode) (2.0))
@@ -44,61 +42,99 @@ Hexgate does NOT do:
 - Peer-to-peer
 - MTU discovery (minimum assumed MTU size is ~1250 bytes)
 
+## Keys
+The server needs a `secret_key` (its ed25519 identity) and an `auth_salt`. Generate them once and keep them secret
+and stable, e.g. with `keys::load_or_generate("server.key")`. Clients pin the server's public key
+(`server::public_key(&secret_key)`, shipped with the game) through `ServerKey::Pinned`, so nobody else can pose as the
+server; `hexgate::fingerprint` formats it for comparing. `ServerKey::Unverified` turns this off explicitly. For trust
+on first use, connect unverified once and store `client.get_server_key()` with `keys::save`.
+
 ## Example
-Creating and running a hexgate server:
+A server that relays chat messages, polled once per game tick:
 ```rust
-/// Only for simplicity, allows every client to join.
-struct UselessAuthenticator;
-impl Authenticator<()> for UselessAuthenticator {
-    fn authenticate(&mut self, _: SocketAddr, _: Vec<u8>) -> Result<(), Vec<u8>> {
-        Ok(())
+use std::{net::SocketAddr, time::Duration};
+
+use hexgate::{keys, server::Event, Authenticator, Channel, ChannelConfiguration, Server};
+
+/// Accepts everyone, using the auth data as the player name.
+struct AcceptAll;
+
+impl Authenticator<String> for AcceptAll {
+    fn authenticate(&mut self, _: SocketAddr, name: Vec<u8>) -> Result<String, Vec<u8>> {
+        String::from_utf8(name).map_err(|_| b"invalid name".to_vec())
     }
 }
 
-let server = Server::prepare()
-    .bind_addr(SERVER_ADDR)
-    .info(b"Example of a hexgate server".to_vec())
-    .allowed_client_versions(|_| Ok(()))
-    // Generated and saved on the first run, keep them secret.
-    .secret_key(keys::load_or_generate("server.key")?)
-    .auth_salt(keys::load_or_generate("server.salt")?)
-    .authenticator(UselessAuthenticator)
-    .channel_config(ChannelConfiguration {
-        weight_unreliable: 15,
-        weights_unreliable_ordered: vec![4, 4],
-        weights_reliable: vec![10, 10, 10],
-    })
-    .run()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let server = Server::prepare()
+        .bind_addr("0.0.0.0:44444".parse()?)
+        .info(b"My game server".to_vec())
+        .allowed_client_versions(|_| Ok(()))
+        .secret_key(keys::load_or_generate("server.key")?)
+        .auth_salt(keys::load_or_generate("server.salt")?)
+        .authenticator(AcceptAll)
+        .channel_config(ChannelConfiguration {
+            weight_unreliable: 10,
+            weights_unreliable_ordered: vec![10],
+            weights_reliable: vec![10],
+        })
+        .run()?;
 
-match server.next() {
-    _ => todo!("Handle server events")
+    loop {
+        while let Some(event) = server.try_next()? {
+            match event {
+                Event::Connected(addr, name) => println!("{name} joined from {addr}"),
+                Event::Received(_, message) => server.broadcast(Channel::Reliable(0), message)?,
+                Event::Disconnected(addr, _) | Event::TimedOut(addr) => println!("{addr} left"),
+                Event::Violation(addr, violation) => println!("{addr} was kicked: {violation}"),
+            }
+        }
+        // Simulate the world, then send state updates on Channel::Unreliable...
+        std::thread::sleep(Duration::from_millis(16));
+    }
 }
 ```
 
-Creating a hexgate client and connecting to a server. The client pins the server's public key
-(`hexgate::server::public_key(&secret_key)`, shipped with the game), so nobody else can pose as the
-server (`hexgate::fingerprint` formats it for comparing). `ServerKey::Unverified` turns this off explicitly; for
-trust on first use, connect unverified once and store `client.get_server_key()` with `keys::save`.
+A client that connects without blocking the game loop:
 ```rust
-let client = Client::prepare()
-    .client_version(ClientVersion::ZERO)
-    .server_socket_addr(SERVER_ADDR)
-    .server_key(ServerKey::Pinned(SERVER_PUBLIC_KEY))
-    .auth_data(username)
-    .hash_auth_data(false)
-    .channel_config(ChannelConfiguration {
-        weight_unreliable: 15,
-        weights_unreliable_ordered: vec![4, 4],
-        weights_reliable: vec![10, 10, 10],
-    })
-    .connect()?;
+use std::time::Duration;
 
-client.send(Channel::Unreliable, vec![1, 2, 3])?;
+use hexgate::{client::Event, Channel, ChannelConfiguration, Client, ClientVersion, ServerKey};
 
-match client.next() {
-    _ => todo!("Handle client events")
+/// `hexgate::server::public_key` of the server's secret key.
+const SERVER_KEY: [u8; 32] = [0; 32];
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::prepare()
+        .client_version(ClientVersion { major: 1, minor: 0, patch: 0 })
+        .server_socket_addr("example.com:44444")
+        .server_key(ServerKey::Pinned(SERVER_KEY))
+        .auth_data(b"Alice".to_vec())
+        .hash_auth_data(false)
+        .channel_config(ChannelConfiguration {
+            weight_unreliable: 10,
+            weights_unreliable_ordered: vec![10],
+            weights_reliable: vec![10],
+        })
+        .start()?;
+    // Queued until the connection is up.
+    client.send(Channel::Reliable(0), b"Hello!".to_vec())?;
+
+    loop {
+        while let Some(event) = client.try_next()? {
+            match event {
+                Event::Connected => println!("connected"),
+                Event::ConnectFailed(e) => return Err(e.into()),
+                Event::Received(message) => println!("{}", String::from_utf8_lossy(&message)),
+                Event::Disconnected(_) | Event::TimedOut | Event::Violation(_) => return Ok(()),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
 }
 ```
+
+See `examples/` for a complete chat and a server browser query.
 
 ## Inspiration
 
