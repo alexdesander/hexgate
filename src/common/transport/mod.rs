@@ -756,8 +756,8 @@ impl Connection {
 mod tests {
     use super::*;
     use crate::common::{
-        send::{Admission, SendOptions, SendQueueLimits},
         Cipher,
+        send::{Admission, SendOptions, SendQueueLimits},
     };
     use std::sync::Arc;
     use x25519_dalek::{PublicKey, ReusableSecret};

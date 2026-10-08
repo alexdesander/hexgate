@@ -23,7 +23,7 @@
 use std::ops::RangeInclusive;
 
 use crate::common::{
-    codec::{varint_len, Reader, Writer},
+    codec::{Reader, Writer, varint_len},
     packets::PacketError,
 };
 
@@ -84,7 +84,7 @@ pub struct AckFrame<'a> {
 
 impl<'a> AckFrame<'a> {
     /// Acknowledged packet numbers, newest first.
-    pub fn ranges(&self) -> impl Iterator<Item = RangeInclusive<u64>> + 'a {
+    pub fn ranges(&self) -> impl Iterator<Item = RangeInclusive<u64>> + use<'a> {
         let mut reader = Reader::new(self.ranges);
         let mut next = Some(self.largest - self.first_range..=self.largest);
         let mut left = self.range_count;
@@ -101,7 +101,7 @@ impl<'a> AckFrame<'a> {
     }
 
     /// Packet numbers and their receive times (µs on the receiver's clock), newest first.
-    pub fn timestamps(&self) -> impl Iterator<Item = (u64, u64)> + 'a {
+    pub fn timestamps(&self) -> impl Iterator<Item = (u64, u64)> + use<'a> {
         let mut reader = Reader::new(self.timestamps);
         let mut previous: Option<(u64, u64)> = None;
         let mut left = self.timestamp_count;

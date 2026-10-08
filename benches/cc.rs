@@ -32,12 +32,12 @@ use std::{
 };
 
 use hexgate::{
+    Channel, ChannelConfiguration, CongestionConfig,
     bench::{Delivery, Pairs, Side},
     sim::{
         Bottleneck, Fate, Jitter, JitterDistribution, Link, LinkConfig, LinkStats,
         NetworkSimulator, Profile,
     },
-    Channel, ChannelConfiguration, CongestionConfig,
 };
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -63,7 +63,7 @@ fn allocated(size: usize) {
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
+        let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
             allocated(layout.size());
         }
@@ -71,12 +71,12 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
+        unsafe { System.dealloc(ptr, layout) };
         HEAP.fetch_sub(layout.size(), Ordering::Relaxed);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new = System.realloc(ptr, layout, new_size);
+        let new = unsafe { System.realloc(ptr, layout, new_size) };
         if !new.is_null() {
             HEAP.fetch_sub(layout.size(), Ordering::Relaxed);
             allocated(new_size);
@@ -801,7 +801,7 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
         for spec in specs {
             let id = u16::try_from(streams.len()).expect("too many benchmark streams");
             let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed ^ u64::from(id) << 32);
-            let phase = Duration::from_secs_f64(rng.gen::<f64>() / 64.0);
+            let phase = Duration::from_secs_f64(rng.r#gen::<f64>() / 64.0);
             let start = scenario.stagger * flow as u32 + phase + spec.offset;
             let (samples, bursts) = spec.kind.samples(args.seconds);
             streams.push(Stream {
@@ -1150,13 +1150,30 @@ fn report(scenario: &Scenario, profile: &Profile, args: &Args) {
             args.seconds
         );
         for stream in &outcome.streams {
-            println!("    {} {:<10} active {:.3} Mbit/s, common {:.3}/{:.3}, p99 {:.1} p99.9 {:.1} max {:.1} gap {:.1} ms, {} blackouts, {} {} -> {}",
-                pair_label(stream.pair), stream.name, stream.metrics[1], stream.common_rates[0], stream.common_rates[1],
-                stream.metrics[4], stream.metrics[5], stream.metrics[6], stream.max_gap, stream.blackouts,
-                if stream.reliable { "pending" } else { "unobserved" },
-                stream.pending_at_end, stream.pending_after_drain);
+            println!(
+                "    {} {:<10} active {:.3} Mbit/s, common {:.3}/{:.3}, p99 {:.1} p99.9 {:.1} max {:.1} gap {:.1} ms, {} blackouts, {} {} -> {}",
+                pair_label(stream.pair),
+                stream.name,
+                stream.metrics[1],
+                stream.common_rates[0],
+                stream.common_rates[1],
+                stream.metrics[4],
+                stream.metrics[5],
+                stream.metrics[6],
+                stream.max_gap,
+                stream.blackouts,
+                if stream.reliable {
+                    "pending"
+                } else {
+                    "unobserved"
+                },
+                stream.pending_at_end,
+                stream.pending_after_drain
+            );
             if let Some(([p50, p99, max], incomplete)) = stream.completion {
-                println!("      bursts completed p50 {p50:.1} p99 {p99:.1} max {max:.1} ms, {incomplete} incomplete");
+                println!(
+                    "      bursts completed p50 {p50:.1} p99 {p99:.1} max {max:.1} ms, {incomplete} incomplete"
+                );
             }
         }
         println!(

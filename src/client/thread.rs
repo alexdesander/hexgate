@@ -6,8 +6,8 @@ use std::{
     collections::VecDeque,
     io,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -16,6 +16,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use mio::{Events, Poll, Waker};
 
 use crate::common::{
+    RECV_TOKEN, WAKE_TOKEN,
     channel::Channel,
     error::RecvError,
     events::{DeliveryBudget, EventSender},
@@ -24,7 +25,6 @@ use crate::common::{
     socket::sim::Simulator,
     stats::{ChannelStats, Stats},
     transport::{Connection, Output},
-    RECV_TOKEN, WAKE_TOKEN,
 };
 
 use super::{Event, Socket};
@@ -115,9 +115,11 @@ impl ClientThreadState {
             }
             self.socket.flush();
             let readable = events.iter().any(|event| event.token() == RECV_TOKEN);
-            debug_assert!(events
-                .iter()
-                .all(|event| [RECV_TOKEN, WAKE_TOKEN].contains(&event.token())));
+            debug_assert!(
+                events
+                    .iter()
+                    .all(|event| [RECV_TOKEN, WAKE_TOKEN].contains(&event.token()))
+            );
             if (self.receive_pending || readable || self.socket.inbound_due())
                 && self.handle_all_recvs(&mut budget)?
             {

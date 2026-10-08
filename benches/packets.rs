@@ -4,11 +4,11 @@
 
 //! Encrypting a packet and decrypting it on the other end. Run with `--features bench`.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ed25519_dalek::SigningKey;
 use hexgate::{
-    bench::{key_exchange, Packets},
     Cipher,
+    bench::{Packets, key_exchange},
 };
 use x25519_dalek::PublicKey;
 

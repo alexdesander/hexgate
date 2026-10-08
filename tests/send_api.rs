@@ -7,10 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{client_builder, server_builder, AcceptAll, Blackhole, TIMEOUT};
+use common::{AcceptAll, Blackhole, TIMEOUT, client_builder, server_builder};
 use hexgate::{
-    client, error::SendError, server, Channel, ChannelConfiguration, Client, ClientVersion,
-    SendOptions, SendQueueLimits, ServerKey, Simulator,
+    Channel, ChannelConfiguration, Client, ClientVersion, SendOptions, SendQueueLimits, ServerKey,
+    Simulator, client, error::SendError, server,
 };
 
 struct Resolver {

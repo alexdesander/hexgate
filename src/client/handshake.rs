@@ -16,8 +16,9 @@ use rand::thread_rng;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, ReusableSecret};
 
-use super::{thread::Cmd, ConnectError, ServerKey};
+use super::{ConnectError, ServerKey, thread::Cmd};
 use crate::common::{
+    ClientVersion, PROTOCOL_VERSION,
     crypto::Crypto,
     packets::{
         client_hello::ClientHello,
@@ -28,7 +29,6 @@ use crate::common::{
         server_hello::ServerHello,
     },
     socket::Socket,
-    ClientVersion, PROTOCOL_VERSION,
 };
 
 /// First retransmission interval of a handshake step, doubled up to the maximum.

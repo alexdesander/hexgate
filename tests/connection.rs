@@ -11,14 +11,15 @@ use std::{
 };
 
 use common::{
-    channel_config, client, client_builder, connected, next_event, server, server_builder,
-    AcceptAll, Blackhole, DropNth, OKAY, SECRET_KEY, TIMEOUT,
+    AcceptAll, Blackhole, DropNth, OKAY, SECRET_KEY, TIMEOUT, channel_config, client,
+    client_builder, connected, next_event, server, server_builder,
 };
 use hexgate::{
+    AllowedClientVersions, Authenticator, Channel, Client, ClientVersion, Server, ServerKey,
+    Simulator,
     client::{self as hexclient, ConnectError},
     error::SendError,
-    server as hexserver, AllowedClientVersions, Authenticator, Channel, Client, ClientVersion,
-    Server, ServerKey, Simulator,
+    server as hexserver,
 };
 use rand::Rng;
 

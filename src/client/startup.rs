@@ -2,25 +2,25 @@ use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, PoisonError, RwLock,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-use crossbeam_channel::{bounded, Receiver, TryRecvError};
+use crossbeam_channel::{Receiver, TryRecvError, bounded};
 use ed25519_dalek::VerifyingKey;
 use mio::{Events, Interest, Poll, Waker};
 
 use super::{
+    ConnectError,
     handshake::{Handshake, Link},
     thread::Cmd,
-    ConnectError,
 };
 use crate::common::{
-    crypto::Crypto,
-    socket::{sim::Simulator, Socket},
     RECV_TOKEN,
+    crypto::Crypto,
+    socket::{Socket, sim::Simulator},
 };
 
 type Connected = (Socket, Crypto, VerifyingKey, Vec<Cmd>);
@@ -57,7 +57,7 @@ pub(super) fn connect<A: ToSocketAddrs + Send + 'static>(
         match rx.try_recv() {
             Ok(addresses) => break addresses?,
             Err(TryRecvError::Disconnected) => {
-                return Err(io::Error::other("address resolver stopped").into())
+                return Err(io::Error::other("address resolver stopped").into());
             }
             Err(TryRecvError::Empty) => {}
         }

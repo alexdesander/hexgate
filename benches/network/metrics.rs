@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use hexgate::{
-    sim::{LinkStats, Profile},
     Channel, Stats,
+    sim::{LinkStats, Profile},
 };
 use serde::Serialize;
 

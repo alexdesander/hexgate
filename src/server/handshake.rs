@@ -12,9 +12,9 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use super::auth::LoginAttempt;
 use crate::common::{
+    Cipher,
     crypto::Crypto,
     packets::connection_response::{ConnectionResponse, Transcript},
-    Cipher,
 };
 
 /// A ConnectionRequest that passed the cookie check and the rate limit.

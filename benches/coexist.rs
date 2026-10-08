@@ -19,19 +19,19 @@ mod linux {
         net::{SocketAddr, TcpListener, TcpStream},
         path::PathBuf,
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use anyhow::{bail, Context};
+    use anyhow::{Context, bail};
     use hexgate::{
-        client, error::SendError, server, Authenticator, Channel, ChannelConfiguration, Client,
-        ClientVersion, SendOptions, SendOutcome, SendQueueLimits, Server, ServerKey,
+        Authenticator, Channel, ChannelConfiguration, Client, ClientVersion, SendOptions,
+        SendOutcome, SendQueueLimits, Server, ServerKey, client, error::SendError, server,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use socket2::{Domain, Protocol, Socket, Type};
 
     const SECRET: [u8; 32] = [7; 32];
@@ -81,7 +81,9 @@ mod linux {
     pub fn run() -> anyhow::Result<()> {
         let args: Vec<_> = std::env::args().collect();
         if args.len() != 9 {
-            bail!("coexist server|client IP START_US WARMUP_US DURATION_US DRAIN_US none|cubic|bbr OUTPUT");
+            bail!(
+                "coexist server|client IP START_US WARMUP_US DURATION_US DRAIN_US none|cubic|bbr OUTPUT"
+            );
         }
         let start: u64 = args[3].parse()?;
         let duration: u64 = args[5].parse()?;

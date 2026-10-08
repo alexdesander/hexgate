@@ -10,7 +10,7 @@ use hexgate::sim::{JitterDistribution, LinkConfig, Profile};
 use serde::Serialize;
 
 use crate::{
-    metrics::{channel_name, Percentiles, RunResult, StreamResult},
+    metrics::{Percentiles, RunResult, StreamResult, channel_name},
     workloads::Workload,
 };
 
@@ -249,8 +249,23 @@ pub fn text(report: &Report, workloads: &[Workload]) -> String {
         let _ = writeln!(
             out,
             "{:<9} {:<12}{:<5}{:<6}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}",
-            "profile", "stream", "dir", "chan", "deliv%", "min", "p50", "p90", "p99", "p99.9",
-            "max", "+p50", "+p99", "jitter", "maxgap", "stall/m", "goodput"
+            "profile",
+            "stream",
+            "dir",
+            "chan",
+            "deliv%",
+            "min",
+            "p50",
+            "p90",
+            "p99",
+            "p99.9",
+            "max",
+            "+p50",
+            "+p99",
+            "jitter",
+            "maxgap",
+            "stall/m",
+            "goodput"
         );
         for run in &runs {
             if !run.connected {

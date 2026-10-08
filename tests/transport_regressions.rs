@@ -1,9 +1,9 @@
 #![cfg(feature = "bench")]
 
 use hexgate::{
+    Channel, ChannelConfiguration, CongestionConfig, SendOptions, SendOutcome,
     bench::{Delivery, Pairs, Side},
     sim::{Link, LinkConfig},
-    Channel, ChannelConfiguration, CongestionConfig, SendOptions, SendOutcome,
 };
 use std::time::Duration;
 

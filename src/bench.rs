@@ -13,11 +13,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ed25519_dalek::{ed25519::signature::Signer, SigningKey};
+use ed25519_dalek::{SigningKey, ed25519::signature::Signer};
 use rand::thread_rng;
 use x25519_dalek::{EphemeralSecret, PublicKey, ReusableSecret};
 
 use crate::common::{
+    Cipher,
     channel::{Channel, ChannelConfiguration},
     codec::Writer,
     congestion::CongestionConfig,
@@ -26,8 +27,7 @@ use crate::common::{
     send::{Message, SendOptions, SendOutcome},
     socket::sim::{Fate, NetworkSimulator},
     stats::Stats,
-    transport::{self, frame, packet, Connection, Output},
-    Cipher,
+    transport::{self, Connection, Output, frame, packet},
 };
 
 /// The keys of both ends of a connection.

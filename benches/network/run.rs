@@ -12,19 +12,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use hexgate::{
-    client,
+    Authenticator, Channel, Client, ClientVersion, Server, ServerKey, Stats, client,
     error::SendError,
     server,
     sim::{LinkStats, Profile, Simulator},
-    Authenticator, Channel, Client, ClientVersion, Server, ServerKey, Stats,
 };
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Exp1};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
-use crate::workloads::{channel_config, Dir, Pattern, Workload, CONTROL};
+use crate::workloads::{CONTROL, Dir, Pattern, Workload, channel_config};
 
 const SECRET_KEY: [u8; 32] = [7; 32];
 const HEADER: usize = 13;
@@ -168,32 +167,34 @@ fn server_receiver(
     shared: Shared,
     addr_tx: Sender<SocketAddr>,
 ) -> JoinHandle<()> {
-    std::thread::spawn(move || loop {
-        let ended = match server.next() {
-            Ok(server::Event::Connected(addr, ())) => {
-                let _ = addr_tx.send(addr);
-                continue;
-            }
-            Ok(server::Event::Received(from, _, message)) => {
-                let stream = parse(&message).map(|header| header.stream);
-                if stream == Some(STOP) {
-                    return;
+    std::thread::spawn(move || {
+        loop {
+            let ended = match server.next() {
+                Ok(server::Event::Connected(addr, ())) => {
+                    let _ = addr_tx.send(addr);
+                    continue;
                 }
-                let spec = stream.and_then(|stream| workload.streams.get(stream as usize));
-                if let Some(spec) =
-                    spec.filter(|spec| matches!(spec.pattern, Pattern::PingPong { .. }))
-                {
-                    let _ = server.send(from, spec.channel, message);
-                } else {
-                    lock(&shared).record(&message);
+                Ok(server::Event::Received(from, _, message)) => {
+                    let stream = parse(&message).map(|header| header.stream);
+                    if stream == Some(STOP) {
+                        return;
+                    }
+                    let spec = stream.and_then(|stream| workload.streams.get(stream as usize));
+                    if let Some(spec) =
+                        spec.filter(|spec| matches!(spec.pattern, Pattern::PingPong { .. }))
+                    {
+                        let _ = server.send(from, spec.channel, message);
+                    } else {
+                        lock(&shared).record(&message);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Ok(event) => format!("server: {event:?}"),
-            Err(e) => format!("server: {e}"),
-        };
-        lock(&shared).ended.get_or_insert(ended);
-        return;
+                Ok(event) => format!("server: {event:?}"),
+                Err(e) => format!("server: {e}"),
+            };
+            lock(&shared).ended.get_or_insert(ended);
+            return;
+        }
     })
 }
 
@@ -204,23 +205,25 @@ fn client_receiver(
     pings: Vec<bool>,
     pong_tx: Sender<u8>,
 ) -> JoinHandle<()> {
-    std::thread::spawn(move || loop {
-        let ended = match client.next() {
-            Ok(client::Event::Received(_, message)) => {
-                if parse(&message).is_some_and(|header| header.stream == STOP) {
-                    return;
+    std::thread::spawn(move || {
+        loop {
+            let ended = match client.next() {
+                Ok(client::Event::Received(_, message)) => {
+                    if parse(&message).is_some_and(|header| header.stream == STOP) {
+                        return;
+                    }
+                    let stream = lock(&shared).record(&message);
+                    if let Some(stream) = stream.filter(|&stream| pings[stream as usize]) {
+                        let _ = pong_tx.send(stream);
+                    }
+                    continue;
                 }
-                let stream = lock(&shared).record(&message);
-                if let Some(stream) = stream.filter(|&stream| pings[stream as usize]) {
-                    let _ = pong_tx.send(stream);
-                }
-                continue;
-            }
-            Ok(event) => format!("client: {event:?}"),
-            Err(e) => format!("client: {e}"),
-        };
-        lock(&shared).ended.get_or_insert(ended);
-        return;
+                Ok(event) => format!("client: {event:?}"),
+                Err(e) => format!("client: {e}"),
+            };
+            lock(&shared).ended.get_or_insert(ended);
+            return;
+        }
     })
 }
 
@@ -428,7 +431,7 @@ fn send_phase(
                 _ => None,
             };
             // Ticks of different streams don't line up.
-            let phase = gap.map_or(Duration::ZERO, |gap| gap.mul_f64(rng.gen()));
+            let phase = gap.map_or(Duration::ZERO, |gap| gap.mul_f64(rng.r#gen()));
             StreamState {
                 seq: 0,
                 next_at: start + phase,

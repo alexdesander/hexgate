@@ -3,8 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use aes_gcm::{
-    aead::{self, AeadInPlace},
     Aes256Gcm, KeyInit,
+    aead::{self, AeadInPlace},
 };
 use chacha20poly1305::ChaCha20Poly1305;
 

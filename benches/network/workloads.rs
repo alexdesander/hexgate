@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use hexgate::{sim::Profile, Channel, ChannelConfiguration};
+use hexgate::{Channel, ChannelConfiguration, sim::Profile};
 use rand::Rng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use serde::Serialize;

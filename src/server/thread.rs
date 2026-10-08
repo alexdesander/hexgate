@@ -8,8 +8,8 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, PoisonError,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -22,11 +22,13 @@ use sha2::{Digest, Sha256};
 use siphasher::sip::SipHasher;
 
 use crate::common::{
+    AllowedClientVersions, Cipher, ClientVersion, PROTOCOL_VERSION, RECV_TOKEN, WAKE_TOKEN,
     channel::Channel,
     crypto::Crypto,
     error::RecvError,
     events::{DeliveryBudget, EventSender},
     packets::{
+        PacketIdentifier,
         client_hello::ClientHello,
         connection_request::ConnectionRequest,
         connection_response,
@@ -36,21 +38,19 @@ use crate::common::{
         login_response::LoginResponse,
         rejected,
         server_hello::{self, ServerHello},
-        PacketIdentifier,
     },
     send::{Admission, Message, SendQueueLimits},
     socket::sim::Simulator,
     stats::{ChannelStats, Stats},
     timed_event_queue::TimedEventQueue,
     transport::{self, Connection, Output},
-    AllowedClientVersions, Cipher, ClientVersion, PROTOCOL_VERSION, RECV_TOKEN, WAKE_TOKEN,
 };
 
 use super::{
+    ConnectedSet, Event, PeerState, Socket,
     auth::{AuthCmd, AuthResult, Exchange, LoginAttempt},
     handshake::{KeyExchange, KeyExchanged},
     rate_limit::RateLimiter,
-    ConnectedSet, Event, PeerState, Socket,
 };
 
 const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(10);
@@ -237,9 +237,11 @@ impl<R: AuthResult> ServerThreadState<R> {
             }
             self.socket.flush();
             let readable = events.iter().any(|event| event.token() == RECV_TOKEN);
-            debug_assert!(events
-                .iter()
-                .all(|event| [RECV_TOKEN, WAKE_TOKEN].contains(&event.token())));
+            debug_assert!(
+                events
+                    .iter()
+                    .all(|event| [RECV_TOKEN, WAKE_TOKEN].contains(&event.token()))
+            );
             if self.receive_pending || readable || self.socket.inbound_due() {
                 self.handle_all_recvs(&mut budget)?;
             }
@@ -501,7 +503,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                 | PacketIdentifier::LoginRequest
                     if self.shutting_down =>
                 {
-                    continue
+                    continue;
                 }
                 PacketIdentifier::InfoRequest => self.handle_packet_info_request(size, from),
                 PacketIdentifier::ClientHello => self.handle_packet_client_hello(size, from),

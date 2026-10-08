@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use hexgate::{client::request_infos, keys, Authenticator, ChannelConfiguration, Server};
+use hexgate::{Authenticator, ChannelConfiguration, Server, client::request_infos, keys};
 
 const SERVER_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 44444));

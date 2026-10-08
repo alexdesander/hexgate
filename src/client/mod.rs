@@ -10,8 +10,9 @@ use std::{
     net::{SocketAddr, ToSocketAddrs, UdpSocket},
     panic::{self, AssertUnwindSafe},
     sync::{
+        Arc, OnceLock, PoisonError, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, OnceLock, PoisonError, RwLock,
+        mpsc,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -19,22 +20,22 @@ use std::{
 
 use ahash::HashSet;
 use bon::bon;
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{Sender, bounded};
 use handshake::Handshake;
 use mio::{Poll, Waker};
 use thread::{ClientThreadState, Cmd};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel, SendLimits},
+    AllowedClientVersions, ClientVersion, WAKE_TOKEN,
+    channel::{Channel, SendLimits, scheduler::ChannelConfiguration},
     congestion::CongestionConfig,
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver, Payload},
     packets::{info_request::InfoRequest, info_response::InfoResponse, login_request},
     send::{self, Admission, Message, SendOptions, SendOutcome, SendQueueLimits},
-    socket::{is_transient, sim::Simulator, Socket},
+    socket::{Socket, is_transient, sim::Simulator},
     stats::{ChannelStats, Stats},
     transport::{self, Connection},
-    AllowedClientVersions, ClientVersion, WAKE_TOKEN,
 };
 
 mod handshake;
@@ -66,7 +67,9 @@ pub enum ConnectError {
         server: u8,
     },
     /// The server's key isn't the pinned one: a different server, or someone impersonating it.
-    #[error("The server's public key does not match the expected key (possible SECURITY IMPLICATIONS!!!)")]
+    #[error(
+        "The server's public key does not match the expected key (possible SECURITY IMPLICATIONS!!!)"
+    )]
     ServerKeyMismatch {
         /// The key the server presented.
         received_key: [u8; 32],
@@ -78,7 +81,9 @@ pub enum ConnectError {
     #[error("Auth data too large: {0}")]
     AuthDataTooLarge(TooLarge),
     /// Counts of unreliable ordered and reliable channels.
-    #[error("Channel configuration differs from the server's (client: {client:?}, server: {server:?} unreliable ordered and reliable channels)")]
+    #[error(
+        "Channel configuration differs from the server's (client: {client:?}, server: {server:?} unreliable ordered and reliable channels)"
+    )]
     ChannelMismatch {
         /// This client's counts.
         client: [u16; 2],

@@ -5,8 +5,8 @@
 //! Channel throughput without pacing, loss or a socket: splitting, encryption, reassembly and
 //! acks. Run with `--features bench`.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use hexgate::{bench::Link, Channel, Cipher};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use hexgate::{Channel, Cipher, bench::Link};
 
 fn channels(c: &mut Criterion) {
     let mut group = c.benchmark_group("channels");

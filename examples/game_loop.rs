@@ -4,8 +4,8 @@ use std::{
 };
 
 use hexgate::{
-    client, error::SendError, server, Authenticator, Channel, ChannelConfiguration, Client,
-    ClientVersion, SendOptions, Server, ServerKey,
+    Authenticator, Channel, ChannelConfiguration, Client, ClientVersion, SendOptions, Server,
+    ServerKey, client, error::SendError, server,
 };
 
 struct Accept;

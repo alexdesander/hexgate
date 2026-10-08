@@ -13,9 +13,9 @@ use std::{
     time::Instant,
 };
 
-use super::{ranges::RangeSet, SendResult};
+use super::{SendResult, ranges::RangeSet};
 use crate::common::{
-    codec::{write_varint, Writer},
+    codec::{Writer, write_varint},
     error::ProtocolViolation,
     events::DeliveryBudget,
     send::{Message, SendOutcome},

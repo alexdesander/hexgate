@@ -2,9 +2,9 @@
 
 use hexgate::sim::{Fate, NetworkSimulator};
 use hexgate::{
+    Channel, ChannelConfiguration, CongestionConfig, SendOptions,
     bench::{Delivery, Pairs, Side},
     sim::{Bottleneck, Link, LinkConfig},
-    Channel, ChannelConfiguration, CongestionConfig, SendOptions,
 };
 use std::{
     net::SocketAddr,
@@ -86,7 +86,11 @@ fn game_ticks_do_not_build_a_standing_queue() {
                 pairs.stats(0, Side::Client)
             );
             let p95 = latencies[latencies.len() * 95 / 100];
-            eprintln!("{hz}/{size}/{capacity}/{buffer_ms} variable={variable_sizes}: p95={p95}us count={} max_queue={:?}", latencies.len(), link.stats().max_queue_delay);
+            eprintln!(
+                "{hz}/{size}/{capacity}/{buffer_ms} variable={variable_sizes}: p95={p95}us count={} max_queue={:?}",
+                latencies.len(),
+                link.stats().max_queue_delay
+            );
             assert!(
                 p95 < 160_000,
                 "{hz}/{size}/{capacity}/{buffer_ms} variable={variable_sizes}: p95={p95}us stats={:?}",

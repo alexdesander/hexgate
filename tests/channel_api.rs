@@ -2,8 +2,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{client_builder, server_builder, AcceptAll};
-use hexgate::{client, server, Channel, CongestionConfig, SendOptions, SendOutcome};
+use common::{AcceptAll, client_builder, server_builder};
+use hexgate::{Channel, CongestionConfig, SendOptions, SendOutcome, client, server};
 
 #[test]
 fn socket_threads_preserve_channel_stats_resets_priorities_and_receipts() {
@@ -50,9 +50,11 @@ fn socket_threads_preserve_channel_stats_resets_priorities_and_receipts() {
     for stats in [client_stats, server_stats] {
         assert!(stats.unsent_bytes > 900_000, "{stats:?}");
         assert!(stats.oldest_queued.is_some());
-        assert!(stats
-            .send_delay
-            .is_some_and(|delay| delay > Duration::from_secs(20)));
+        assert!(
+            stats
+                .send_delay
+                .is_some_and(|delay| delay > Duration::from_secs(20))
+        );
     }
     client.reset_channel(0).unwrap();
     server.reset_channel(peer, 0).unwrap();

@@ -12,7 +12,7 @@ use std::{
     path::Path,
 };
 
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 
 /// Reading or writing a key file failed.
 #[derive(Debug, thiserror::Error)]

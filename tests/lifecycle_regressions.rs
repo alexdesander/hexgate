@@ -3,16 +3,16 @@ mod common;
 use std::{
     net::{SocketAddr, UdpSocket},
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
     },
     time::{Duration, Instant},
 };
 
-use common::{client_builder, next_event, server_builder, AcceptAll};
+use common::{AcceptAll, client_builder, next_event, server_builder};
 use hexgate::{
-    client, server, Authenticator, Channel, ChannelConfiguration, Client, Server, Simulator,
+    Authenticator, Channel, ChannelConfiguration, Client, Server, Simulator, client, server,
 };
 
 const WAIT: Duration = Duration::from_secs(3);

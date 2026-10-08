@@ -9,8 +9,8 @@ use std::{
     net::SocketAddr,
     panic::{self, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicU64, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -29,17 +29,18 @@ use siphasher::sip::SipHasher;
 use thread::{Cmd, ServerThreadState};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel, SendLimits},
+    AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
+    channel::{Channel, SendLimits, scheduler::ChannelConfiguration},
     congestion::CongestionConfig,
     crypto::sym::SymCipher,
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver, Payload},
     packets::info_response::MAX_INFO_SIZE,
     send::{self, Admission, Message, SendOptions, SendOutcome, SendQueueLimits},
-    socket::{sim::Simulator, Socket},
+    socket::{Socket, sim::Simulator},
     stats::{ChannelStats, Stats},
     timed_event_queue::TimedEventQueue,
-    transport, AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
+    transport,
 };
 
 mod auth;

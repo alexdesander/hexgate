@@ -9,7 +9,7 @@ use std::{
 
 use rand_xoshiro::Xoshiro256PlusPlus;
 
-use super::link::{Episodes, Schedule, FAR_FUTURE};
+use super::link::{Episodes, FAR_FUTURE, Schedule};
 
 /// Size of a cross-traffic packet.
 const CROSS_PACKET: usize = 1500;

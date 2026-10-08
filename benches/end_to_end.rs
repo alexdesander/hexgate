@@ -9,10 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use hexgate::{
-    client, server, Authenticator, Channel, ChannelConfiguration, Client, ClientVersion, Server,
-    ServerKey,
+    Authenticator, Channel, ChannelConfiguration, Client, ClientVersion, Server, ServerKey, client,
+    server,
 };
 
 struct AcceptAll;

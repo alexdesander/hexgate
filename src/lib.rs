@@ -152,12 +152,12 @@ pub mod server;
 
 pub use client::{Client, ServerKey};
 pub use common::{
+    AllowedClientVersions, Cipher, ClientVersion,
     channel::{Channel, ChannelConfiguration},
     congestion::{Congestion, CongestionConfig},
     error, fingerprint, keys,
     send::{SendOptions, SendOutcome, SendQueueLimits},
     socket::sim::{self, NetworkSimulator, Simulator},
     stats::{ChannelStats, Stats},
-    AllowedClientVersions, Cipher, ClientVersion,
 };
 pub use server::{Authenticator, Server};

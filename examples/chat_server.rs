@@ -6,9 +6,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use ahash::HashMap;
 use hexgate::{
-    fingerprint, keys,
+    Authenticator, Channel, ChannelConfiguration, Server, fingerprint, keys,
     server::{self, Event},
-    Authenticator, Channel, ChannelConfiguration, Server,
 };
 
 const SERVER_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 44444);

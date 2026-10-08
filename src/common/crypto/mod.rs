@@ -7,7 +7,7 @@ use sha2::Sha512;
 use sym::SymCipher;
 use x25519_dalek::SharedSecret;
 
-use super::{packets::PacketError, Cipher};
+use super::{Cipher, packets::PacketError};
 
 pub mod sym;
 

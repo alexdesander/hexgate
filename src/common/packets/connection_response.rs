@@ -4,11 +4,11 @@
 
 use std::ops::Range;
 
-use ed25519_dalek::{ed25519::signature::Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey, ed25519::signature::Signer};
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey, ReusableSecret};
 
-use crate::common::{crypto::Crypto, Cipher};
+use crate::common::{Cipher, crypto::Crypto};
 
 use super::*;
 

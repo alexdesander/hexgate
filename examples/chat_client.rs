@@ -5,8 +5,8 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use hexgate::{
-    client::Event, fingerprint, keys, sim::Profile, Channel, ChannelConfiguration, Client,
-    ClientVersion, ServerKey,
+    Channel, ChannelConfiguration, Client, ClientVersion, ServerKey, client::Event, fingerprint,
+    keys, sim::Profile,
 };
 use text_io::read;
 

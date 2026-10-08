@@ -12,10 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng};
 use x25519_dalek::{PublicKey, ReusableSecret};
 
 use crate::common::{
+    Cipher,
     channel::{Channel, ChannelConfiguration},
     codec::Reader,
     congestion::CongestionConfig,
@@ -31,8 +32,7 @@ use crate::common::{
         login_response::LoginResponse,
         server_hello::ServerHello,
     },
-    transport::{self, frame, packet, Connection, Output},
-    Cipher,
+    transport::{self, Connection, Output, frame, packet},
 };
 
 const MAX_MESSAGE_SIZE: usize = 1 << 20;
@@ -178,7 +178,7 @@ pub fn channels(inputs: &[Vec<u8>]) {
 pub fn progress(input: &[u8]) {
     use crate::common::{
         channel::{Channels, StreamFrames},
-        codec::{varint_len, Writer},
+        codec::{Writer, varint_len},
     };
     use std::collections::VecDeque;
     let config = ChannelConfiguration {

@@ -11,10 +11,10 @@ use std::{
 };
 
 use hexgate::{
+    Authenticator, ChannelConfiguration, Client, SendQueueLimits, Server, ServerKey, Simulator,
     error::RecvError,
     server,
     sim::{Fate, NetworkSimulator},
-    Authenticator, ChannelConfiguration, Client, SendQueueLimits, Server, ServerKey, Simulator,
 };
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;

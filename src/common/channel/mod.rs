@@ -621,19 +621,21 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(channels
-            .on_unreliable(
-                now,
-                Some(0),
-                0,
-                Some(Fragment {
-                    offset: 0,
-                    total: 1024
-                }),
-                &[2; 512]
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            channels
+                .on_unreliable(
+                    now,
+                    Some(0),
+                    0,
+                    Some(Fragment {
+                        offset: 0,
+                        total: 1024
+                    }),
+                    &[2; 512]
+                )
+                .unwrap()
+                .is_none()
+        );
         let message = channels
             .on_unreliable(
                 now,
