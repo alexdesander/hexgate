@@ -43,6 +43,8 @@ tracing = { version = "0.1.44", optional = true }
 [features]
 # Debug and trace events for handshakes, connection changes and rejected packets.
 tracing = ["dep:tracing"]
+# Internal entry points for the benchmarks in benches/, not part of the API.
+bench = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
@@ -53,4 +55,19 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 
 [dev-dependencies]
 anyhow = "1.0.93"
+criterion = "0.8.2"
 text_io = "0.1.12"
+
+[[bench]]
+name = "packets"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "channels"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "end_to_end"
+harness = false

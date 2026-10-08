@@ -10,6 +10,9 @@ macro_rules! log {
     }};
 }
 
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod bench;
 pub mod client;
 mod common;
 #[cfg(fuzzing)]
