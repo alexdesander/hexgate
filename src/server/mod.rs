@@ -183,6 +183,8 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         allowed_client_versions: fn(ClientVersion) -> Result<(), AllowedClientVersions>,
         cipher: Option<Cipher>,
         secret_key: [u8; 32],
+        /// Salts the Argon2 hash of clients with `hash_auth_data`, together with the server's
+        /// public key. Changing either changes the hashes the authenticator receives.
         auth_salt: [u8; 16],
         #[builder(default = Duration::from_secs(10))] timeout_dur: Duration,
         /// Further clients are turned away (`ConnectError::ServerFull`). Unlimited by default.

@@ -17,6 +17,7 @@ use crossbeam::channel::{bounded, unbounded, Sender};
 use ed25519_dalek::VerifyingKey;
 use mio::{Events, Interest, Poll, Waker};
 use rand::thread_rng;
+use sha2::{Digest, Sha256};
 use thread::{ClientThreadState, Cmd};
 use x25519_dalek::{PublicKey, ReusableSecret};
 
@@ -239,6 +240,9 @@ impl Client {
         server_key: ServerKey,
         /// At most 1177 bytes unless hashed.
         auth_data: Vec<u8>,
+        /// Sends an Argon2id hash of `auth_data` (e.g. a password) instead, salted with the
+        /// server's key and `auth_salt`. The hash is as good as the password for logging in to
+        /// this server, so the server has to hash it again before storing it.
         hash_auth_data: bool,
         simulator: Option<Box<dyn NetworkSimulator>>,
         socket_buffer_size: Option<usize>,
@@ -390,13 +394,18 @@ impl Client {
             // LoginRequest -> LoginResponse
             let hashed_auth_data;
             let login_auth_data = if hash_auth_data {
+                // A rogue server reusing another server's auth_salt must not get hashes valid there.
+                let argon2_salt = Sha256::new()
+                    .chain_update(server_ed25519_pubkey.as_bytes())
+                    .chain_update(auth_salt)
+                    .finalize();
                 let mut hashed = vec![0u8; 20];
                 Argon2::new(
                     argon2::Algorithm::Argon2id,
                     argon2::Version::V0x13,
                     Params::new(65536, 2, 1, Some(20)).unwrap(),
                 )
-                .hash_password_into(&auth_data, &auth_salt, &mut hashed)
+                .hash_password_into(&auth_data, &argon2_salt, &mut hashed)
                 .unwrap();
                 hashed_auth_data = hashed;
                 &hashed_auth_data
