@@ -3,11 +3,13 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::BTreeMap,
     io,
     net::SocketAddr,
     rc::Rc,
-    sync::{Arc, PoisonError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, PoisonError,
+    },
     time::{Duration, Instant},
 };
 
@@ -20,45 +22,35 @@ use siphasher::sip::SipHasher;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel, Pop, IDS_EXHAUSTED},
-    congestion::CongestionConfiguration,
+    channel::Channel,
     crypto::Crypto,
-    error::{ProtocolViolation, RecvError},
+    error::RecvError,
     events::EventSender,
     packets::{
-        acks::Acks,
         client_hello::ClientHello,
         connection_request::ConnectionRequest,
         connection_response::{self, ConnectionResponse, Transcript},
-        disconnect::{self, Disconnect},
         info_request::InfoRequest,
         info_response::InfoResponse,
-        latency_discovery::LatencyDiscovery,
-        latency_discovery_response::LatencyDiscoveryResponse,
-        latency_discovery_response_2::LatencyDiscoveryResponse2,
         login_request::LoginRequest,
         login_response::LoginResponse,
         rejected,
-        reliable_payload::ReliablePayload,
         server_hello::{self, ServerHello},
-        unreliable_payload::UnreliablePayload,
         PacketIdentifier,
     },
     socket::sim::Simulator,
     stats::Stats,
     timed_event_queue::TimedEventQueue,
+    transport::{self, Connection, Output},
     AllowedClientVersions, Cipher, ClientVersion, PROTOCOL_VERSION, RECV_TOKEN, WAKE_TOKEN,
 };
 
 use super::{
     auth::{AuthCmd, AuthResult, LoginAttempt},
-    connection::Connection,
     rate_limit::RateLimiter,
     ConnectedSet, Event, Socket,
 };
 
-/// Timeouts are checked this many times per timeout duration.
-const TIMEOUT_CHECKS: u32 = 4;
 const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long handshake state is kept to answer retransmitted requests.
 const HANDSHAKE_STATE_TTL: Duration = Duration::from_secs(8);
@@ -79,6 +71,7 @@ pub enum Cmd<R: AuthResult> {
     AuthSuccess(LoginAttempt, R),
     AuthFailed(LoginAttempt, Vec<u8>),
     Send(Recipients, Channel, Vec<u8>),
+    Flush,
     Stats(SocketAddr, Sender<Option<Stats>>),
     /// The authenticator panicked, the server shuts down and reports this.
     Failed(RecvError),
@@ -92,34 +85,19 @@ pub enum Recipients {
     All,
 }
 
-/// Queues a message for a client that isn't being closed. Recipients share the buffer.
-fn queue_message(
-    timed_events: &mut TimedEventQueue<TimedEventKey, TimedEventData>,
-    addr: SocketAddr,
-    connection: &mut Connection,
-    channel: Channel,
-    message: &Rc<Vec<u8>>,
-) {
-    if connection.closing.is_some() {
-        return;
-    }
-    connection.channels.push(channel, message.clone());
-    timed_events.push(
-        TimedEventKey::Send(addr),
-        connection.last_sent + connection.congestion.downtime_between_batches(),
-        TimedEventData::Nothing,
-    );
+/// A connected client.
+pub struct Peer {
+    connection: Connection,
+    /// Its send rate, shared with `Server::budget_for`.
+    rate: Arc<AtomicU64>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub enum TimedEventKey {
     RemoveExpectingLoginRequest(LoginAttempt),
     RemoveAnsweredLogin(LoginAttempt),
-    CheckForTimeouts,
-    DiscoverLatencies,
-    Send(SocketAddr),
-    SendAcks(SocketAddr, u8),
-    CloseDeadline(SocketAddr),
+    /// The connection's timers (`Connection::timeout`).
+    Connection(SocketAddr),
     PruneRateLimits,
 }
 
@@ -148,11 +126,7 @@ pub struct ServerThreadState<R: AuthResult> {
     /// Handshake cookie timestamps are milliseconds since this instant.
     pub cookie_epoch: Instant,
     pub connection_request_max_timestamp_age: Duration,
-    pub timeout_dur: Duration,
     pub max_connections: Option<usize>,
-    pub max_recv_msg_size: usize,
-    pub is_checking_for_timeouts: bool,
-    pub latency_discovery_interval: Duration,
 
     /// Limit answered ClientHellos and new key exchanges per client IP.
     pub client_hellos: RateLimiter,
@@ -162,15 +136,13 @@ pub struct ServerThreadState<R: AuthResult> {
     pub expecting_auth_result: HashMap<LoginAttempt, Crypto>,
     /// Sent LoginResponses, resent for retransmitted LoginRequests.
     pub answered_logins: HashMap<LoginAttempt, Vec<u8>>,
-    pub connections: HashMap<SocketAddr, Connection>,
+    pub connections: HashMap<SocketAddr, Peer>,
     /// Connected clients that aren't being closed, shared with `Server`.
     pub connected: ConnectedSet,
-
-    pub latency_discoveries_sent: BTreeMap<u32, Instant>,
-    pub is_discovering_latencies: bool,
-
-    pub channel_config: ChannelConfiguration,
-    pub congestion_config: CongestionConfiguration,
+    pub config: transport::Config,
+    /// Connections with something new to send.
+    pub dirty: Vec<SocketAddr>,
+    pub outputs: Vec<Output>,
 
     pub close_linger: Duration,
     pub shutting_down: bool,
@@ -186,10 +158,11 @@ impl<R: AuthResult> ServerThreadState<R> {
             .register(self.socket.mio_socket(), RECV_TOKEN, Interest::READABLE)?;
 
         loop {
-            if self.handle_all_cmds()? {
+            if self.handle_all_cmds() {
                 break;
             }
             self.handle_all_events();
+            self.service_dirty();
             if self.shutting_down && self.connections.is_empty() {
                 break;
             }
@@ -197,38 +170,74 @@ impl<R: AuthResult> ServerThreadState<R> {
                 .timed_events
                 .next()
                 .into_iter()
-                .chain(self.socket.next_deadline());
-            let max_poll_time = deadline.min().map(|deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .max(Duration::from_millis(1))
-            });
+                .chain(self.socket.next_deadline())
+                .min();
+            let max_poll_time =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             // A signal handler ran, nothing happened on the socket.
             match self.poll.poll(&mut events, max_poll_time) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 result => result?,
             }
-            for event in events.iter() {
-                match event.token() {
-                    RECV_TOKEN => self.handle_all_recvs()?,
-                    WAKE_TOKEN => {}
-                    _ => unreachable!(),
-                }
-            }
             self.socket.flush();
-            if self.socket.inbound_due() {
+            let readable = events.iter().any(|event| event.token() == RECV_TOKEN);
+            debug_assert!(events
+                .iter()
+                .all(|event| [RECV_TOKEN, WAKE_TOKEN].contains(&event.token())));
+            if readable || self.socket.inbound_due() {
                 self.handle_all_recvs()?;
             }
         }
         self.failure.take().map_or(Ok(()), Err)
     }
 
-    fn handle_all_cmds(&mut self) -> Result<bool, io::Error> {
+    /// Sends what the connections touched since the last call have to send.
+    fn service_dirty(&mut self) {
+        let now = Instant::now();
+        for addr in std::mem::take(&mut self.dirty) {
+            self.service(addr, now);
+        }
+    }
+
+    /// Sends what the connection has to send, then removes it if it closed or reschedules
+    /// its timers.
+    fn service(&mut self, addr: SocketAddr, now: Instant) {
+        let Some(peer) = self.connections.get_mut(&addr) else {
+            return;
+        };
+        while let Some(size) = peer.connection.poll_transmit(now, &mut self.buf) {
+            self.socket.send_to(addr, &self.buf[..size]);
+        }
+        peer.rate
+            .store(peer.connection.rate() as u64, Ordering::Relaxed);
+        if peer.connection.is_closed() {
+            log!(debug, %addr, "closed");
+            self.remove(addr);
+            return;
+        }
+        match peer.connection.timeout(now) {
+            Some(deadline) => self.timed_events.set(
+                TimedEventKey::Connection(addr),
+                deadline,
+                TimedEventData::Nothing,
+            ),
+            None => self.timed_events.remove(&TimedEventKey::Connection(addr)),
+        }
+    }
+
+    fn remove(&mut self, addr: SocketAddr) {
+        self.connections.remove(&addr);
+        self.timed_events.remove(&TimedEventKey::Connection(addr));
+        self.set_connected(addr, None);
+    }
+
+    /// Returns true once all `Server` handles are gone.
+    fn handle_all_cmds(&mut self) -> bool {
         loop {
             let cmd = match self.cmds.try_recv() {
                 Ok(cmd) => cmd,
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(true),
+                Err(TryRecvError::Disconnected) => return true,
             };
 
             match cmd {
@@ -253,42 +262,48 @@ impl<R: AuthResult> ServerThreadState<R> {
                 }
                 Cmd::Send(recipients, channel, message) => {
                     let message = Rc::new(message);
-                    let mut queue = |addr: SocketAddr, connection: &mut Connection| {
-                        queue_message(&mut self.timed_events, addr, connection, channel, &message)
+                    let now = Instant::now();
+                    let mut queue = |addr: SocketAddr, peer: &mut Peer| {
+                        peer.connection.push(channel, message.clone(), now);
+                        self.dirty.push(addr);
                     };
                     match recipients {
                         Recipients::One(addr) => {
-                            if let Some(connection) = self.connections.get_mut(&addr) {
-                                queue(addr, connection);
+                            if let Some(peer) = self.connections.get_mut(&addr) {
+                                queue(addr, peer);
                             }
                         }
                         Recipients::Many(addrs) => {
                             for addr in addrs {
-                                if let Some(connection) = self.connections.get_mut(&addr) {
-                                    queue(addr, connection);
+                                if let Some(peer) = self.connections.get_mut(&addr) {
+                                    queue(addr, peer);
                                 }
                             }
                         }
                         Recipients::All => {
-                            for (addr, connection) in &mut self.connections {
-                                queue(*addr, connection);
+                            for (addr, peer) in &mut self.connections {
+                                queue(*addr, peer);
                             }
                         }
                     }
                 }
+                Cmd::Flush => {
+                    for (addr, peer) in &mut self.connections {
+                        peer.connection.flush();
+                        self.dirty.push(*addr);
+                    }
+                }
                 Cmd::Stats(addr, reply) => {
-                    let _ = reply.send(self.connections.get(&addr).map(|connection| {
-                        Stats::new(
-                            &connection.congestion,
-                            &connection.channels,
-                            &connection.probe_loss,
-                        )
-                    }));
+                    let _ = reply.send(
+                        self.connections
+                            .get(&addr)
+                            .map(|peer| peer.connection.stats()),
+                    );
                 }
                 Cmd::SetSimulator(simulator) => self.socket.set_simulator(simulator),
             }
         }
-        Ok(false)
+        false
     }
 
     fn handle_all_events(&mut self) {
@@ -305,21 +320,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                 TimedEventKey::RemoveAnsweredLogin(attempt) => {
                     self.answered_logins.remove(&attempt);
                 }
-                TimedEventKey::CheckForTimeouts => {
-                    self.handle_event_check_for_timeouts();
-                }
-                TimedEventKey::DiscoverLatencies => {
-                    self.handle_event_discover_latencies();
-                }
-                TimedEventKey::Send(socket_addr) => {
-                    self.handle_event_send(socket_addr);
-                }
-                TimedEventKey::SendAcks(socket_addr, channel_id) => {
-                    self.handle_event_send_acks(socket_addr, channel_id);
-                }
-                TimedEventKey::CloseDeadline(socket_addr) => {
-                    self.finish_close(socket_addr);
-                }
+                TimedEventKey::Connection(addr) => self.handle_event_connection(addr),
                 TimedEventKey::PruneRateLimits => {
                     let now = Instant::now();
                     self.client_hellos.prune(now);
@@ -327,6 +328,25 @@ impl<R: AuthResult> ServerThreadState<R> {
                 }
             }
         }
+    }
+
+    fn handle_event_connection(&mut self, addr: SocketAddr) {
+        let now = Instant::now();
+        let Some(peer) = self.connections.get_mut(&addr) else {
+            return;
+        };
+        if peer.connection.on_timeout(now) {
+            let closing = peer.connection.is_closing();
+            let size = peer.connection.close_now(b"Timeout", now, &mut self.buf);
+            self.socket.send_to(addr, &self.buf[..size]);
+            self.remove(addr);
+            log!(debug, %addr, "timed out");
+            if !closing {
+                self.event_tx.send(Event::TimedOut(addr));
+            }
+            return;
+        }
+        self.service(addr, now);
     }
 
     fn handle_all_recvs(&mut self) -> Result<(), io::Error> {
@@ -354,151 +374,73 @@ impl<R: AuthResult> ServerThreadState<R> {
                     self.handle_packet_connection_request(size, from)
                 }
                 PacketIdentifier::LoginRequest => self.handle_packet_login_request(size, from),
-                PacketIdentifier::Disconnect => self.handle_packet_disconnect(size, from),
-                PacketIdentifier::LatencyDiscoveryResponse => {
-                    self.handle_packet_latency_discovery_response(size, from)
+                PacketIdentifier::Data | PacketIdentifier::DataAckNow => {
+                    self.handle_packet_data(size, from)
                 }
-                PacketIdentifier::UnreliableStandalonePayload
-                | PacketIdentifier::UnreliableFragmentedPayload
-                | PacketIdentifier::UnreliableFragmentedPayloadLast
-                | PacketIdentifier::UnreliableOrderedStandalonePayload
-                | PacketIdentifier::UnreliableOrderedFragmentedPayload
-                | PacketIdentifier::UnreliableOrderedFragmentedPayloadLast => {
-                    self.handle_packet_unreliable_payload(size, from)
-                }
-                PacketIdentifier::ReliablePayloadNoAcks => {
-                    self.handle_packet_reliable_payload(size, from)
-                }
-                PacketIdentifier::Acks => self.handle_packet_acks(size, from),
                 _ => continue,
             }
         }
+        self.service_dirty();
         Ok(())
     }
 
-    fn handle_event_check_for_timeouts(&mut self) {
-        let timed_outs: Vec<SocketAddr> = self
-            .connections
-            .iter()
-            .filter(|(_, connection)| connection.last_received.elapsed() > self.timeout_dur)
-            .map(|(addr, _)| *addr)
-            .collect();
-        for addr in timed_outs {
-            let connection = self.connections.remove(&addr).unwrap();
-            let disconnect = Disconnect { data: b"Timeout" };
-            let size = disconnect.serialize(&connection.crypto, &mut self.buf);
-            self.socket.send_to(addr, &self.buf[..size]);
-            self.set_connected(addr, false);
-            log!(debug, %addr, "timed out");
-            self.event_tx.send(Event::TimedOut(addr));
-        }
-        if !self.connections.is_empty() {
-            self.timed_events.push(
-                TimedEventKey::CheckForTimeouts,
-                Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
-                TimedEventData::Nothing,
-            );
-        } else {
-            self.is_checking_for_timeouts = false;
-        }
-    }
-
-    fn handle_event_discover_latencies(&mut self) {
-        let sequence_number = self
-            .latency_discoveries_sent
-            .last_entry()
-            .map_or(1, |kv| kv.key().checked_add(1).unwrap());
-        let mut latency_discovery = LatencyDiscovery {
-            sequence_number,
-            truncated_siphash: 0,
-        };
-        self.latency_discoveries_sent
-            .insert(sequence_number, Instant::now());
-        if self.latency_discoveries_sent.len() > 63 {
-            self.latency_discoveries_sent.pop_first();
-        }
-        for (addr, connection) in self.connections.iter_mut() {
-            let size = latency_discovery.serialize(&connection.crypto, &mut self.buf);
-            self.socket.send_to(*addr, &self.buf[..size]);
-            connection.probe_loss.probe(sequence_number);
-        }
-        if !self.connections.is_empty() {
-            self.timed_events.push(
-                TimedEventKey::DiscoverLatencies,
-                Instant::now() + self.latency_discovery_interval,
-                TimedEventData::Nothing,
-            );
-        } else {
-            self.is_discovering_latencies = false;
-        }
-    }
-
-    fn handle_event_send(&mut self, to: SocketAddr) {
-        let Some(connection) = self.connections.get_mut(&to) else {
+    fn handle_packet_data(&mut self, size: usize, from: SocketAddr) {
+        let Some(peer) = self.connections.get_mut(&from) else {
             return;
         };
         let now = Instant::now();
-        let downtime = connection.congestion.downtime_between_batches();
-        while connection.congestion.can_send(now) {
-            match connection.channels.pop(
-                &mut connection.congestion,
-                &connection.crypto,
-                &mut self.buf,
-            ) {
-                Pop::Packet(size) => {
-                    connection.last_sent = now;
-                    self.socket.send_to(to, &self.buf[..size]);
-                    connection.congestion.consume(size);
-                }
-                Pop::Wait(time_till_resend) => {
-                    let deadline = (now + time_till_resend).max(connection.last_sent + downtime);
-                    self.timed_events.push(
-                        TimedEventKey::Send(to),
-                        deadline,
-                        TimedEventData::Nothing,
-                    );
-                    return;
-                }
-                Pop::Idle => {
-                    if connection.closing.is_some() {
-                        self.finish_close(to);
+        let accept = self.event_tx.has_room();
+        // Closed by us (kicked, shutdown): the app hears nothing more about it.
+        let closing = peer.connection.is_closing();
+        let handled = peer
+            .connection
+            .handle(now, &mut self.buf[..size], accept, &mut self.outputs);
+        if let Err(error) = handled {
+            rejected("DATA", from, error);
+            return;
+        }
+        self.dirty.push(from);
+        for output in std::mem::take(&mut self.outputs) {
+            match output {
+                Output::Message(message) => self.event_tx.send(Event::Received(from, message)),
+                Output::Closed(reason) => {
+                    log!(debug, %from, "disconnected by client");
+                    // Acknowledges the CLOSE.
+                    self.service(from, now);
+                    self.remove(from);
+                    if !closing {
+                        self.event_tx.send(Event::Disconnected(from, reason));
                     }
                     return;
                 }
-                Pop::Exhausted => {
-                    let disconnect = Disconnect {
-                        data: IDS_EXHAUSTED,
-                    };
-                    let size = disconnect.serialize(&connection.crypto, &mut self.buf);
-                    self.socket.send_to(to, &self.buf[..size]);
-                    self.connections.remove(&to);
-                    self.set_connected(to, false);
-                    log!(warn, %to, "message ids exhausted");
-                    self.event_tx
-                        .send(Event::Disconnected(to, IDS_EXHAUSTED.to_vec()));
+                Output::Violation(violation) => {
+                    log!(warn, %from, %violation, "protocol violation");
+                    if let Some(peer) = self.connections.get_mut(&from) {
+                        let reason = violation.to_string();
+                        let size = peer
+                            .connection
+                            .close_now(reason.as_bytes(), now, &mut self.buf);
+                        self.socket.send_to(from, &self.buf[..size]);
+                    }
+                    self.remove(from);
+                    self.event_tx.send(Event::Violation(from, violation));
                     return;
                 }
             }
         }
-        self.timed_events.push(
-            TimedEventKey::Send(to),
-            now + connection.congestion.time_until_send().max(downtime),
-            TimedEventData::Nothing,
-        );
     }
 
     /// Updates the clients the app can send to (`Server::connections`), before the event that
     /// tells it.
-    fn set_connected(&self, addr: SocketAddr, connected: bool) {
+    fn set_connected(&self, addr: SocketAddr, rate: Option<Arc<AtomicU64>>) {
         let mut set = self
             .connected
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        if connected {
-            set.insert(addr);
-        } else {
-            set.remove(&addr);
-        }
+        match rate {
+            Some(rate) => set.insert(addr, rate),
+            None => set.remove(&addr),
+        };
     }
 
     fn schedule_rate_limit_prune(&mut self, now: Instant) {
@@ -518,53 +460,17 @@ impl<R: AuthResult> ServerThreadState<R> {
 
     /// Starts a graceful disconnect: queued messages are flushed for up to `close_linger`.
     fn start_close(&mut self, addr: SocketAddr, reason: Rc<[u8]>) {
-        let Some(connection) = self.connections.get_mut(&addr) else {
+        let Some(peer) = self.connections.get_mut(&addr) else {
             return;
         };
-        if connection.closing.is_some() {
+        if peer.connection.is_closing() {
             return;
         }
-        connection.closing = Some(reason);
-        self.set_connected(addr, false);
+        peer.connection
+            .close(reason, self.close_linger, Instant::now());
+        self.set_connected(addr, None);
         log!(debug, %addr, "closing");
-        let now = Instant::now();
-        self.timed_events.push(
-            TimedEventKey::CloseDeadline(addr),
-            now + self.close_linger,
-            TimedEventData::Nothing,
-        );
-        self.timed_events
-            .push(TimedEventKey::Send(addr), now, TimedEventData::Nothing);
-    }
-
-    /// Ends a graceful disconnect: everything was sent and acked, or the linger ran out.
-    fn finish_close(&mut self, addr: SocketAddr) {
-        // The client may have reconnected from the same address since.
-        if !self
-            .connections
-            .get(&addr)
-            .is_some_and(|connection| connection.closing.is_some())
-        {
-            return;
-        }
-        let connection = self.connections.remove(&addr).unwrap();
-        self.timed_events
-            .remove(&TimedEventKey::CloseDeadline(addr));
-        log!(debug, %addr, "closed");
-        let reason = connection.closing.as_deref().unwrap_or_default();
-        let size = Disconnect { data: reason }.serialize(&connection.crypto, &mut self.buf);
-        for _ in 0..disconnect::REPEATS {
-            self.socket.send_to(addr, &self.buf[..size]);
-        }
-    }
-
-    fn handle_event_send_acks(&mut self, to: SocketAddr, channel_id: u8) {
-        let Some(connection) = self.connections.get_mut(&to) else {
-            return;
-        };
-        let acks = connection.channels.acks(Channel::Reliable(channel_id));
-        let size = acks.serialize(&connection.crypto, &mut self.buf);
-        self.socket.send_to(to, &self.buf[..size]);
+        self.dirty.push(addr);
     }
 
     fn handle_cmd_auth_success(&mut self, attempt: LoginAttempt, auth_result: R) {
@@ -586,35 +492,23 @@ impl<R: AuthResult> ServerThreadState<R> {
         }
         let from = attempt.0;
         let size = LoginResponse::Success.serialize(&crypto, &mut self.buf);
+        let rate = Arc::new(AtomicU64::new(0));
         // The connection is inserted before the next command, so sends can go to it as soon as
         // the client is connected.
-        self.set_connected(from, true);
+        self.set_connected(from, Some(rate.clone()));
         self.answer_login(attempt, size);
-        let connection = Connection::new(
-            crypto,
-            &self.channel_config,
-            self.congestion_config,
-            self.max_recv_msg_size,
-        );
+        let peer = Peer {
+            connection: Connection::new(crypto, &self.config, Instant::now()),
+            rate,
+        };
         // A new handshake from a connected address means the client lost its old session
         // (e.g. our LoginSuccess got lost and it started over).
-        if self.connections.insert(from, connection).is_some() {
+        if self.connections.insert(from, peer).is_some() {
             self.event_tx.send(Event::Disconnected(from, Vec::new()));
         }
         log!(debug, %from, "connected");
         self.event_tx.send(Event::Connected(from, auth_result));
-
-        self.timed_events.push(
-            TimedEventKey::DiscoverLatencies,
-            Instant::now() + self.latency_discovery_interval,
-            TimedEventData::Nothing,
-        );
-
-        self.timed_events.push(
-            TimedEventKey::CheckForTimeouts,
-            Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
-            TimedEventData::Nothing,
-        );
+        self.dirty.push(from);
     }
 
     fn handle_cmd_auth_failure(&mut self, attempt: LoginAttempt, failure_data: Vec<u8>) {
@@ -697,7 +591,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                     cipher: self.cipher,
                     server_ed25519_pubkey: self.veryifying_key,
                     siphash: None,
-                    channel_counts: self.channel_config.counts(),
+                    channel_counts: self.config.channels.counts(),
                 }
             }
             Err(allowed_versions) => {
@@ -770,7 +664,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         let transcript = Transcript {
             request: &signed_request,
             cipher: self.cipher,
-            channel_counts: self.channel_config.counts(),
+            channel_counts: self.config.channels.counts(),
         };
         let size =
             connection_response.serialize(&crypto, &self.signing_key, &transcript, &mut self.buf);
@@ -824,154 +718,5 @@ impl<R: AuthResult> ServerThreadState<R> {
         }
         log!(debug, %from, "authenticating");
         self.expecting_auth_result.insert(attempt, crypto);
-    }
-
-    fn handle_packet_disconnect(&mut self, size: usize, from: SocketAddr) {
-        let Some(connection) = self.connections.get(&from) else {
-            return;
-        };
-        let Ok(disconnect) = Disconnect::deserialize(&connection.crypto, &mut self.buf[..size])
-            .inspect_err(|e| rejected("Disconnect", from, *e))
-        else {
-            return;
-        };
-        let data = disconnect.data.to_vec();
-        log!(debug, %from, "disconnected by client");
-        self.connections.remove(&from);
-        self.set_connected(from, false);
-        self.event_tx.send(Event::Disconnected(from, data));
-    }
-
-    fn handle_packet_latency_discovery_response(&mut self, size: usize, from: SocketAddr) {
-        let Some(connection) = self.connections.get_mut(&from) else {
-            return;
-        };
-        let Ok(latency_discovery_response) =
-            LatencyDiscoveryResponse::deserialize(&connection.crypto, &self.buf[..size])
-                .inspect_err(|e| rejected("LatencyDiscoveryResponse", from, *e))
-        else {
-            return;
-        };
-        if latency_discovery_response.sequence_number <= connection.last_latency_discovery_response
-        {
-            return;
-        }
-        let Some(sent) = self
-            .latency_discoveries_sent
-            .get(&latency_discovery_response.sequence_number)
-        else {
-            // TODO: Think about what to do with really, really bad connections
-            return;
-        };
-        connection.last_latency_discovery_response = latency_discovery_response.sequence_number;
-        connection
-            .probe_loss
-            .answered(latency_discovery_response.sequence_number);
-        let latency = sent.elapsed();
-        connection.congestion.update_latency(latency);
-
-        let mut latency_discovery_response_2 = LatencyDiscoveryResponse2 {
-            sequence_number: latency_discovery_response.sequence_number,
-            truncated_siphash: 0,
-        };
-        let size = latency_discovery_response_2.serialize(&connection.crypto, &mut self.buf);
-        self.socket.send_to(from, &self.buf[..size]);
-
-        connection.last_received = Instant::now();
-    }
-
-    fn handle_packet_unreliable_payload(&mut self, size: usize, from: SocketAddr) {
-        if !self.event_tx.has_room() {
-            return;
-        }
-        let Some(connection) = self
-            .connections
-            .get_mut(&from)
-            .filter(|connection| connection.closing.is_none())
-        else {
-            return;
-        };
-        let Ok(packet) = UnreliablePayload::deserialize(&connection.crypto, &mut self.buf[0..size])
-            .inspect_err(|e| rejected("UnreliablePayload", from, *e))
-        else {
-            return;
-        };
-        connection.last_received = Instant::now();
-        match connection.channels.handle_unreliable(packet) {
-            Ok(Some(message)) => self.event_tx.send(Event::Received(from, message)),
-            Ok(None) => {}
-            Err(violation) => self.handle_violation(from, violation),
-        }
-    }
-
-    fn handle_packet_reliable_payload(&mut self, size: usize, from: SocketAddr) {
-        if !self.event_tx.has_room() {
-            return;
-        }
-        let Some(connection) = self
-            .connections
-            .get_mut(&from)
-            .filter(|connection| connection.closing.is_none())
-        else {
-            return;
-        };
-        let Ok(packet) = ReliablePayload::deserialize(&connection.crypto, &mut self.buf[..size])
-            .inspect_err(|e| rejected("ReliablePayload", from, *e))
-        else {
-            return;
-        };
-        connection.last_received = Instant::now();
-        if packet.channel_id() as usize >= self.channel_config.weights_reliable.len() {
-            return;
-        }
-        self.timed_events.push(
-            TimedEventKey::SendAcks(from, packet.channel_id()),
-            Instant::now() + connection.congestion.ack_delay(),
-            TimedEventData::Nothing,
-        );
-        match connection.channels.handle_reliable(packet) {
-            Ok(messages) => {
-                for message in messages {
-                    self.event_tx.send(Event::Received(from, message));
-                }
-            }
-            Err(violation) => self.handle_violation(from, violation),
-        }
-    }
-
-    fn handle_packet_acks(&mut self, size: usize, from: SocketAddr) {
-        let Some(connection) = self.connections.get_mut(&from) else {
-            return;
-        };
-        let Ok(packet) = Acks::deserialize(&connection.crypto, &self.buf[..size])
-            .inspect_err(|e| rejected("Acks", from, *e))
-        else {
-            return;
-        };
-        connection.last_received = Instant::now();
-        connection
-            .channels
-            .handle_acks(packet, &mut connection.congestion);
-        // Acks can open the window or reveal losses.
-        self.timed_events.push(
-            TimedEventKey::Send(from),
-            connection.last_sent + connection.congestion.downtime_between_batches(),
-            TimedEventData::Nothing,
-        );
-    }
-
-    fn handle_violation(&mut self, addr: SocketAddr, violation: ProtocolViolation) {
-        let Some(connection) = self.connections.remove(&addr) else {
-            return;
-        };
-        self.set_connected(addr, false);
-        log!(warn, %addr, %violation, "protocol violation");
-        let reason = violation.to_string();
-        let disconnect = Disconnect {
-            data: reason.as_bytes(),
-        };
-        let size = disconnect.serialize(&connection.crypto, &mut self.buf);
-        self.socket.send_to(addr, &self.buf[..size]);
-        self.event_tx.send(Event::Violation(addr, violation));
     }
 }

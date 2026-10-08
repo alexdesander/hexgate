@@ -20,6 +20,9 @@ use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// The transfer tests queue tens of thousands of messages at once and poll with sleeps: a
+/// full event queue would drop unreliable ones (see `max_events`).
+pub const MAX_EVENTS: usize = 1 << 20;
 pub const SECRET_KEY: [u8; 32] = [7; 32];
 
 pub struct AcceptAll;
@@ -32,11 +35,13 @@ impl Authenticator<()> for AcceptAll {
 
 pub type TestServer = Server<()>;
 
+/// Unreliable messages don't expire: the tests queue thousands at once and check delivery.
 pub fn channel_config() -> ChannelConfiguration {
     ChannelConfiguration {
         weight_unreliable: 10,
         weights_unreliable_ordered: vec![10; 5],
         weights_reliable: vec![10; 5],
+        unreliable_max_age: Duration::from_secs(60),
     }
 }
 
@@ -143,6 +148,7 @@ pub fn server(timeout_dur: Duration) -> TestServer {
         .authenticator(AcceptAll)
         .channel_config(channel_config())
         .timeout_dur(timeout_dur)
+        .max_events(MAX_EVENTS)
         .run()
         .unwrap()
 }
@@ -156,6 +162,7 @@ pub fn client(server_addr: SocketAddr, timeout_dur: Duration) -> Client {
         .hash_auth_data(false)
         .channel_config(channel_config())
         .timeout_dur(timeout_dur)
+        .max_events(MAX_EVENTS)
         .connect()
         .unwrap()
 }

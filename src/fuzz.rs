@@ -3,36 +3,34 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Entry points for the cargo-fuzz targets in `fuzz/`. Only built with `--cfg fuzzing`, which
-//! also turns off AEAD and SipHash verification (authenticated hashes must be zero), so inputs
-//! reach the parsing a malicious peer with valid keys controls.
+//! also turns off AEAD verification (DATA packets are not decrypted), so inputs reach the
+//! parsing a malicious peer with valid keys controls.
 
-use std::{rc::Rc, sync::OnceLock};
+use std::{
+    rc::Rc,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use rand::{rngs::StdRng, SeedableRng};
 use x25519_dalek::{PublicKey, ReusableSecret};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel, Channels, Pop},
-    congestion::{CongestionConfiguration, CongestionController},
+    channel::{Channel, ChannelConfiguration},
+    codec::Reader,
+    congestion::CongestionConfig,
     crypto::Crypto,
     packets::{
-        acks::Acks,
         client_hello::ClientHello,
         connection_request::ConnectionRequest,
         connection_response::{ConnectionResponse, Transcript},
-        disconnect::Disconnect,
         info_request::InfoRequest,
         info_response::InfoResponse,
-        latency_discovery::LatencyDiscovery,
-        latency_discovery_response::LatencyDiscoveryResponse,
-        latency_discovery_response_2::LatencyDiscoveryResponse2,
         login_request::LoginRequest,
         login_response::LoginResponse,
-        reliable_payload::ReliablePayload,
         server_hello::ServerHello,
-        unreliable_payload::UnreliablePayload,
-        PacketIdentifier,
     },
+    transport::{self, frame, packet, Connection, Output},
     Cipher,
 };
 
@@ -43,12 +41,9 @@ fn secret() -> &'static ReusableSecret {
     SECRET.get_or_init(|| ReusableSecret::random_from_rng(StdRng::seed_from_u64(0)))
 }
 
-fn crypto() -> &'static Crypto {
-    static CRYPTO: OnceLock<Crypto> = OnceLock::new();
-    CRYPTO.get_or_init(|| {
-        let shared_secret = secret().diffie_hellman(&PublicKey::from(secret()));
-        Crypto::new(shared_secret, [0; 32], true, Cipher::ChaCha20Poly1305)
-    })
+fn crypto() -> Crypto {
+    let shared_secret = secret().diffie_hellman(&PublicKey::from(secret()));
+    Crypto::new(shared_secret, [0; 32], true, Cipher::ChaCha20Poly1305)
 }
 
 /// Every deserializer on the same bytes.
@@ -62,98 +57,82 @@ pub fn packets(data: &[u8]) {
     let _ = ServerHello::deserialize(&buf);
     let _ = ConnectionRequest::deserialize(&buf);
     let _ = LoginRequest::deserialize_salt(&buf);
-    let _ = LatencyDiscovery::deserialize(crypto, &buf);
-    let _ = LatencyDiscoveryResponse::deserialize(crypto, &buf);
-    let _ = LatencyDiscoveryResponse2::deserialize(crypto, &buf);
-    let _ = Acks::deserialize(crypto, &buf);
-    if let Ok(server_hello) = ServerHello::deserialize(&buf) {
-        if let ServerHello::VersionSupported {
-            server_ed25519_pubkey,
+    if let Ok(ServerHello::VersionSupported {
+        server_ed25519_pubkey,
+        cipher,
+        channel_counts,
+        ..
+    }) = ServerHello::deserialize(&buf)
+    {
+        let transcript = Transcript {
+            request: &[0; 116],
             cipher,
             channel_counts,
-            ..
-        } = server_hello
-        {
-            let transcript = Transcript {
-                request: &[0; 116],
-                cipher,
-                channel_counts,
-            };
-            let _ = ConnectionResponse::deserialize(
-                &buf,
-                server_ed25519_pubkey,
-                secret(),
-                [0; 32],
-                &transcript,
-            );
+        };
+        let _ = ConnectionResponse::deserialize(
+            &buf,
+            server_ed25519_pubkey,
+            secret(),
+            [0; 32],
+            &transcript,
+        );
+    }
+    let _ = LoginRequest::deserialize(&crypto, &mut buf);
+    let _ = LoginResponse::deserialize(&crypto, &mut buf);
+    if let Ok(header) = packet::parse_header(&buf) {
+        if let Ok(payload) = packet::open(&crypto, &header, &mut buf) {
+            let mut r = Reader::new(payload);
+            while let Ok(Some(frame)) = frame::parse(&mut r) {
+                if let frame::Frame::Ack(ack) = frame {
+                    ack.ranges().for_each(drop);
+                    ack.timestamps().for_each(drop);
+                }
+            }
         }
     }
-    let _ = LoginRequest::deserialize(crypto, &mut buf);
-    let _ = LoginResponse::deserialize(crypto, &mut buf);
-    let _ = Disconnect::deserialize(crypto, &mut buf);
-    let _ = UnreliablePayload::deserialize(crypto, &mut buf);
-    let _ = ReliablePayload::deserialize(crypto, &mut buf);
 }
 
-/// Feeds packets from a peer to one connection's channels. Inputs that aren't payloads or acks
-/// queue a message and send, so acks find packets in flight.
-pub fn channels(packets: &[Vec<u8>]) {
-    let config = ChannelConfiguration {
-        weight_unreliable: 1,
-        weights_unreliable_ordered: vec![1, 2],
-        weights_reliable: vec![1, 2],
+/// A connection fed with a peer's packets (the input's DATA headers and frames as they are).
+/// Inputs that aren't DATA packets queue a message and let time pass, so acknowledgements
+/// find packets in flight.
+pub fn channels(inputs: &[Vec<u8>]) {
+    let config = transport::Config {
+        channels: ChannelConfiguration {
+            weight_unreliable: 1,
+            weights_unreliable_ordered: vec![1, 2],
+            weights_reliable: vec![1, 2],
+            ..ChannelConfiguration::default()
+        },
+        congestion: CongestionConfig::default(),
+        max_recv_msg_size: MAX_MESSAGE_SIZE,
+        timeout: Duration::from_secs(10),
     };
-    let mut channels = Channels::new(&config, MAX_MESSAGE_SIZE);
-    let mut congestion = CongestionController::new(CongestionConfiguration::default());
-    let crypto = crypto();
+    let mut now = Instant::now();
+    let mut connection = Connection::new(crypto(), &config, now);
+    let mut outputs = Vec::new();
     let mut buf = [0u8; 1201];
-    for packet in packets {
-        let mut packet = packet.clone();
-        let Some(&identifier) = packet.first() else {
-            continue;
-        };
-        let messages = match PacketIdentifier::try_from(identifier) {
-            Ok(PacketIdentifier::Acks) => {
-                if let Ok(acks) = Acks::deserialize(crypto, &packet) {
-                    channels.handle_acks(acks, &mut congestion);
-                }
-                continue;
-            }
-            Ok(PacketIdentifier::ReliablePayloadNoAcks) => {
-                match ReliablePayload::deserialize(crypto, &mut packet) {
-                    Ok(payload) => channels.handle_reliable(payload),
-                    Err(_) => continue,
+    for input in inputs {
+        let mut input = input.clone();
+        now += Duration::from_millis(1);
+        if packet::parse_header(&input).is_ok() {
+            let _ = connection.handle(now, &mut input, true, &mut outputs);
+            for output in outputs.drain(..) {
+                match output {
+                    Output::Message(message) => assert!(message.len() <= MAX_MESSAGE_SIZE),
+                    // The connection would be closed.
+                    Output::Closed(_) | Output::Violation(_) => return,
                 }
             }
-            Ok(_) => match UnreliablePayload::deserialize(crypto, &mut packet) {
-                Ok(payload) => channels
-                    .handle_unreliable(payload)
-                    .map(|message| message.into_iter().collect()),
-                Err(_) => continue,
-            },
-            Err(_) => {
-                let channel = match packet.get(1).map_or(0, |byte| byte % 5) {
-                    0 => Channel::Unreliable,
-                    id @ (1 | 2) => Channel::UnreliableOrdered(id - 1),
-                    id => Channel::Reliable(id - 3),
-                };
-                let message = packet.get(2..).unwrap_or_default().to_vec();
-                channels.push(channel, Rc::new(message));
-                for _ in 0..64 {
-                    if !matches!(
-                        channels.pop(&mut congestion, crypto, &mut buf),
-                        Pop::Packet(_)
-                    ) {
-                        break;
-                    }
-                }
-                continue;
-            }
-        };
-        match messages {
-            Ok(messages) => assert!(messages.iter().all(|m| m.len() <= MAX_MESSAGE_SIZE)),
-            // The peer broke the protocol, the connection would be closed.
-            Err(_) => return,
+        } else {
+            let channel = match input.first().map_or(0, |byte| byte % 5) {
+                0 => Channel::Unreliable,
+                id @ (1 | 2) => Channel::UnreliableOrdered(id - 1),
+                id => Channel::Reliable(id - 3),
+            };
+            let message = input.get(1..).unwrap_or_default().to_vec();
+            connection.push(channel, Rc::new(message), now);
+            connection.on_timeout(now);
         }
+        while connection.poll_transmit(now, &mut buf).is_some() {}
     }
 }

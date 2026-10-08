@@ -62,6 +62,11 @@ impl<K: Hash + Eq, T: EventData> TimedEventQueue<K, T> {
         self.events.push(key, TimedEvent { deadline, event });
     }
 
+    /// Sets the deadline of `key`, earlier or later than before.
+    pub fn set(&mut self, key: K, deadline: Instant, event: T) {
+        self.events.push(key, TimedEvent { deadline, event });
+    }
+
     pub fn deadline(&self, key: &K) -> Option<Instant> {
         self.events.get(key).map(|(_, e)| e.deadline)
     }

@@ -4,7 +4,6 @@
 
 use hkdf::Hkdf;
 use sha2::Sha512;
-use siphasher::sip::SipHasher;
 use sym::SymCipher;
 use x25519_dalek::SharedSecret;
 
@@ -15,8 +14,6 @@ pub mod sym;
 pub(crate) struct Crypto {
     sym_out: SymCipher,
     sym_in: SymCipher,
-    siphash_out: SipHasher,
-    siphash_in: SipHasher,
 }
 
 impl Crypto {
@@ -29,25 +26,15 @@ impl Crypto {
         let hk = Hkdf::<Sha512>::new(Some(&salt), shared_secret.as_bytes());
         let mut sym_out_key = [0u8; 32];
         let mut sym_in_key = [0u8; 32];
-        let mut siphash_out_key = [0u8; 16];
-        let mut siphash_in_key = [0u8; 16];
-
         hk.expand(b"Sym Client->Server", &mut sym_out_key).unwrap();
         hk.expand(b"Sym Server->Client", &mut sym_in_key).unwrap();
-        hk.expand(b"Sip Client->Server", &mut siphash_out_key)
-            .unwrap();
-        hk.expand(b"Sip Server->Client", &mut siphash_in_key)
-            .unwrap();
         if is_server {
             std::mem::swap(&mut sym_out_key, &mut sym_in_key);
-            std::mem::swap(&mut siphash_out_key, &mut siphash_in_key);
         }
 
         Self {
             sym_out: SymCipher::new(cipher, sym_out_key),
             sym_in: SymCipher::new(cipher, sym_in_key),
-            siphash_out: SipHasher::new_with_key(&siphash_out_key),
-            siphash_in: SipHasher::new_with_key(&siphash_in_key),
         }
     }
 
@@ -69,16 +56,5 @@ impl Crypto {
         self.sym_in
             .decrypt(nonce, aad, to_decrypt, tag)
             .map_err(|_| PacketError::Tag)
-    }
-
-    pub fn hash_out(&self, data: &[u8]) -> u64 {
-        self.siphash_out.hash(data)
-    }
-
-    pub fn hash_in(&self, data: &[u8]) -> u64 {
-        if cfg!(fuzzing) {
-            return 0;
-        }
-        self.siphash_in.hash(data)
     }
 }

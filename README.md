@@ -31,8 +31,10 @@ Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
     - DoS hardening: stateless handshake cookies bound to the client address, per-IP rate limits, requests padded
       so the server never amplifies traffic
     - Key file helpers (`hexgate::keys`)
-- Timeouts, latency probes and connection statistics (RTT, jitter, loss, send rate, queued bytes)
-- Basic send-rate control (a delay-based congestion controller is being designed)
+- Latency-first congestion control: paced bursts, utilization measured from receive timestamps, queues drained
+  within a few bursts; realtime messages first, stale unreliable messages dropped instead of sent late
+- Per-tick API for games: `flush()` sends a tick as one burst, `budget_for(tick)` tells how much it may send
+- Timeouts, keepalives and connection statistics (RTT, queueing delay, send and delivery rate, loss, queued bytes)
 - Network simulation (`hexgate::sim`), both directions, on the network thread: presets from perfect to terrible,
   bottleneck with buffer and cross traffic, jitter distributions, bursty loss, spikes, stalls, outages, reordering,
   duplication, corruption
@@ -79,6 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             weight_unreliable: 10,
             weights_unreliable_ordered: vec![10],
             weights_reliable: vec![10],
+            ..ChannelConfiguration::default()
         })
         .run()?;
 
@@ -117,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             weight_unreliable: 10,
             weights_unreliable_ordered: vec![10],
             weights_reliable: vec![10],
+            ..ChannelConfiguration::default()
         })
         .start()?;
     // Queued until the connection is up.

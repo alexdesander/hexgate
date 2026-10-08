@@ -46,6 +46,10 @@ pub enum ProtocolViolation {
         /// `max_recv_msg_size`.
         max: usize,
     },
+    /// A frame that no correct peer sends: inconsistent fragments, reliable data beyond the
+    /// flow-control window.
+    #[error("received a malformed frame")]
+    Malformed,
 }
 
 /// Data longer than allowed.
@@ -97,7 +101,7 @@ pub enum ConfigError {
     /// The server info exceeds 256 bytes.
     #[error("info too large: {0}")]
     InfoTooLarge(TooLarge),
-    /// The `CongestionConfiguration` bandwidths are out of order or zero.
-    #[error("congestion config needs 0 < min_bandwidth <= start_bandwidth <= max_bandwidth")]
-    InvalidBandwidth,
+    /// The `CongestionConfig` rates are out of order or zero.
+    #[error("congestion config needs 0 < min_rate <= initial_rate <= max_rate")]
+    InvalidRate,
 }

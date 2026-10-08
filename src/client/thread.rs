@@ -3,10 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     io,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -14,51 +16,24 @@ use crossbeam::channel::{Receiver, Sender, TryRecvError};
 use mio::{Events, Poll, Waker};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel, Channels, Pop, IDS_EXHAUSTED},
-    congestion::CongestionController,
-    crypto::Crypto,
-    error::{ProtocolViolation, RecvError},
+    channel::Channel,
+    error::RecvError,
     events::EventSender,
-    packets::{
-        acks::Acks,
-        disconnect::{self, Disconnect},
-        latency_discovery::LatencyDiscovery,
-        latency_discovery_response::LatencyDiscoveryResponse,
-        latency_discovery_response_2::LatencyDiscoveryResponse2,
-        rejected,
-        reliable_payload::ReliablePayload,
-        unreliable_payload::UnreliablePayload,
-        PacketIdentifier,
-    },
+    packets::rejected,
     socket::sim::Simulator,
-    stats::{ProbeLoss, Stats},
-    timed_event_queue::TimedEventQueue,
+    stats::Stats,
+    transport::{Connection, Output},
     RECV_TOKEN, WAKE_TOKEN,
 };
 
 use super::{Event, Socket};
 
-/// Timeouts are checked this many times per timeout duration.
-const TIMEOUT_CHECKS: u32 = 4;
-
 pub enum Cmd {
     SetSimulator(Simulator),
     Disconnect(Vec<u8>),
     Send(Channel, Vec<u8>),
+    Flush,
     Stats(Sender<Stats>),
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub enum TimedEventKey {
-    CheckForTimeout,
-    Send,
-    SendAcks(u8),
-    CloseDeadline,
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TimedEventData {
-    Nothing,
 }
 
 pub struct ClientThreadState {
@@ -68,415 +43,130 @@ pub struct ClientThreadState {
     pub _waker: Arc<Waker>,
     pub socket: Socket,
     pub buf: [u8; 1201],
-
-    pub timed_events: TimedEventQueue<TimedEventKey, TimedEventData>,
-    pub crypto: Crypto,
-
-    pub latency_discoveries: BTreeMap<u32, Instant>,
-    pub latencies: BTreeSet<u32>,
-    pub probe_loss: ProbeLoss,
-
-    pub last_received: Instant,
-    pub timeout_dur: Duration,
-
-    pub channel_config: ChannelConfiguration,
-    pub channels: Channels,
-    pub congestion: CongestionController,
-    pub last_sent: Instant,
-
+    pub connection: Connection,
+    /// The send rate, for `Client::budget_for`.
+    pub rate: Arc<AtomicU64>,
     pub close_linger: Duration,
-    /// Reason of a graceful disconnect in progress.
-    pub closing: Option<Vec<u8>>,
+    pub outputs: Vec<Output>,
 }
 
 impl ClientThreadState {
     /// `pending`: commands sent during the handshake.
     pub fn run(&mut self, pending: Vec<Cmd>) -> Result<(), RecvError> {
         for cmd in pending {
-            self.handle_cmd(cmd)?;
+            self.handle_cmd(cmd);
         }
-        self.timed_events.push(
-            TimedEventKey::CheckForTimeout,
-            Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
-            TimedEventData::Nothing,
-        );
-
         let mut events = Events::with_capacity(16);
-
-        'outer: loop {
-            if self.handle_all_cmds()? || self.handle_all_events() {
-                break;
+        loop {
+            if self.handle_all_cmds() {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if self.connection.on_timeout(now) {
+                let size = self.connection.close_now(b"Timeout", now, &mut self.buf);
+                self.socket.send(&self.buf[..size]);
+                log!(debug, "timed out");
+                self.event_tx.send(Event::TimedOut);
+                return Ok(());
+            }
+            self.transmit(now);
+            if self.connection.is_closed() {
+                log!(debug, "closed");
+                return Ok(());
             }
             let deadline = self
-                .timed_events
-                .next()
+                .connection
+                .timeout(now)
                 .into_iter()
-                .chain(self.socket.next_deadline());
-            let max_poll_time = deadline.min().map(|deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .max(Duration::from_millis(1))
-            });
+                .chain(self.socket.next_deadline())
+                .min();
+            let max_poll_time =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             // A signal handler ran, nothing happened on the socket.
             match self.poll.poll(&mut events, max_poll_time) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 result => result?,
             }
-            for event in events.iter() {
-                match event.token() {
-                    RECV_TOKEN => {
-                        if self.handle_all_recvs()? {
-                            break 'outer;
-                        }
-                    }
-                    WAKE_TOKEN => {}
-                    _ => unreachable!(),
-                }
-            }
             self.socket.flush();
-            if self.socket.inbound_due() && self.handle_all_recvs()? {
-                break;
+            let readable = events.iter().any(|event| event.token() == RECV_TOKEN);
+            debug_assert!(events
+                .iter()
+                .all(|event| [RECV_TOKEN, WAKE_TOKEN].contains(&event.token())));
+            if (readable || self.socket.inbound_due()) && self.handle_all_recvs()? {
+                return Ok(());
             }
         }
-        Ok(())
     }
 
-    fn handle_all_cmds(&mut self) -> Result<bool, io::Error> {
+    fn transmit(&mut self, now: Instant) {
+        while let Some(size) = self.connection.poll_transmit(now, &mut self.buf) {
+            self.socket.send(&self.buf[..size]);
+        }
+        self.rate
+            .store(self.connection.rate() as u64, Ordering::Relaxed);
+    }
+
+    /// Returns true once all `Client` handles are gone.
+    fn handle_all_cmds(&mut self) -> bool {
         loop {
             match self.cmds.try_recv() {
-                Ok(cmd) => self.handle_cmd(cmd)?,
-                Err(TryRecvError::Empty) => return Ok(false),
-                Err(TryRecvError::Disconnected) => return Ok(true),
+                Ok(cmd) => self.handle_cmd(cmd),
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => return true,
             }
         }
     }
 
-    fn handle_cmd(&mut self, cmd: Cmd) -> Result<(), io::Error> {
+    fn handle_cmd(&mut self, cmd: Cmd) {
+        let now = Instant::now();
         match cmd {
-            Cmd::Disconnect(data) => {
-                if self.closing.is_none() {
-                    let now = Instant::now();
-                    self.closing = Some(data);
-                    self.timed_events.push(
-                        TimedEventKey::CloseDeadline,
-                        now + self.close_linger,
-                        TimedEventData::Nothing,
-                    );
-                    self.timed_events
-                        .push(TimedEventKey::Send, now, TimedEventData::Nothing);
-                }
-            }
-            Cmd::Send(..) if self.closing.is_some() => {}
-            Cmd::Send(channel, payload) => {
-                self.channels.push(channel, Rc::new(payload));
-                self.timed_events.push(
-                    TimedEventKey::Send,
-                    self.last_sent + self.congestion.downtime_between_batches(),
-                    TimedEventData::Nothing,
-                );
-            }
+            Cmd::Disconnect(reason) => self.connection.close(reason.into(), self.close_linger, now),
+            Cmd::Send(channel, message) => self.connection.push(channel, Rc::new(message), now),
+            Cmd::Flush => self.connection.flush(),
             Cmd::Stats(reply) => {
-                let _ = reply.send(Stats::new(
-                    &self.congestion,
-                    &self.channels,
-                    &self.probe_loss,
-                ));
+                let _ = reply.send(self.connection.stats());
             }
             Cmd::SetSimulator(simulator) => self.socket.set_simulator(simulator),
         }
-        Ok(())
     }
 
-    fn handle_all_events(&mut self) -> bool {
-        while self
-            .timed_events
-            .next()
-            .is_some_and(|deadline| deadline <= Instant::now())
-        {
-            let (key, _event) = self.timed_events.pop().unwrap();
-            match key {
-                TimedEventKey::Send => {
-                    if self.handle_event_send() {
-                        return true;
-                    }
-                }
-                TimedEventKey::SendAcks(channel_id) => self.handle_event_send_acks(channel_id),
-                TimedEventKey::CloseDeadline => {
-                    self.finish_close();
-                    return true;
-                }
-                TimedEventKey::CheckForTimeout => {
-                    if self.last_received.elapsed() > self.timeout_dur {
-                        let disconnect = Disconnect { data: b"Timeout" };
-                        let size = disconnect.serialize(&self.crypto, &mut self.buf);
-                        self.socket.send(&self.buf[..size]);
-                        log!(debug, "timed out");
-                        self.event_tx.send(Event::TimedOut);
-                        return true;
-                    } else {
-                        self.timed_events.push(
-                            TimedEventKey::CheckForTimeout,
-                            Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,
-                            TimedEventData::Nothing,
-                        );
-                    }
-                }
-            }
-        }
-        false
-    }
-
+    /// Returns true when the connection ended.
     fn handle_all_recvs(&mut self) -> Result<bool, io::Error> {
         while let Some((size, _)) = self.socket.recv_from(&mut self.buf)? {
             if size == 0 || size > 1200 {
                 log!(trace, size, "dropped datagram of invalid size");
                 continue;
             }
-            let Ok(packet_identifier) = PacketIdentifier::try_from(self.buf[0])
-                .inspect_err(|e| rejected("datagram", "server", *e))
-            else {
-                continue;
-            };
-            let shutdown = match packet_identifier {
-                PacketIdentifier::Disconnect => self.handle_packet_disconnect(size),
-                PacketIdentifier::LatencyDiscovery => self.handle_packet_latency_discovery(size),
-                PacketIdentifier::LatencyDiscoveryResponse2 => {
-                    self.handle_packet_latency_response_2(size)
+            let now = Instant::now();
+            let accept = self.event_tx.has_room();
+            if let Err(error) =
+                self.connection
+                    .handle(now, &mut self.buf[..size], accept, &mut self.outputs)
+            {
+                rejected("datagram", "server", error);
+            }
+            for output in std::mem::take(&mut self.outputs) {
+                match output {
+                    Output::Message(message) => self.event_tx.send(Event::Received(message)),
+                    Output::Closed(reason) => {
+                        self.transmit(now);
+                        log!(debug, "disconnected by server");
+                        self.event_tx.send(Event::Disconnected(reason));
+                        return Ok(true);
+                    }
+                    Output::Violation(violation) => {
+                        let reason = violation.to_string();
+                        let size = self
+                            .connection
+                            .close_now(reason.as_bytes(), now, &mut self.buf);
+                        self.socket.send(&self.buf[..size]);
+                        log!(warn, %violation, "protocol violation");
+                        self.event_tx.send(Event::Violation(violation));
+                        return Ok(true);
+                    }
                 }
-                PacketIdentifier::UnreliableStandalonePayload
-                | PacketIdentifier::UnreliableFragmentedPayload
-                | PacketIdentifier::UnreliableFragmentedPayloadLast
-                | PacketIdentifier::UnreliableOrderedStandalonePayload
-                | PacketIdentifier::UnreliableOrderedFragmentedPayload
-                | PacketIdentifier::UnreliableOrderedFragmentedPayloadLast => {
-                    self.handle_packet_unreliable_payload(size)
-                }
-                PacketIdentifier::ReliablePayloadNoAcks => {
-                    self.handle_packet_reliable_payload(size)
-                }
-                PacketIdentifier::Acks => self.handle_packet_acks(size),
-                _ => false,
-            };
-            if shutdown {
-                return Ok(true);
             }
         }
         Ok(false)
-    }
-
-    /// Returns true when the connection had to be closed.
-    fn handle_event_send(&mut self) -> bool {
-        let now = Instant::now();
-        let downtime = self.congestion.downtime_between_batches();
-        while self.congestion.can_send(now) {
-            match self
-                .channels
-                .pop(&mut self.congestion, &self.crypto, &mut self.buf)
-            {
-                Pop::Packet(size) => {
-                    self.last_sent = now;
-                    self.socket.send(&self.buf[..size]);
-                    self.congestion.consume(size);
-                }
-                Pop::Wait(time_till_resend) => {
-                    let deadline = (now + time_till_resend).max(self.last_sent + downtime);
-                    self.timed_events
-                        .push(TimedEventKey::Send, deadline, TimedEventData::Nothing);
-                    return false;
-                }
-                Pop::Idle if self.closing.is_some() => {
-                    self.finish_close();
-                    return true;
-                }
-                Pop::Idle => return false,
-                Pop::Exhausted => {
-                    let disconnect = Disconnect {
-                        data: IDS_EXHAUSTED,
-                    };
-                    let size = disconnect.serialize(&self.crypto, &mut self.buf);
-                    self.socket.send(&self.buf[..size]);
-                    self.event_tx
-                        .send(Event::Disconnected(IDS_EXHAUSTED.to_vec()));
-                    log!(warn, "message ids exhausted");
-                    return true;
-                }
-            }
-        }
-        self.timed_events.push(
-            TimedEventKey::Send,
-            now + self.congestion.time_until_send().max(downtime),
-            TimedEventData::Nothing,
-        );
-        false
-    }
-
-    /// Ends a graceful disconnect: everything was sent and acked, or the linger ran out.
-    fn finish_close(&mut self) {
-        let Some(reason) = &self.closing else {
-            return;
-        };
-        log!(debug, "closed");
-        let size = Disconnect { data: reason }.serialize(&self.crypto, &mut self.buf);
-        for _ in 0..disconnect::REPEATS {
-            self.socket.send(&self.buf[..size]);
-        }
-    }
-
-    fn handle_event_send_acks(&mut self, channel_id: u8) {
-        let acks = self.channels.acks(Channel::Reliable(channel_id));
-        let size = acks.serialize(&self.crypto, &mut self.buf);
-        self.socket.send(&self.buf[..size]);
-    }
-
-    fn handle_packet_disconnect(&mut self, size: usize) -> bool {
-        let Ok(disconnect) = Disconnect::deserialize(&self.crypto, &mut self.buf[..size])
-            .inspect_err(|e| rejected("Disconnect", "server", *e))
-        else {
-            return false;
-        };
-        self.event_tx
-            .send(Event::Disconnected(disconnect.data.to_vec()));
-        log!(debug, "disconnected by server");
-        true
-    }
-
-    fn handle_packet_latency_discovery(&mut self, size: usize) -> bool {
-        let Ok(latency_discovery) = LatencyDiscovery::deserialize(&self.crypto, &self.buf[..size])
-            .inspect_err(|e| rejected("LatencyDiscovery", "server", *e))
-        else {
-            return false;
-        };
-        if self
-            .latency_discoveries
-            .contains_key(&latency_discovery.sequence_number)
-        {
-            return false;
-        }
-        self.latency_discoveries
-            .insert(latency_discovery.sequence_number, Instant::now());
-        self.probe_loss.probe(latency_discovery.sequence_number);
-        if self.latency_discoveries.len() > 63 {
-            self.latency_discoveries.pop_first();
-        }
-
-        let mut latency_discovery_response = LatencyDiscoveryResponse {
-            sequence_number: latency_discovery.sequence_number,
-            truncated_siphash: 0,
-        };
-        let size = latency_discovery_response.serialize(&self.crypto, &mut self.buf);
-        self.socket.send(&self.buf[..size]);
-
-        self.last_received = Instant::now();
-        false
-    }
-
-    fn handle_packet_latency_response_2(&mut self, size: usize) -> bool {
-        let Ok(latency_discovery_response_2) =
-            LatencyDiscoveryResponse2::deserialize(&self.crypto, &self.buf[..size])
-                .inspect_err(|e| rejected("LatencyDiscoveryResponse2", "server", *e))
-        else {
-            return false;
-        };
-        if self
-            .latencies
-            .contains(&latency_discovery_response_2.sequence_number)
-        {
-            return false;
-        }
-        let Some(sent) = self
-            .latency_discoveries
-            .get(&latency_discovery_response_2.sequence_number)
-        else {
-            // TODO: Deal with really bad connections
-            return false;
-        };
-        let latency = sent.elapsed();
-        self.congestion.update_latency(latency);
-        self.probe_loss
-            .answered(latency_discovery_response_2.sequence_number);
-        self.latencies
-            .insert(latency_discovery_response_2.sequence_number);
-        if self.latencies.len() > 19 {
-            self.latencies.pop_first();
-        }
-
-        self.last_received = Instant::now();
-        false
-    }
-
-    fn handle_packet_unreliable_payload(&mut self, size: usize) -> bool {
-        if self.closing.is_some() || !self.event_tx.has_room() {
-            return false;
-        }
-        let Ok(packet) = UnreliablePayload::deserialize(&self.crypto, &mut self.buf[0..size])
-            .inspect_err(|e| rejected("UnreliablePayload", "server", *e))
-        else {
-            return false;
-        };
-        self.last_received = Instant::now();
-        match self.channels.handle_unreliable(packet) {
-            Ok(Some(message)) => self.event_tx.send(Event::Received(message)),
-            Ok(None) => {}
-            Err(violation) => return self.handle_violation(violation),
-        }
-        false
-    }
-
-    fn handle_packet_reliable_payload(&mut self, size: usize) -> bool {
-        if self.closing.is_some() || !self.event_tx.has_room() {
-            return false;
-        }
-        let Ok(packet) = ReliablePayload::deserialize(&self.crypto, &mut self.buf[..size])
-            .inspect_err(|e| rejected("ReliablePayload", "server", *e))
-        else {
-            return false;
-        };
-        self.last_received = Instant::now();
-        if packet.channel_id() as usize >= self.channel_config.weights_reliable.len() {
-            return false;
-        }
-        self.timed_events.push(
-            TimedEventKey::SendAcks(packet.channel_id()),
-            Instant::now() + self.congestion.ack_delay(),
-            TimedEventData::Nothing,
-        );
-        match self.channels.handle_reliable(packet) {
-            Ok(messages) => {
-                for message in messages {
-                    self.event_tx.send(Event::Received(message));
-                }
-            }
-            Err(violation) => return self.handle_violation(violation),
-        }
-        false
-    }
-
-    fn handle_packet_acks(&mut self, size: usize) -> bool {
-        let Ok(acks) = Acks::deserialize(&self.crypto, &self.buf[..size])
-            .inspect_err(|e| rejected("Acks", "server", *e))
-        else {
-            return false;
-        };
-        self.last_received = Instant::now();
-        self.channels.handle_acks(acks, &mut self.congestion);
-        // Acks can open the window or reveal losses.
-        self.timed_events.push(
-            TimedEventKey::Send,
-            self.last_sent + self.congestion.downtime_between_batches(),
-            TimedEventData::Nothing,
-        );
-        false
-    }
-
-    fn handle_violation(&mut self, violation: ProtocolViolation) -> bool {
-        let reason = violation.to_string();
-        let disconnect = Disconnect {
-            data: reason.as_bytes(),
-        };
-        let size = disconnect.serialize(&self.crypto, &mut self.buf);
-        self.socket.send(&self.buf[..size]);
-        log!(warn, %violation, "protocol violation");
-        self.event_tx.send(Event::Violation(violation));
-        true
     }
 }

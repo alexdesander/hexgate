@@ -75,13 +75,27 @@
 //! Dropping the last handle closes the connections gracefully (see `close_linger`) and joins the
 //! threads.
 //!
+//! # Congestion control
+//!
+//! Each connection sends at the rate its congestion controller allows (see
+//! [`CongestionConfig`]). The controller keeps the queues in the network near empty: it sends
+//! in short paced bursts, measures from the acknowledgements' receive timestamps how fast the
+//! bottleneck delivered them, and backs off within a few bursts when it overloads the path.
+//! Unreliable messages go first and are dropped when they waited longer than
+//! `unreliable_max_age`, instead of arriving late.
+//!
+//! Games that call `flush()` at the end of every tick send each tick's messages as one burst,
+//! and can ask `budget_for(tick)` how many bytes the next tick may send without queueing.
+//! `stats()` tells the round-trip time, queueing delay, send rate and whether the connection
+//! is congested.
+//!
 //! # Backpressure
 //!
 //! Events are queued for the app. Connection events are always delivered; received messages
 //! only while fewer than `max_events` events are queued. Above that, unreliable messages are
 //! dropped and reliable packets stay unacknowledged until the app catches up, so the peer resends
-//! them. Sent messages are queued without a limit and leave at the congestion controller's rate;
-//! [`Stats::queued_bytes`] tells how much is waiting.
+//! them. Sent reliable messages are queued without a limit and leave at the congestion
+//! controller's rate; [`Stats::queued_bytes`] tells how much is waiting.
 //!
 //! # Size limits
 //!
@@ -89,7 +103,7 @@
 //!   larger message violates the protocol and is disconnected.
 //! - `auth_data`: 1177 bytes, unless hashed with `hash_auth_data`.
 //! - Login failure data (returned by the `Authenticator`): 1181 bytes, longer data is truncated.
-//! - Disconnect and shutdown reasons: 1183 bytes.
+//! - Disconnect and shutdown reasons: 1170 bytes.
 //! - Server info (see [`client::request_infos`]): 256 bytes.
 //!
 //! # Security
@@ -106,10 +120,9 @@
 //!   `hash_auth_data` sends an Argon2id hash salted with the server's key and `auth_salt`
 //!   instead. That hash is as good as the password for this server, so hash it again before
 //!   storing it. Limit failed attempts per account in the authenticator.
-//! - **Traffic.** Messages are encrypted and authenticated with AES-256-GCM or
-//!   ChaCha20-Poly1305 ([`Cipher`]), with one key per direction. Acks and latency probes are
-//!   only authenticated (SipHash). Replayed and duplicated packets are dropped. A connection is
-//!   closed before its message ids would wrap; there is no rekeying.
+//! - **Traffic.** After the handshake, every packet is encrypted and authenticated with
+//!   AES-256-GCM or ChaCha20-Poly1305 ([`Cipher`]), with one key per direction and the packet
+//!   number as nonce. Replayed and duplicated packets are dropped. There is no rekeying.
 //! - Keep the server's `secret_key` and `auth_salt` secret and stable, see [`keys`].
 
 #![warn(missing_docs)]
@@ -135,7 +148,7 @@ pub mod server;
 pub use client::{Client, ServerKey};
 pub use common::{
     channel::{Channel, ChannelConfiguration},
-    congestion::CongestionConfiguration,
+    congestion::{Congestion, CongestionConfig},
     error, fingerprint, keys,
     socket::sim::{self, NetworkSimulator, Simulator},
     stats::Stats,

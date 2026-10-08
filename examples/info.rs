@@ -28,7 +28,7 @@ fn main() {
         .secret_key(keys::generate())
         .auth_salt(keys::generate())
         .authenticator(MockAuthenticator)
-        .channel_config(ChannelConfiguration { weight_unreliable: 10, weights_unreliable_ordered: vec![10], weights_reliable: vec![10] })
+        .channel_config(ChannelConfiguration::default())
         .run()
         .unwrap();
 

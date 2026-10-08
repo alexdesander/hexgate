@@ -21,6 +21,7 @@ pub fn channel_config() -> ChannelConfiguration {
         weight_unreliable: 10,
         weights_unreliable_ordered: vec![10; 2],
         weights_reliable: vec![10; 3],
+        ..ChannelConfiguration::default()
     }
 }
 

@@ -2,54 +2,34 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{rc::Rc, time::Instant};
 
-use reliable::ReliableChannel;
+use reliable::{RecvStream, SendStream};
 pub use scheduler::ChannelConfiguration;
 use scheduler::Scheduler;
-use unreliable::UnreliableChannel;
-use unreliable_ordered::UnreliableOrderedChannel;
+use unreliable::{AssemblyBudget, UnreliableRecv, UnreliableSend, Write};
 
 use super::{
-    congestion::CongestionController,
-    crypto::Crypto,
+    codec::Writer,
     error::{ProtocolViolation, SendError, TooLarge},
-    packets::{
-        acks::Acks, reliable_payload::ReliablePayload, unreliable_payload::UnreliablePayload,
-    },
+    transport::frame::Fragment,
 };
 
-mod fragments;
+mod ranges;
 mod reliable;
 pub(crate) mod scheduler;
 mod unreliable;
-mod unreliable_ordered;
 
-// TODO: Implement a scheduler and use it here to make the weights actually do something.
-
-/// Sent to the peer when a message id counter is used up.
-pub(crate) const IDS_EXHAUSTED: &[u8] = b"Message ids exhausted";
-
-pub(crate) enum Pop {
-    /// A packet of this size was written (`peek`: can be sent now).
-    Packet(usize),
-    /// Nothing can be sent before then (reliable retransmissions).
-    Wait(Duration),
-    /// Nothing is queued.
-    Idle,
-    /// A message id counter is used up, sending more would reuse AEAD nonces.
-    Exhausted,
-}
+/// Fragment assemblies of a connection may hold this many times `max_recv_msg_size`.
+const ASSEMBLY_BUDGET: usize = 4;
 
 /// Where a message is sent, which decides its delivery guarantees. Each channel has its own
 /// queue, so a full reliable channel doesn't delay the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Channel {
     /// Messages may get lost or arrive out of order, never twice. A message larger than one
-    /// packet (about 1.1 KiB) is lost when any of its fragments is.
+    /// packet (about 1.1 KiB) is lost when any of its fragments is. Messages that waited
+    /// longer than `unreliable_max_age` to be sent are dropped.
     Unreliable,
     /// Like `Unreliable`, but a message older than the newest one received on this channel is
     /// dropped (sequenced).
@@ -88,156 +68,246 @@ impl SendLimits {
     }
 }
 
+/// Reliable stream bytes a packet carried.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StreamRange {
+    pub channel: u8,
+    pub start: u64,
+    pub len: u32,
+}
+
+impl StreamRange {
+    fn range(&self) -> std::ops::Range<u64> {
+        self.start..self.start + u64::from(self.len)
+    }
+}
+
+/// The reliable frames of one packet.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StreamFrames {
+    ranges: [StreamRange; 4],
+    len: u8,
+}
+
+impl StreamFrames {
+    fn is_full(&self) -> bool {
+        self.len as usize == self.ranges.len()
+    }
+
+    fn push(&mut self, range: StreamRange) {
+        self.ranges[self.len as usize] = range;
+        self.len += 1;
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = StreamRange> + '_ {
+        self.ranges[..self.len as usize].iter().copied()
+    }
+}
+
 pub(crate) struct Channels {
     max_recv_msg_size: usize,
     scheduler: Scheduler,
-    unreliable: UnreliableChannel,
-    unreliable_ordered: Vec<UnreliableOrderedChannel>,
-    reliable: Vec<ReliableChannel>,
+    /// `Channel::Unreliable` first, then the ordered ones.
+    unreliable: Vec<(UnreliableSend, UnreliableRecv)>,
+    reliable: Vec<(SendStream, RecvStream)>,
+    budget: AssemblyBudget,
+    /// Slots whose next frame didn't fit into the packet being written.
+    no_room: Vec<bool>,
 }
 
 impl Channels {
     pub fn new(config: &ChannelConfiguration, max_recv_msg_size: usize) -> Self {
+        let max_age = config.unreliable_max_age;
+        let unreliable = std::iter::once((
+            UnreliableSend::new(None, max_age),
+            UnreliableRecv::new(false),
+        ))
+        .chain((0..config.weights_unreliable_ordered.len()).map(|id| {
+            (
+                UnreliableSend::new(Some(id as u8), max_age),
+                UnreliableRecv::new(true),
+            )
+        }))
+        .collect();
+        let reliable = (0..config.weights_reliable.len())
+            .map(|_| (SendStream::default(), RecvStream::new(max_recv_msg_size)))
+            .collect();
+        let scheduler = Scheduler::new(config);
         Self {
             max_recv_msg_size,
-            scheduler: Scheduler::new(config),
-            unreliable: UnreliableChannel::new(max_recv_msg_size),
-            unreliable_ordered: (0..config.weights_unreliable_ordered.len())
-                .map(|i| UnreliableOrderedChannel::new(i.try_into().unwrap(), max_recv_msg_size))
-                .collect(),
-            reliable: (0..config.weights_reliable.len())
-                .map(|i| ReliableChannel::new(i.try_into().unwrap(), max_recv_msg_size))
-                .collect(),
+            no_room: vec![false; scheduler.slots()],
+            scheduler,
+            unreliable,
+            reliable,
+            budget: AssemblyBudget {
+                left: max_recv_msg_size.saturating_mul(ASSEMBLY_BUDGET),
+            },
         }
     }
 
-    pub fn push(&mut self, channel: Channel, message: Rc<Vec<u8>>) {
+    pub fn push(&mut self, channel: Channel, message: Rc<Vec<u8>>, now: Instant) {
         match channel {
-            Channel::Unreliable => self.unreliable.push(message),
-            Channel::UnreliableOrdered(channel_id) => {
-                self.unreliable_ordered[channel_id as usize].push(message)
-            }
-            Channel::Reliable(channel_id) => self.reliable[channel_id as usize].push(message),
+            Channel::Unreliable => self.unreliable[0].0.push(message, now),
+            Channel::UnreliableOrdered(id) => self.unreliable[id as usize + 1].0.push(message, now),
+            Channel::Reliable(id) => self.reliable[id as usize].0.push(message),
         }
     }
 
-    /// Encrypts the next packet into `buf`.
-    pub fn pop(
+    /// Size of the next frame of `slot` in an empty packet of `capacity`, 0 if it has none.
+    fn next_size(&mut self, slot: usize, now: Instant, capacity: usize) -> usize {
+        match self.unreliable.get_mut(slot) {
+            Some((send, _)) => match send.ready(now) {
+                true => send.next_size(capacity),
+                false => 0,
+            },
+            None => {
+                (self.reliable[slot - self.unreliable.len()].0.sendable() as usize).min(capacity)
+            }
+        }
+    }
+
+    /// Whether a channel has something to send. Drops expired unreliable messages.
+    pub fn has_data(&mut self, now: Instant) -> bool {
+        (0..self.scheduler.slots()).any(|slot| self.next_size(slot, now, 1) > 0)
+    }
+
+    /// Whether an unreliable channel has something to send.
+    pub fn has_realtime(&mut self, now: Instant) -> bool {
+        (0..self.unreliable.len()).any(|slot| self.next_size(slot, now, 1) > 0)
+    }
+
+    /// Fills the packet with frames in fair-queueing order, only from the unreliable channels
+    /// if `realtime_only`. `capacity` is the room of an empty packet. Returns whether anything
+    /// was written.
+    pub fn write(
         &mut self,
-        congestion: &mut CongestionController,
-        crypto: &Crypto,
-        buf: &mut [u8],
-    ) -> Pop {
-        let now = Instant::now();
-        let mut next: Option<(u64, usize)> = None;
-        let mut wait: Option<Duration> = None;
-        for slot in 0..self.scheduler.slots() {
-            match self.peek(slot, now) {
-                Pop::Packet(size) => {
-                    let tag = self.scheduler.tag(slot, size);
-                    if next.is_none_or(|(best, _)| tag < best) {
-                        next = Some((tag, slot));
-                    }
-                }
-                other => {
+        now: Instant,
+        w: &mut Writer,
+        (capacity, realtime_only): (usize, bool),
+        frames: &mut StreamFrames,
+    ) -> bool {
+        let unreliable = self.unreliable.len();
+        let slots = if realtime_only {
+            unreliable
+        } else {
+            self.scheduler.slots()
+        };
+        self.no_room.fill(false);
+        let mut wrote = false;
+        loop {
+            let mut best: Option<(u64, usize)> = None;
+            let mut backlogged = false;
+            for slot in 0..slots {
+                let size = self.next_size(slot, now, capacity);
+                if size == 0 {
                     self.scheduler.clear(slot);
-                    if let Pop::Wait(slot_wait) = other {
-                        wait = Some(wait.map_or(slot_wait, |wait| wait.min(slot_wait)));
-                    }
+                    continue;
+                }
+                backlogged = true;
+                if self.no_room[slot] || (slot >= unreliable && frames.is_full()) {
+                    continue;
+                }
+                let tag = self.scheduler.tag(slot, size);
+                if best.is_none_or(|(best, _)| tag < best) {
+                    best = Some((tag, slot));
                 }
             }
+            if !backlogged {
+                self.scheduler.reset();
+            }
+            let Some((_, slot)) = best else {
+                return wrote;
+            };
+            let written = match self.unreliable.get_mut(slot) {
+                Some((send, _)) => matches!(send.write(w, capacity), Write::Wrote),
+                None => {
+                    let channel = (slot - unreliable) as u8;
+                    let range = self.reliable[channel as usize].0.write(channel, w);
+                    if let Some(range) = &range {
+                        frames.push(StreamRange {
+                            channel,
+                            start: range.start,
+                            len: (range.end - range.start) as u32,
+                        });
+                    }
+                    range.is_some()
+                }
+            };
+            if written {
+                self.scheduler.served(slot);
+                wrote = true;
+            } else {
+                self.no_room[slot] = true;
+            }
         }
-        let Some((_, slot)) = next else {
-            self.scheduler.reset();
-            return wait.map_or(Pop::Idle, Pop::Wait);
-        };
-        self.scheduler.served(slot);
-        let ordered = self.unreliable_ordered.len();
-        let size = match slot {
-            0 => self.unreliable.pop(crypto, buf),
-            slot if slot <= ordered => self.unreliable_ordered[slot - 1].pop(crypto, buf),
-            slot => Some(self.reliable[slot - 1 - ordered].pop(now, congestion, crypto, buf)),
-        };
-        size.map_or(Pop::Exhausted, Pop::Packet)
     }
 
-    fn peek(&mut self, slot: usize, now: Instant) -> Pop {
-        let ordered = self.unreliable_ordered.len();
-        let size = match slot {
-            0 => self.unreliable.peek_size(),
-            slot if slot <= ordered => self.unreliable_ordered[slot - 1].peek_size(),
-            slot => return self.reliable[slot - 1 - ordered].peek(now),
-        };
-        if size > 0 {
-            Pop::Packet(size)
-        } else {
-            Pop::Idle
+    pub fn on_acked(&mut self, frames: &StreamFrames) {
+        for range in frames.iter() {
+            self.reliable[range.channel as usize]
+                .0
+                .on_acked(range.range());
         }
     }
 
+    pub fn on_lost(&mut self, frames: &StreamFrames) {
+        for range in frames.iter() {
+            self.reliable[range.channel as usize]
+                .0
+                .on_lost(range.range());
+        }
+    }
+
+    /// Handles an UNRELIABLE frame, returns a complete message.
+    pub fn on_unreliable(
+        &mut self,
+        channel: Option<u8>,
+        msg_id: u64,
+        fragment: Option<Fragment>,
+        data: &[u8],
+    ) -> Result<Option<Vec<u8>>, ProtocolViolation> {
+        let slot = channel.map_or(0, |id| id as usize + 1);
+        let Some((_, recv)) = self.unreliable.get_mut(slot) else {
+            return Ok(None);
+        };
+        recv.on_frame(
+            msg_id,
+            fragment,
+            data,
+            self.max_recv_msg_size,
+            &mut self.budget,
+        )
+    }
+
+    /// Handles a RELIABLE frame, complete messages go to `out`.
+    pub fn on_reliable(
+        &mut self,
+        channel: u8,
+        offset: u64,
+        data: &[u8],
+        out: &mut impl FnMut(Vec<u8>),
+    ) -> Result<(), ProtocolViolation> {
+        match self.reliable.get_mut(channel as usize) {
+            Some((_, recv)) => recv.on_frame(offset, data, out),
+            None => Ok(()),
+        }
+    }
+
+    /// Bytes waiting to be sent, plus reliable bytes waiting for an acknowledgement.
     pub fn queued_bytes(&self) -> usize {
-        self.unreliable.queued_bytes()
-            + self
-                .unreliable_ordered
-                .iter()
-                .map(UnreliableOrderedChannel::queued_bytes)
-                .sum::<usize>()
+        self.unreliable
+            .iter()
+            .map(|(send, _)| send.queued_bytes())
+            .sum::<usize>()
             + self
                 .reliable
                 .iter()
-                .map(ReliableChannel::queued_bytes)
+                .map(|(send, _)| send.queued_bytes() as usize)
                 .sum::<usize>()
     }
 
-    pub fn handle_unreliable(
-        &mut self,
-        packet: UnreliablePayload,
-    ) -> Result<Option<Vec<u8>>, ProtocolViolation> {
-        match packet {
-            UnreliablePayload::Standalone { payload, .. }
-            | UnreliablePayload::OrderedStandalone { payload, .. }
-                if payload.len() > self.max_recv_msg_size =>
-            {
-                Err(ProtocolViolation::MessageTooLarge {
-                    max: self.max_recv_msg_size,
-                })
-            }
-            UnreliablePayload::Standalone { .. } | UnreliablePayload::Fragmented { .. } => {
-                self.unreliable.handle(packet)
-            }
-            UnreliablePayload::OrderedStandalone { channel_id, .. }
-            | UnreliablePayload::OrderedFragmented { channel_id, .. } => {
-                if channel_id as usize >= self.unreliable_ordered.len() {
-                    return Ok(None);
-                }
-                self.unreliable_ordered[channel_id as usize].handle(packet)
-            }
-        }
-    }
-
-    pub fn handle_reliable(
-        &mut self,
-        packet: ReliablePayload,
-    ) -> Result<Vec<Vec<u8>>, ProtocolViolation> {
-        if packet.channel_id() as usize >= self.reliable.len() {
-            return Ok(Vec::new());
-        }
-        self.reliable[packet.channel_id() as usize].handle(packet.to_owned())
-    }
-
-    pub fn acks(&mut self, channel: Channel) -> Acks {
-        match channel {
-            Channel::Reliable(channel_id) => self.reliable[channel_id as usize].acks(),
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn handle_acks(&mut self, acks: Acks, congestion: &mut CongestionController) {
-        let Some(channel) = self.reliable.get_mut(acks.channel_id as usize) else {
-            return;
-        };
-        if let Some(rtt) = channel.handle_acks(acks) {
-            congestion.update_rtt(rtt);
-        }
+    /// Unreliable messages dropped because they waited too long.
+    pub fn expired(&self) -> u64 {
+        self.unreliable.iter().map(|(send, _)| send.expired).sum()
     }
 }

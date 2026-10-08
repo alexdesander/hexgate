@@ -9,7 +9,10 @@ use std::{
     io::{self, ErrorKind},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     panic::{self, AssertUnwindSafe},
-    sync::{mpsc, Arc, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, OnceLock,
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -22,14 +25,14 @@ use mio::{Interest, Poll, Waker};
 use thread::{ClientThreadState, Cmd};
 
 use crate::common::{
-    channel::{scheduler::ChannelConfiguration, Channel, Channels, SendLimits},
-    congestion::{CongestionConfiguration, CongestionController},
+    channel::{scheduler::ChannelConfiguration, Channel, SendLimits},
+    congestion::CongestionConfig,
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver},
-    packets::{disconnect, info_request::InfoRequest, info_response::InfoResponse, login_request},
+    packets::{info_request::InfoRequest, info_response::InfoResponse, login_request},
     socket::{is_transient, sim::Simulator, Socket},
     stats::Stats,
-    timed_event_queue::TimedEventQueue,
+    transport::{self, Connection},
     AllowedClientVersions, ClientVersion, RECV_TOKEN, WAKE_TOKEN,
 };
 
@@ -214,10 +217,25 @@ impl Client {
         Ok(())
     }
 
+    /// Ends a tick: the messages sent since the last flush leave together, as one paced burst.
+    /// Optional; once called, sent messages wait for the next flush (at most two tick
+    /// intervals). Without it, messages leave as soon as the send rate allows.
+    pub fn flush(&self) {
+        let _ = self.inner.cmd_tx.send(Cmd::Flush);
+        let _ = self.inner.waker.wake();
+    }
+
+    /// The bytes the next tick of length `tick` may send without queueing: the congestion
+    /// controller's send rate times the tick. Fill snapshots up to this in priority order.
+    /// 0 before the connection is established.
+    pub fn budget_for(&self, tick: Duration) -> usize {
+        (self.inner.rate.load(Ordering::Relaxed) as f64 * tick.as_secs_f64()) as usize
+    }
+
     /// Closes the connection once queued messages were sent and acknowledged, or after
-    /// `close_linger`. Later sends are dropped. The data is sent to the server, at most 1183 bytes.
+    /// `close_linger`. Later sends are dropped. The data is sent to the server, at most 1170 bytes.
     pub fn disconnect(&self, data: Vec<u8>) -> Result<(), TooLarge> {
-        TooLarge::check(data.len(), disconnect::MAX_DATA_SIZE)?;
+        TooLarge::check(data.len(), transport::MAX_REASON_SIZE)?;
         let _ = self.inner.cmd_tx.send(Cmd::Disconnect(data));
         let _ = self.inner.waker.wake();
         Ok(())
@@ -261,6 +279,7 @@ impl fmt::Debug for Client {
 
 struct ClientInner {
     server_key: Arc<OnceLock<[u8; 32]>>,
+    rate: Arc<AtomicU64>,
     cmd_tx: Sender<Cmd>,
     event_rx: EventReceiver<Event>,
     waker: Arc<Waker>,
@@ -313,7 +332,7 @@ impl Client {
         channel_config: ChannelConfiguration,
         /// Send rate limits.
         #[builder(default)]
-        congestion_config: CongestionConfiguration,
+        congestion_config: CongestionConfig,
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
@@ -381,6 +400,14 @@ impl Client {
         let _waker = waker.clone();
         let server_key = Arc::new(OnceLock::new());
         let thread_server_key = server_key.clone();
+        let rate = Arc::new(AtomicU64::new(0));
+        let thread_rate = rate.clone();
+        let config = transport::Config {
+            channels: channel_config,
+            congestion: congestion_config,
+            max_recv_msg_size,
+            timeout: timeout_dur,
+        };
         let thread = std::thread::Builder::new()
             .name("hexgate-client".into())
             .spawn(move || {
@@ -410,24 +437,10 @@ impl Client {
                         _waker,
                         socket,
                         buf: [0u8; 1201],
-
-                        timed_events: TimedEventQueue::new(),
-                        crypto,
-
-                        latency_discoveries: Default::default(),
-                        latencies: Default::default(),
-                        probe_loss: Default::default(),
-
-                        last_received: Instant::now(),
-                        timeout_dur,
-
-                        channels: Channels::new(&channel_config, max_recv_msg_size),
-                        channel_config,
-                        congestion: CongestionController::new(congestion_config),
-                        last_sent: Instant::now(),
-
+                        connection: Connection::new(crypto, &config, Instant::now()),
+                        rate: thread_rate,
                         close_linger,
-                        closing: None,
+                        outputs: Vec::new(),
                     };
                     state.run(pending)
                 }))
@@ -443,6 +456,7 @@ impl Client {
             local_addr,
             inner: Arc::new(ClientInner {
                 server_key,
+                rate,
                 cmd_tx,
                 event_rx,
                 waker,

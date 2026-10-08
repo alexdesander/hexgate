@@ -27,6 +27,7 @@ fn main() -> anyhow::Result<()> {
             weight_unreliable: 10,
             weights_unreliable_ordered: vec![10, 10, 10, 10, 10],
             weights_reliable: vec![10, 10, 10, 10, 10],
+            ..ChannelConfiguration::default()
         })
         .connect()?;
     if let (None, Some(server_key)) = (known_server_key, client.get_server_key()) {

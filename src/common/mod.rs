@@ -7,6 +7,7 @@ use std::fmt;
 use mio::Token;
 
 pub mod channel;
+pub(crate) mod codec;
 pub mod congestion;
 pub(crate) mod crypto;
 pub mod error;
@@ -16,6 +17,7 @@ pub(crate) mod packets;
 pub mod socket;
 pub mod stats;
 pub(crate) mod timed_event_queue;
+pub(crate) mod transport;
 
 pub(crate) const PROTOCOL_VERSION: u8 = 0;
 pub(crate) const RECV_TOKEN: Token = Token(0);

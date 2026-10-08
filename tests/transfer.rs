@@ -30,9 +30,9 @@ fn reliable_transfer(network: Option<Network>, amount: u32, timeout_dur: Duratio
     }
 }
 
-/// Messages arrive in order, late ones are dropped, the newest state gets through.
-/// Returns how many arrived.
-fn unreliable_ordered_transfer(network: Option<Network>, amount: u32) -> u32 {
+/// Messages arrive in order, late ones are dropped, the newest state gets through: one of
+/// the last `newest` messages. Returns how many arrived.
+fn unreliable_ordered_transfer(network: Option<Network>, amount: u32, newest: u32) -> u32 {
     const QUIET: Duration = Duration::from_secs(2);
     let (server, client) = connected(network, TIMEOUT);
     for i in 0..amount {
@@ -58,7 +58,7 @@ fn unreliable_ordered_transfer(network: Option<Network>, amount: u32) -> u32 {
         }
     }
     assert!(
-        last.is_some_and(|last| last >= amount - 50),
+        last.is_some_and(|last| last >= amount - newest),
         "newest: {last:?}"
     );
     received
@@ -133,21 +133,22 @@ fn reliable_terrible_network() {
 #[test]
 fn unreliable_ordered_no_simulator() {
     let amount = 50_000;
-    let received = unreliable_ordered_transfer(None, amount);
+    let received = unreliable_ordered_transfer(None, amount, 50);
     assert!(received >= amount * 9 / 10, "{received}/{amount}");
 }
 
 #[test]
 fn unreliable_ordered_okay_network() {
-    unreliable_ordered_transfer(Some(OKAY), 50_000);
+    unreliable_ordered_transfer(Some(OKAY), 50_000, 50);
 }
 
 #[test]
 fn unreliable_ordered_bad_network() {
-    unreliable_ordered_transfer(Some(BAD), 50_000);
+    unreliable_ordered_transfer(Some(BAD), 50_000, 50);
 }
 
 #[test]
 fn unreliable_ordered_terrible_network() {
-    unreliable_ordered_transfer(Some(TERRIBLE), 50_000);
+    // About 150 of these small messages share a packet, and 70 % of the packets are lost.
+    unreliable_ordered_transfer(Some(TERRIBLE), 50_000, 5_000);
 }

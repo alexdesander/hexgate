@@ -8,12 +8,15 @@ use std::{
     fmt, io,
     net::SocketAddr,
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use ahash::HashSet;
+use ahash::HashMap;
 use auth::AuthThreadState;
 pub use auth::{AuthResult, Authenticator};
 use bon::bon;
@@ -26,19 +29,18 @@ use thread::{Cmd, Recipients, ServerThreadState};
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, SendLimits},
-    congestion::CongestionConfiguration,
+    congestion::CongestionConfig,
     crypto::sym::SymCipher,
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver},
-    packets::{disconnect, info_response::MAX_INFO_SIZE},
+    packets::info_response::MAX_INFO_SIZE,
     socket::{sim::Simulator, Socket},
     stats::Stats,
     timed_event_queue::TimedEventQueue,
-    AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
+    transport, AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
 };
 
 mod auth;
-mod connection;
 mod rate_limit;
 mod thread;
 
@@ -49,8 +51,9 @@ const CONNECTION_REQUEST_BURST: f64 = 20.0;
 const CLIENT_HELLOS_PER_SECOND: f64 = 20.0;
 const CLIENT_HELLO_BURST: f64 = 40.0;
 
-/// Connected clients that aren't being closed, kept up to date by the network thread.
-type ConnectedSet = Arc<RwLock<HashSet<SocketAddr>>>;
+/// Connected clients that aren't being closed and their send rates, kept up to date by the
+/// network thread.
+type ConnectedSet = Arc<RwLock<HashMap<SocketAddr, Arc<AtomicU64>>>>;
 
 /// The public key clients pin (`client::ServerKey::Pinned`) for a server's `secret_key`.
 pub fn public_key(secret_key: &[u8; 32]) -> [u8; 32] {
@@ -132,15 +135,31 @@ impl<R: AuthResult> Server<R> {
     /// The connected clients. A client is connected from its `Connected` event until it
     /// disconnects, times out or is disconnected with `disconnect`.
     pub fn connections(&self) -> Vec<SocketAddr> {
-        self.connected().iter().copied().collect()
+        self.connected().keys().copied().collect()
     }
 
     /// Whether `client` is in `connections()`.
     pub fn is_connected(&self, client: SocketAddr) -> bool {
-        self.connected().contains(&client)
+        self.connected().contains_key(&client)
     }
 
-    fn connected(&self) -> RwLockReadGuard<'_, HashSet<SocketAddr>> {
+    /// The bytes the next tick of length `tick` may send to `client` without queueing: the
+    /// congestion controller's send rate times the tick. Fill each client's snapshot up to
+    /// this in priority order. `None` if the client isn't connected.
+    pub fn budget_for(&self, client: SocketAddr, tick: Duration) -> Option<usize> {
+        let rate = self.connected().get(&client)?.load(Ordering::Relaxed);
+        Some((rate as f64 * tick.as_secs_f64()) as usize)
+    }
+
+    /// Ends a server tick: the messages sent to each client since the last flush leave
+    /// together, as one paced burst. Optional; once called, sent messages wait for the next
+    /// flush (at most two tick intervals).
+    pub fn flush(&self) {
+        let _ = self.inner.cmd_tx.send(Cmd::Flush);
+        let _ = self.inner.waker.wake();
+    }
+
+    fn connected(&self) -> RwLockReadGuard<'_, HashMap<SocketAddr, Arc<AtomicU64>>> {
         self.inner
             .connected
             .read()
@@ -148,7 +167,7 @@ impl<R: AuthResult> Server<R> {
     }
 
     /// `disconnect` and `shutdown` take effect for sends right away.
-    fn connected_mut(&self) -> RwLockWriteGuard<'_, HashSet<SocketAddr>> {
+    fn connected_mut(&self) -> RwLockWriteGuard<'_, HashMap<SocketAddr, Arc<AtomicU64>>> {
         self.inner
             .connected
             .write()
@@ -234,9 +253,9 @@ impl<R: AuthResult> Server<R> {
 
     /// Closes every connection once its queued messages were sent and acknowledged, or after
     /// `close_linger`, then stops. Later sends are dropped and no new clients are accepted.
-    /// The reason is sent to every client, at most 1183 bytes.
+    /// The reason is sent to every client, at most 1170 bytes.
     pub fn shutdown(&self, reason: Vec<u8>) -> Result<(), TooLarge> {
-        TooLarge::check(reason.len(), disconnect::MAX_DATA_SIZE)?;
+        TooLarge::check(reason.len(), transport::MAX_REASON_SIZE)?;
         self.connected_mut().clear();
         let _ = self.inner.cmd_tx.send(Cmd::Shutdown(reason));
         let _ = self.inner.waker.wake();
@@ -244,9 +263,9 @@ impl<R: AuthResult> Server<R> {
     }
 
     /// Disconnects one client like `shutdown` does, without an event for it.
-    /// The reason is sent to the client, at most 1183 bytes.
+    /// The reason is sent to the client, at most 1170 bytes.
     pub fn disconnect(&self, client: SocketAddr, reason: Vec<u8>) -> Result<(), TooLarge> {
-        TooLarge::check(reason.len(), disconnect::MAX_DATA_SIZE)?;
+        TooLarge::check(reason.len(), transport::MAX_REASON_SIZE)?;
         self.connected_mut().remove(&client);
         let _ = self.inner.cmd_tx.send(Cmd::Disconnect(client, reason));
         let _ = self.inner.waker.wake();
@@ -303,10 +322,6 @@ impl<R: AuthResult> Server<R> {
         timeout_dur: Duration,
         /// Further clients are turned away (`ConnectError::ServerFull`). Unlimited by default.
         max_connections: Option<usize>,
-        /// How often the round-trip time to every client is measured (also keeps idle
-        /// connections alive).
-        #[builder(default = Duration::from_millis(500))]
-        latency_discovery_interval: Duration,
         /// Limit for queued, undrained events. While reached, received unreliable messages are
         /// dropped and reliable packets are left unacknowledged (the peer resends them later).
         /// Connection events are always delivered.
@@ -316,7 +331,7 @@ impl<R: AuthResult> Server<R> {
         channel_config: ChannelConfiguration,
         /// Send rate limits per connection.
         #[builder(default)]
-        congestion_config: CongestionConfiguration,
+        congestion_config: CongestionConfig,
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
@@ -393,11 +408,7 @@ impl<R: AuthResult> Server<R> {
 
                     cookie_epoch: Instant::now(),
                     connection_request_max_timestamp_age,
-                    timeout_dur,
                     max_connections,
-                    max_recv_msg_size,
-                    is_checking_for_timeouts: false,
-                    latency_discovery_interval,
 
                     siphasher: SipHasher::new_with_key(&rand::random()),
                     client_hellos: RateLimiter::new(CLIENT_HELLOS_PER_SECOND, CLIENT_HELLO_BURST),
@@ -411,12 +422,14 @@ impl<R: AuthResult> Server<R> {
                     answered_logins: Default::default(),
                     connections: Default::default(),
                     connected: thread_connected,
-
-                    latency_discoveries_sent: Default::default(),
-                    is_discovering_latencies: false,
-
-                    channel_config,
-                    congestion_config,
+                    config: transport::Config {
+                        channels: channel_config,
+                        congestion: congestion_config,
+                        max_recv_msg_size,
+                        timeout: timeout_dur,
+                    },
+                    dirty: Vec::new(),
+                    outputs: Vec::new(),
 
                     close_linger,
                     shutting_down: false,

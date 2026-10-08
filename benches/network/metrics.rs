@@ -119,10 +119,16 @@ pub struct LinkSummary {
 #[derive(Serialize)]
 pub struct StatsSummary {
     pub rtt_ms: Option<f64>,
-    pub jitter_ms: f64,
+    pub min_rtt_ms: Option<f64>,
+    pub rtt_var_ms: f64,
+    pub queue_delay_ms: f64,
     pub packet_loss: f32,
     pub send_rate_mbit: f64,
+    pub delivery_rate_mbit: f64,
+    pub utilization: f32,
+    pub congestion: Option<String>,
     pub queued_bytes: usize,
+    pub expired_messages: u64,
 }
 
 fn ms(duration: Duration) -> f64 {
@@ -367,9 +373,15 @@ fn link(stats: &LinkStats) -> LinkSummary {
 fn stats(stats: Stats) -> StatsSummary {
     StatsSummary {
         rtt_ms: stats.rtt.map(ms),
-        jitter_ms: ms(stats.jitter),
+        min_rtt_ms: stats.min_rtt.map(ms),
+        rtt_var_ms: ms(stats.rtt_var),
+        queue_delay_ms: ms(stats.queue_delay),
         packet_loss: stats.packet_loss,
         send_rate_mbit: stats.send_rate as f64 * 8.0 / 1e6,
+        delivery_rate_mbit: stats.delivery_rate as f64 * 8.0 / 1e6,
+        utilization: stats.utilization,
+        congestion: stats.congestion.map(|congestion| format!("{congestion:?}")),
         queued_bytes: stats.queued_bytes,
+        expired_messages: stats.expired_messages,
     }
 }

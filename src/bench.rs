@@ -2,22 +2,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Entry points for the criterion benchmarks in `benches/`, only built with the `bench` feature.
+//! Entry points for the benchmarks in `benches/`, only built with the `bench` feature.
 
-use std::rc::Rc;
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    net::SocketAddr,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use ed25519_dalek::{ed25519::signature::Signer, SigningKey};
 use rand::thread_rng;
 use x25519_dalek::{EphemeralSecret, PublicKey, ReusableSecret};
 
 use crate::common::{
-    channel::{Channel, ChannelConfiguration, Channels, Pop},
-    congestion::{CongestionConfiguration, CongestionController},
+    channel::{Channel, ChannelConfiguration},
+    codec::Writer,
+    congestion::CongestionConfig,
     crypto::Crypto,
-    packets::{
-        acks::Acks, reliable_payload::ReliablePayload, unreliable_payload::UnreliablePayload,
-        PacketIdentifier,
-    },
+    socket::sim::{Fate, NetworkSimulator},
+    stats::Stats,
+    transport::{self, frame, packet, Connection, Output},
     Cipher,
 };
 
@@ -56,7 +62,7 @@ pub fn key_exchange(signing_key: &SigningKey, client_key: &PublicKey) -> [u8; 64
     signing_key.sign(&[tag; 4].concat()).to_bytes()
 }
 
-/// Encrypts packets on one end and decrypts them on the other.
+/// Encrypts DATA packets on one end and decrypts them on the other.
 pub struct Packets {
     sender: Crypto,
     receiver: Crypto,
@@ -75,100 +81,299 @@ impl Packets {
         }
     }
 
-    /// A reliable packet with `len` payload bytes (at most 1172), returns the packet size.
+    /// A packet with a reliable frame of `len` bytes (at most about 1170), returns its size.
     pub fn reliable(&mut self, len: usize) -> usize {
-        let packet = ReliablePayload::NoAcks {
-            channel_id: 0,
-            packet_id: 1000,
-            payload: &self.payload[..len],
-        };
-        let size = packet.serialize(&self.sender, &mut self.buf);
-        ReliablePayload::deserialize(&self.receiver, &mut self.buf[..size]).unwrap();
-        size
+        self.data(|w, payload| {
+            frame::write_reliable_header(w, 0, 1 << 20, len);
+            w.bytes(&payload[..len]);
+        })
     }
 
-    /// An unreliable standalone packet with `len` payload bytes (at most 1178), returns the
-    /// packet size.
+    /// A packet with an unreliable frame of `len` bytes (at most about 1175), returns its size.
     pub fn unreliable(&mut self, len: usize) -> usize {
-        let packet = UnreliablePayload::Standalone {
-            message_id: 1000,
-            payload: &self.payload[..len],
-        };
-        let size = packet.serialize(&self.sender, &mut self.buf);
-        UnreliablePayload::deserialize(&self.receiver, &mut self.buf[..size]).unwrap();
-        size
+        self.data(|w, payload| frame::write_unreliable(w, None, 0, None, &payload[..len]))
     }
 
-    /// An ack packet (SipHash only).
+    /// A packet with an ACK frame of 4 ranges and 16 receive timestamps.
     pub fn acks(&mut self) -> usize {
-        let acks = Acks {
-            channel_id: 0,
-            packet_id: 1000,
-            lowest_unreceived: 1000,
-            ack_bitfield: [0x55; 16],
-        };
-        let size = acks.serialize(&self.sender, &mut self.buf);
-        Acks::deserialize(&self.receiver, &self.buf[..size]).unwrap();
+        let ranges = [(990, 1000), (900, 980), (500, 800), (0, 400)];
+        let timestamps: Vec<(u64, u64)> = (985..1001).rev().map(|pn| (pn, pn * 300)).collect();
+        self.data(|w, _| {
+            frame::write_ack(w, 1234, &ranges, &timestamps);
+        })
+    }
+
+    fn data(&mut self, write: impl FnOnce(&mut Writer, &[u8])) -> usize {
+        let pn = 100_000;
+        let header = packet::write_header(&mut self.buf, pn, false);
+        let mut w = Writer::new(&mut self.buf[header..header + packet::capacity(pn)]);
+        write(&mut w, &self.payload);
+        let end = header + w.len();
+        let size = packet::seal(&self.sender, pn, &mut self.buf, header, end);
+        let header = packet::parse_header(&self.buf[..size]).unwrap();
+        packet::open(&self.receiver, &header, &mut self.buf[..size]).unwrap();
         size
+    }
+}
+
+/// One end of a pair.
+pub struct End {
+    connection: Connection,
+    /// Applied to the packets this end sends.
+    simulator: Option<Box<dyn NetworkSimulator>>,
+    timed_out: bool,
+}
+
+/// A packet on the wire: delivery time, order, receiving end, bytes.
+type Wire = BinaryHeap<Reverse<(Instant, u64, usize, Vec<u8>)>>;
+
+/// Client-server pairs of connections that exchange packets through simulators, in virtual
+/// time: seconds of traffic take milliseconds. Wake-ups are rounded up to the timer
+/// granularity, like the network thread's (1 ms).
+pub struct Pairs {
+    epoch: Instant,
+    now: Instant,
+    granularity: Duration,
+    ends: Vec<End>,
+    wire: Wire,
+    sent: u64,
+    buf: [u8; 1201],
+    outputs: Vec<Output>,
+}
+
+/// Which end of a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Client = 0,
+    Server = 1,
+}
+
+/// Something an end received.
+#[derive(Debug)]
+pub enum Delivery {
+    Message(Vec<u8>),
+    Closed(Vec<u8>),
+    TimedOut,
+}
+
+const PEER: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::LOCALHOST,
+    1,
+));
+
+impl Pairs {
+    pub fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            epoch: now,
+            now,
+            granularity: Duration::from_millis(1),
+            ends: Vec::new(),
+            wire: BinaryHeap::new(),
+            sent: 0,
+            buf: [0; 1201],
+            outputs: Vec::new(),
+        }
+    }
+
+    /// Adds a pair, returns its index. `up` and `down` simulate client to server and back.
+    pub fn add(
+        &mut self,
+        channels: ChannelConfiguration,
+        congestion: CongestionConfig,
+        up: Option<Box<dyn NetworkSimulator>>,
+        down: Option<Box<dyn NetworkSimulator>>,
+    ) -> usize {
+        let (client, server) = crypto_pair(Cipher::AES256GCM);
+        let config = transport::Config {
+            channels,
+            congestion,
+            max_recv_msg_size: 1 << 20,
+            timeout: Duration::from_secs(10),
+        };
+        for (crypto, simulator) in [(client, up), (server, down)] {
+            self.ends.push(End {
+                connection: Connection::new(crypto, &config, self.now),
+                simulator,
+                timed_out: false,
+            });
+        }
+        self.ends.len() / 2 - 1
+    }
+
+    pub fn now(&self) -> Instant {
+        self.now
+    }
+
+    /// Time since the start.
+    pub fn elapsed(&self) -> Duration {
+        self.now - self.epoch
+    }
+
+    fn end(&mut self, pair: usize, side: Side) -> &mut End {
+        &mut self.ends[pair * 2 + side as usize]
+    }
+
+    pub fn send(&mut self, pair: usize, from: Side, channel: Channel, message: Vec<u8>) {
+        let now = self.now;
+        self.end(pair, from)
+            .connection
+            .push(channel, Rc::new(message), now);
+    }
+
+    pub fn flush(&mut self, pair: usize, side: Side) {
+        self.end(pair, side).connection.flush();
+    }
+
+    pub fn stats(&mut self, pair: usize, side: Side) -> Stats {
+        self.end(pair, side).connection.stats()
+    }
+
+    fn wake(&self, at: Instant) -> Instant {
+        let since = at.saturating_duration_since(self.epoch).as_nanos();
+        let granularity = self.granularity.as_nanos();
+        self.epoch + Duration::from_nanos((since.div_ceil(granularity) * granularity) as u64)
+    }
+
+    /// Runs until `until`. `on_delivery(pair, receiving side, time, delivery)`.
+    pub fn run(
+        &mut self,
+        until: Instant,
+        on_delivery: &mut impl FnMut(usize, Side, Instant, Delivery),
+    ) {
+        let mut spins = 0;
+        loop {
+            let mut next = until;
+            for end in &mut self.ends {
+                if let Some(at) = end.connection.timeout(self.now).filter(|_| !end.timed_out) {
+                    next = next.min(at);
+                }
+            }
+            if let Some(Reverse((at, ..))) = self.wire.peek() {
+                next = next.min(*at);
+            }
+            let next = self.wake(next).max(self.now);
+            if next == self.now {
+                spins += 1;
+                assert!(spins < 100_000, "no progress at {:?}", self.elapsed());
+            } else {
+                spins = 0;
+            }
+            self.now = next;
+            while self
+                .wire
+                .peek()
+                .is_some_and(|Reverse((at, ..))| *at <= self.now)
+            {
+                let Reverse((_, _, to, mut packet)) = self.wire.pop().unwrap();
+                let end = &mut self.ends[to];
+                if end.timed_out
+                    || end
+                        .connection
+                        .handle(self.now, &mut packet, true, &mut self.outputs)
+                        .is_err()
+                {
+                    continue;
+                }
+                let side = if to % 2 == 0 {
+                    Side::Client
+                } else {
+                    Side::Server
+                };
+                for output in self.outputs.drain(..) {
+                    let delivery = match output {
+                        Output::Message(message) => Delivery::Message(message),
+                        Output::Closed(reason) => Delivery::Closed(reason),
+                        Output::Violation(violation) => panic!("{violation}"),
+                    };
+                    on_delivery(to / 2, side, self.now, delivery);
+                }
+            }
+            for index in 0..self.ends.len() {
+                let end = &mut self.ends[index];
+                if end.timed_out {
+                    continue;
+                }
+                if end.connection.on_timeout(self.now) {
+                    end.timed_out = true;
+                    let side = if index % 2 == 0 {
+                        Side::Client
+                    } else {
+                        Side::Server
+                    };
+                    on_delivery(index / 2, side, self.now, Delivery::TimedOut);
+                    continue;
+                }
+                while let Some(size) = end.connection.poll_transmit(self.now, &mut self.buf) {
+                    let mut packet = self.buf[..size].to_vec();
+                    let fate = match &mut end.simulator {
+                        Some(simulator) => simulator.simulate(self.now, PEER, &mut packet),
+                        None => Fate::Deliver(self.now),
+                    };
+                    let to = index ^ 1;
+                    let mut deliver = |at: Instant, packet: Vec<u8>| {
+                        self.sent += 1;
+                        self.wire
+                            .push(Reverse((at.max(self.now), self.sent, to, packet)));
+                    };
+                    match fate {
+                        Fate::Drop => {}
+                        Fate::Deliver(at) => deliver(at, packet),
+                        Fate::Duplicate(first, second) => {
+                            deliver(first, packet.clone());
+                            deliver(second, packet);
+                        }
+                    }
+                }
+            }
+            if self.now >= until {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for Pairs {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 /// The channels of both ends of a connection, joined without loss or delay.
 pub struct Link {
-    sender: Channels,
-    receiver: Channels,
-    congestion: CongestionController,
-    keys: (Crypto, Crypto),
-    buf: [u8; 1201],
+    pairs: Pairs,
 }
 
 impl Link {
-    pub fn new(cipher: Cipher) -> Self {
-        let config = ChannelConfiguration::default();
-        Self {
-            sender: Channels::new(&config, usize::MAX),
-            receiver: Channels::new(&config, usize::MAX),
-            congestion: CongestionController::new(CongestionConfiguration::default()),
-            keys: crypto_pair(cipher),
-            buf: [0; 1201],
-        }
+    pub fn new(_cipher: Cipher) -> Self {
+        let mut pairs = Pairs::new();
+        let congestion = CongestionConfig {
+            min_rate: u32::MAX,
+            initial_rate: u32::MAX,
+            max_rate: u32::MAX,
+            ..CongestionConfig::default()
+        };
+        pairs.add(ChannelConfiguration::default(), congestion, None, None);
+        Self { pairs }
     }
 
-    /// Sends `count` messages of `size` bytes on `channel` (pacing aside), with acks for
-    /// reliable ones. Returns the delivered bytes.
+    /// Sends `count` messages of `size` bytes on `channel` and returns the delivered bytes.
     pub fn transfer(&mut self, channel: Channel, size: usize, count: usize) -> usize {
-        let message = Rc::new(vec![7u8; size]);
         for _ in 0..count {
-            self.sender.push(channel, message.clone());
+            self.pairs.send(0, Side::Client, channel, vec![7u8; size]);
         }
         let mut delivered = 0;
-        loop {
-            while let Pop::Packet(len) =
-                self.sender
-                    .pop(&mut self.congestion, &self.keys.0, &mut self.buf)
-            {
-                delivered += self.receive(len);
+        while delivered < size * count {
+            let until = self.pairs.now() + Duration::from_millis(1);
+            self.pairs.run(until, &mut |_, _, _, delivery| {
+                if let Delivery::Message(message) = delivery {
+                    delivered += message.len();
+                }
+            });
+            if !matches!(channel, Channel::Reliable(_)) && self.pairs.wire.is_empty() {
+                break;
             }
-            if delivered >= size * count || !matches!(channel, Channel::Reliable(_)) {
-                return delivered;
-            }
-            let acks = self.receiver.acks(channel);
-            let len = acks.serialize(&self.keys.1, &mut self.buf);
-            let acks = Acks::deserialize(&self.keys.0, &self.buf[..len]).unwrap();
-            self.sender.handle_acks(acks, &mut self.congestion);
         }
-    }
-
-    fn receive(&mut self, len: usize) -> usize {
-        let packet = &mut self.buf[..len];
-        if packet[0] == PacketIdentifier::ReliablePayloadNoAcks as u8 {
-            let packet = ReliablePayload::deserialize(&self.keys.1, packet).unwrap();
-            let messages = self.receiver.handle_reliable(packet).unwrap();
-            messages.iter().map(Vec::len).sum()
-        } else {
-            let packet = UnreliablePayload::deserialize(&self.keys.1, packet).unwrap();
-            let message = self.receiver.handle_unreliable(packet).unwrap();
-            message.map_or(0, |message| message.len())
-        }
+        delivered
     }
 }
