@@ -14,12 +14,18 @@ use std::{
 
 use rand::{rngs::OsRng, RngCore};
 
+/// Reading or writing a key file failed.
 #[derive(Debug, thiserror::Error)]
 pub enum KeyFileError {
+    /// The file couldn't be read or created (`save` doesn't overwrite).
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    /// The file holds something else than the key.
     #[error("the key file does not hold {expected} hex digits")]
-    Malformed { expected: usize },
+    Malformed {
+        /// Twice the key size.
+        expected: usize,
+    },
 }
 
 /// Random bytes from the operating system, e.g. a `secret_key` or `auth_salt`.

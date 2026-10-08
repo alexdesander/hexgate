@@ -44,10 +44,17 @@ pub(crate) enum Pop {
     Exhausted,
 }
 
+/// Where a message is sent, which decides its delivery guarantees. Each channel has its own
+/// queue, so a full reliable channel doesn't delay the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Channel {
+    /// Messages may get lost or arrive out of order, never twice. A message larger than one
+    /// packet (about 1.1 KiB) is lost when any of its fragments is.
     Unreliable,
+    /// Like `Unreliable`, but a message older than the newest one received on this channel is
+    /// dropped (sequenced).
     UnreliableOrdered(u8),
+    /// Messages arrive exactly once and in the order they were sent on this channel.
     Reliable(u8),
 }
 

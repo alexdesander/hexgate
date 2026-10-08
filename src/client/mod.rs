@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The client side: [`Client`], its events and the server browser query [`request_infos`].
+
 use std::{
     fmt,
     io::{self, ErrorKind},
@@ -34,28 +36,51 @@ use crate::common::{
 mod handshake;
 mod thread;
 
+/// Why the client couldn't connect.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
+    /// A socket error, an unresolvable server address, or no answer within `handshake_tries`
+    /// (`ErrorKind::TimedOut`).
     #[error("Some io error occurred: {0}")]
     IoError(#[from] io::Error),
+    /// The server's `allowed_client_versions` rejected `client_version`.
     #[error("Client version not supported by server, it allows {0}")]
     VersionNotSupported(AllowedClientVersions),
+    /// The authenticator refused the login, with its failure data.
     #[error("Server denied login")]
     ServerDeniedLogin(Vec<u8>),
+    /// The server has `max_connections` clients.
     #[error("Server is full")]
     ServerFull,
     /// The server speaks another version of the hexgate protocol.
     #[error("Hexgate protocol version {client} is not supported by the server (version {server})")]
-    ProtocolMismatch { client: u8, server: u8 },
+    ProtocolMismatch {
+        /// This client's protocol version.
+        client: u8,
+        /// The server's protocol version.
+        server: u8,
+    },
+    /// The server's key isn't the pinned one: a different server, or someone impersonating it.
     #[error("The server's public key does not match the expected key (possible SECURITY IMPLICATIONS!!!)")]
-    ServerKeyMismatch { received_key: [u8; 32] },
+    ServerKeyMismatch {
+        /// The key the server presented.
+        received_key: [u8; 32],
+    },
+    /// An invalid builder setting.
     #[error("Invalid configuration: {0}")]
     InvalidConfig(#[from] ConfigError),
+    /// `auth_data` exceeds 1177 bytes without `hash_auth_data`.
     #[error("Auth data too large: {0}")]
     AuthDataTooLarge(TooLarge),
     /// Counts of unreliable ordered and reliable channels.
     #[error("Channel configuration differs from the server's (client: {client:?}, server: {server:?} unreliable ordered and reliable channels)")]
-    ChannelMismatch { client: [u16; 2], server: [u16; 2] },
+    ChannelMismatch {
+        /// This client's counts.
+        client: [u16; 2],
+        /// The server's counts.
+        server: [u16; 2],
+    },
+    /// `disconnect()` was called, or the client dropped, during the handshake.
     #[error("The client was disconnected during the handshake")]
     Cancelled,
 }
@@ -138,19 +163,25 @@ pub enum ServerKey {
     Unverified,
 }
 
+/// What happened on the connection, see [`Client::next`].
 #[derive(Debug)]
 pub enum Event {
     /// The handshake succeeded (`start()` only, `connect()` consumes it).
     Connected,
     /// The handshake failed (`start()` only), the client has stopped.
     ConnectFailed(ConnectError),
+    /// The server closed the connection, with its reason.
     Disconnected(Vec<u8>),
+    /// Nothing was received from the server for `timeout_dur`.
     TimedOut,
+    /// A message from the server.
     Received(Vec<u8>),
     /// The server violated the protocol and was disconnected.
     Violation(ProtocolViolation),
 }
 
+/// A connection to a server. Cloning gives another handle to the same connection; dropping the
+/// last one disconnects gracefully.
 #[derive(Clone)]
 pub struct Client {
     send_limits: SendLimits,
@@ -159,16 +190,20 @@ pub struct Client {
 }
 
 impl Client {
-    /// This is non-blocking, an error means the client has shut down.
+    /// The next event if there is one. An error means the network thread has stopped, the
+    /// first one says why.
     pub fn try_next(&self) -> Result<Option<Event>, RecvError> {
         self.inner.event_rx.try_next()
     }
 
-    /// This is blocking, an error means the client has shut down.
+    /// Waits for the next event. An error means the network thread has stopped, the first one
+    /// says why.
     pub fn next(&self) -> Result<Event, RecvError> {
         self.inner.event_rx.next()
     }
 
+    /// Queues a message for the server. Messages sent while connecting (`start()`) are sent
+    /// once connected.
     pub fn send(&self, channel: Channel, message: Vec<u8>) -> Result<(), SendError> {
         self.send_limits.check(channel, message.len())?;
         self.inner
@@ -188,6 +223,7 @@ impl Client {
         Ok(())
     }
 
+    /// Simulates loss and delay for the packets this client sends, `None` turns it off.
     pub fn set_simulator(&self, simulator: Option<Box<dyn NetworkSimulator>>) {
         let _ = self.inner.cmd_tx.send(Cmd::SetSimulator(simulator));
         let _ = self.inner.waker.wake();
@@ -202,6 +238,7 @@ impl Client {
         reply_rx.recv().ok()
     }
 
+    /// The address the client's socket is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -249,6 +286,7 @@ impl Client {
         /// An address or a host name with port, e.g. `"example.com:44444"`. The first resolved
         /// address (of `bind_addr`'s IP version, if set) is used.
         server_socket_addr: A,
+        /// How the server's identity is checked, see [`ServerKey`].
         server_key: ServerKey,
         /// At most 1177 bytes unless hashed.
         auth_data: Vec<u8>,
@@ -256,17 +294,25 @@ impl Client {
         /// server's key and `auth_salt`. The hash is as good as the password for logging in to
         /// this server, so the server has to hash it again before storing it.
         hash_auth_data: bool,
+        /// Simulates loss and delay for sent packets, see [`NetworkSimulator`].
         simulator: Option<Box<dyn NetworkSimulator>>,
+        /// Send and receive buffer size of the socket, the OS default otherwise.
         socket_buffer_size: Option<usize>,
+        /// The app's version, checked by the server's `allowed_client_versions`.
         client_version: ClientVersion,
-        #[builder(default = Duration::from_secs(10))] timeout_dur: Duration,
+        /// The connection times out when nothing arrives from the server for this long.
+        #[builder(default = Duration::from_secs(10))]
+        timeout_dur: Duration,
         /// Limit for queued, undrained events. While reached, received unreliable messages are
         /// dropped and reliable packets are left unacknowledged (the peer resends them later).
         /// Connection events are always delivered.
         #[builder(default = 1024)]
         max_events: usize,
+        /// The channels, the counts must match the server's.
         channel_config: ChannelConfiguration,
-        #[builder(default)] congestion_config: CongestionConfiguration,
+        /// Send rate limits.
+        #[builder(default)]
+        congestion_config: CongestionConfiguration,
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
@@ -278,8 +324,13 @@ impl Client {
         /// sent and acknowledged before the connection is closed.
         #[builder(default = Duration::from_secs(1))]
         close_linger: Duration,
-        #[builder(default = Duration::from_secs(4))] handshake_timeout: Duration,
-        #[builder(default = 2)] handshake_tries: u8,
+        /// How long each handshake step is retransmitted (with backoff) before the handshake
+        /// starts over.
+        #[builder(default = Duration::from_secs(4))]
+        handshake_timeout: Duration,
+        /// How often the handshake starts over before the connect fails.
+        #[builder(default = 2)]
+        handshake_tries: u8,
     ) -> Result<Self, ConnectError> {
         channel_config.validate()?;
         congestion_config.validate()?;

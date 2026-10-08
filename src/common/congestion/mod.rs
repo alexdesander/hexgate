@@ -28,8 +28,11 @@ const TIMER_GRANULARITY: Duration = Duration::from_millis(1);
 /// You should manually tune this to your game's needs.
 #[derive(Debug, Clone, Copy)]
 pub struct CongestionConfiguration {
+    /// Send rate of a new connection (600 KiB/s by default).
     pub start_bandwidth: u32,
+    /// The send rate never exceeds this (10000 KiB/s by default).
     pub max_bandwidth: u32,
+    /// Congestion never lowers the send rate below this (100 KiB/s by default).
     pub min_bandwidth: u32,
 }
 

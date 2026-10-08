@@ -7,8 +7,11 @@ use crate::common::error::ConfigError;
 /// The channels and their send weights. Client and server need the same channel counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelConfiguration {
+    /// Share of the send rate for `Channel::Unreliable` while several channels have data queued.
     pub weight_unreliable: u16,
+    /// One weight per `Channel::UnreliableOrdered` channel (at most 256).
     pub weights_unreliable_ordered: Vec<u16>,
+    /// One weight per `Channel::Reliable` channel (at most 256).
     pub weights_reliable: Vec<u16>,
 }
 

@@ -14,6 +14,7 @@ use mio::Waker;
 use super::thread::Cmd;
 use crate::common::{error::RecvError, packets::login_response::MAX_FAILURE_DATA_SIZE};
 
+/// What an [`Authenticator`] returns for a client, e.g. its account.
 pub trait AuthResult: Send + 'static {}
 impl<T> AuthResult for T where T: Send + 'static {}
 

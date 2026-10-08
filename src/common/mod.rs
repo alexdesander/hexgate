@@ -26,7 +26,9 @@ pub(crate) const WAKE_TOKEN: Token = Token(1);
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cipher {
+    /// AES-256-GCM, fastest with AES hardware instructions.
     AES256GCM = 0,
+    /// ChaCha20-Poly1305, fastest without them.
     ChaCha20Poly1305 = 1,
 }
 
@@ -48,14 +50,20 @@ pub fn fingerprint(key: &[u8; 32]) -> String {
         .join(" ")
 }
 
+/// The version of the app using hexgate, which the server can restrict
+/// (`allowed_client_versions`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ClientVersion {
+    /// Incompatible changes.
     pub major: u16,
+    /// Compatible additions.
     pub minor: u16,
+    /// Fixes.
     pub patch: u16,
 }
 
 impl ClientVersion {
+    /// Version 0.0.0.
     pub const ZERO: Self = Self {
         major: 0,
         minor: 0,
@@ -72,7 +80,9 @@ impl fmt::Display for ClientVersion {
 /// An inclusive range of client versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AllowedClientVersions {
+    /// The oldest allowed version.
     pub min: ClientVersion,
+    /// The newest allowed version.
     pub max: ClientVersion,
 }
 

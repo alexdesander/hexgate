@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! The server side: [`Server`], its events and the [`Authenticator`].
+
 use std::{
     fmt, io,
     net::SocketAddr,
@@ -57,24 +59,36 @@ pub fn public_key(secret_key: &[u8; 32]) -> [u8; 32] {
         .to_bytes()
 }
 
+/// Why the server couldn't start.
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
+    /// Binding the socket or starting a thread failed.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    /// An invalid builder setting.
     #[error("invalid configuration: {0}")]
     InvalidConfig(#[from] ConfigError),
 }
 
+/// What happened to a client, see [`Server::next`].
 #[derive(Debug)]
 pub enum Event<R: AuthResult> {
+    /// A client logged in, with the authenticator's result. A client reconnecting from the same
+    /// address replaces its old connection, which gets a `Disconnected` first.
     Connected(SocketAddr, R),
+    /// The client disconnected, with its reason.
     Disconnected(SocketAddr, Vec<u8>),
+    /// Nothing was received from the client for `timeout_dur`.
     TimedOut(SocketAddr),
+    /// A message from the client.
     Received(SocketAddr, Vec<u8>),
     /// The client violated the protocol and was disconnected.
     Violation(SocketAddr, ProtocolViolation),
 }
 
+/// A server and its connections, `R` being what the [`Authenticator`] returns for a client.
+/// Cloning gives another handle to the same server; dropping the last one shuts it down
+/// gracefully.
 pub struct Server<R: AuthResult> {
     send_limits: SendLimits,
     local_addr: SocketAddr,
@@ -121,6 +135,7 @@ impl<R: AuthResult> Server<R> {
         self.connected().iter().copied().collect()
     }
 
+    /// Whether `client` is in `connections()`.
     pub fn is_connected(&self, client: SocketAddr) -> bool {
         self.connected().contains(&client)
     }
@@ -158,16 +173,19 @@ impl<R: AuthResult> Server<R> {
         Ok(())
     }
 
-    /// This is non-blocking, an error means the server has shut down.
+    /// The next event if there is one. An error means the network thread has stopped, the
+    /// first one says why.
     pub fn try_next(&self) -> Result<Option<Event<R>>, RecvError> {
         self.inner.event_rx.try_next()
     }
 
-    /// This is blocking, an error means the server has shut down.
+    /// Waits for the next event. An error means the network thread has stopped, the first one
+    /// says why.
     pub fn next(&self) -> Result<Event<R>, RecvError> {
         self.inner.event_rx.next()
     }
 
+    /// Queues a message for a connected client.
     pub fn send(
         &self,
         to: SocketAddr,
@@ -235,6 +253,7 @@ impl<R: AuthResult> Server<R> {
         Ok(())
     }
 
+    /// Simulates loss and delay for the packets the server sends, `None` turns it off.
     pub fn set_simulator(&self, simulator: Option<Box<dyn NetworkSimulator>>) {
         let _ = self.inner.cmd_tx.send(Cmd::SetSimulator(simulator));
         let _ = self.inner.waker.wake();
@@ -252,11 +271,17 @@ impl<R: AuthResult> Drop for ServerInner<R> {
 
 #[bon]
 impl<R: AuthResult> Server<R> {
+    /// Configures the server; `run()` binds the socket and starts the threads.
     #[builder(finish_fn = run)]
     pub fn prepare<A, V>(
+        /// Decides which clients may log in, see [`Authenticator`].
         authenticator: A,
+        /// The address to listen on, e.g. `0.0.0.0:44444` (port 0 picks a free port, see
+        /// `local_addr`).
         bind_addr: SocketAddr,
+        /// Send and receive buffer size of the socket, the OS default otherwise.
         socket_buffer_size: Option<usize>,
+        /// Simulates loss and delay for sent packets, see [`NetworkSimulator`].
         simulator: Option<Box<dyn NetworkSimulator>>,
         /// At most 256 bytes.
         info: Vec<u8>,
@@ -264,22 +289,33 @@ impl<R: AuthResult> Server<R> {
         /// `move |version| allowed.check(version)` for an `AllowedClientVersions` range. Rejected
         /// clients get the returned range.
         allowed_client_versions: V,
+        /// The cipher of all connections, by default the faster one on this CPU.
         cipher: Option<Cipher>,
+        /// The server's ed25519 identity, see [`crate::keys`]. Clients pin its public key
+        /// ([`public_key`]).
         secret_key: [u8; 32],
         /// Salts the Argon2 hash of clients with `hash_auth_data`, together with the server's
         /// public key. Changing either changes the hashes the authenticator receives.
         auth_salt: [u8; 16],
-        #[builder(default = Duration::from_secs(10))] timeout_dur: Duration,
+        /// A client that sends nothing for this long times out.
+        #[builder(default = Duration::from_secs(10))]
+        timeout_dur: Duration,
         /// Further clients are turned away (`ConnectError::ServerFull`). Unlimited by default.
         max_connections: Option<usize>,
-        #[builder(default = Duration::from_millis(500))] latency_discovery_interval: Duration,
+        /// How often the round-trip time to every client is measured (also keeps idle
+        /// connections alive).
+        #[builder(default = Duration::from_millis(500))]
+        latency_discovery_interval: Duration,
         /// Limit for queued, undrained events. While reached, received unreliable messages are
         /// dropped and reliable packets are left unacknowledged (the peer resends them later).
         /// Connection events are always delivered.
         #[builder(default = 1024)]
         max_events: usize,
+        /// The channels, clients need the same counts.
         channel_config: ChannelConfiguration,
-        #[builder(default)] congestion_config: CongestionConfiguration,
+        /// Send rate limits per connection.
+        #[builder(default)]
+        congestion_config: CongestionConfiguration,
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
@@ -291,7 +327,10 @@ impl<R: AuthResult> Server<R> {
         /// and acknowledged before the connections are closed.
         #[builder(default = Duration::from_secs(1))]
         close_linger: Duration,
-        #[builder(default = false)] disable_timestamp_age_check: bool,
+        /// Accepts handshake cookies of any age (for servers with an unreliable clock).
+        #[builder(default = false)]
+        disable_timestamp_age_check: bool,
+        /// How long a handshake cookie from a ServerHello stays valid.
         #[builder(default = Duration::from_secs(10))]
         connection_request_max_timestamp_age: Duration,
     ) -> Result<Self, StartError>
