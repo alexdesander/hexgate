@@ -299,9 +299,18 @@ impl<R: AuthResult> ServerThreadState<R> {
     }
 
     fn remove(&mut self, addr: SocketAddr) {
-        self.connections.remove(&addr);
+        if let Some(mut peer) = self.connections.remove(&addr) {
+            self.send_remaining_results(addr, &mut peer.connection);
+        }
         self.timed_events.remove(&TimedEventKey::Connection(addr));
         self.set_connected(addr, None);
+    }
+
+    /// Send results the delivery budget held back would be lost with the connection.
+    fn send_remaining_results(&self, addr: SocketAddr, connection: &mut Connection) {
+        for (cookie, outcome) in connection.drain_send_results() {
+            self.event_tx.send(Event::SendResult(addr, cookie, outcome));
+        }
     }
 
     /// Returns true once all `Server` handles are gone.
@@ -692,7 +701,8 @@ impl<R: AuthResult> ServerThreadState<R> {
         };
         // A new handshake from a connected address means the client lost its old session
         // (e.g. our LoginSuccess got lost and it started over).
-        if self.connections.insert(from, peer).is_some() {
+        if let Some(mut old) = self.connections.insert(from, peer) {
+            self.send_remaining_results(from, &mut old.connection);
             self.event_tx.send(Event::Disconnected(from, Vec::new()));
         }
         log!(debug, %from, "connected");

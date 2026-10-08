@@ -78,6 +78,7 @@ impl ClientThreadState {
                 let size = self.connection.close_now(b"Timeout", now, &mut self.buf);
                 self.socket.send(&self.buf[..size]);
                 log!(debug, "timed out");
+                self.send_remaining_results();
                 self.event_tx.send(Event::TimedOut);
                 return Ok(());
             }
@@ -89,6 +90,7 @@ impl ClientThreadState {
             }
             if self.connection.is_closed() {
                 log!(debug, "closed");
+                self.send_remaining_results();
                 return Ok(());
             }
             let deadline = self
@@ -216,6 +218,7 @@ impl ClientThreadState {
                 Output::Closed(reason) => {
                     self.transmit(now);
                     log!(debug, "disconnected by server");
+                    self.send_remaining_results();
                     self.event_tx.send(Event::Disconnected(reason));
                     return true;
                 }
@@ -226,11 +229,19 @@ impl ClientThreadState {
                         .close_now(reason.as_bytes(), now, &mut self.buf);
                     self.socket.send(&self.buf[..size]);
                     log!(warn, %violation, "protocol violation");
+                    self.send_remaining_results();
                     self.event_tx.send(Event::Violation(violation));
                     return true;
                 }
             }
         }
         false
+    }
+
+    /// Send results the delivery budget held back would be lost with the connection.
+    fn send_remaining_results(&mut self) {
+        for (cookie, outcome) in self.connection.drain_send_results() {
+            self.event_tx.send(Event::SendResult(cookie, outcome));
+        }
     }
 }

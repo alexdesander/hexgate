@@ -238,6 +238,14 @@ impl Connection {
         }
     }
 
+    /// Takes every buffered send result regardless of the budget, for a connection that is dropped.
+    pub fn drain_send_results(&mut self) -> impl Iterator<Item = (u64, SendOutcome)> + '_ {
+        self.channels.take_results(&mut self.send_results);
+        self.send_results
+            .drain(..)
+            .map(|(cookie, outcome, _)| (cookie, outcome))
+    }
+
     /// Ends a tick: the queued messages leave as one burst. From the first call on, messages
     /// wait for the next flush.
     pub fn flush(&mut self) {
