@@ -2,9 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{
-    io, marker::PhantomData, net::SocketAddr, sync::Arc, thread::JoinHandle, time::Duration,
-};
+use std::{io, net::SocketAddr, sync::Arc, thread::JoinHandle, time::Duration};
 
 use auth::{AuthResult, AuthThreadState, Authenticator};
 use bon::bon;
@@ -65,13 +63,13 @@ pub enum Event<R: AuthResult> {
     Violation(SocketAddr, ProtocolViolation),
 }
 
-pub struct Server<R: AuthResult, A: Authenticator<R>> {
+pub struct Server<R: AuthResult> {
     send_limits: SendLimits,
     local_addr: SocketAddr,
-    inner: Arc<ServerInner<R, A>>,
+    inner: Arc<ServerInner<R>>,
 }
 
-impl<R: AuthResult, A: Authenticator<R>> Clone for Server<R, A> {
+impl<R: AuthResult> Clone for Server<R> {
     fn clone(&self) -> Self {
         Self {
             send_limits: self.send_limits,
@@ -81,8 +79,7 @@ impl<R: AuthResult, A: Authenticator<R>> Clone for Server<R, A> {
     }
 }
 
-struct ServerInner<R: AuthResult, A: Authenticator<R>> {
-    _phantom: PhantomData<A>,
+struct ServerInner<R: AuthResult> {
     event_rx: EventReceiver<Event<R>>,
     cmd_tx: crossbeam::channel::Sender<thread::Cmd<R>>,
     waker: Arc<Waker>,
@@ -90,7 +87,7 @@ struct ServerInner<R: AuthResult, A: Authenticator<R>> {
     auth_thread: Option<JoinHandle<()>>,
 }
 
-impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
+impl<R: AuthResult> Server<R> {
     /// The address the server is bound to (e.g. the port chosen for `bind_addr` port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
@@ -164,7 +161,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
     }
 }
 
-impl<R: AuthResult, A: Authenticator<R>> Drop for ServerInner<R, A> {
+impl<R: AuthResult> Drop for ServerInner<R> {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send(Cmd::Shutdown(vec![]));
         let _ = self.waker.wake();
@@ -174,9 +171,9 @@ impl<R: AuthResult, A: Authenticator<R>> Drop for ServerInner<R, A> {
 }
 
 #[bon]
-impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
+impl<R: AuthResult> Server<R> {
     #[builder(finish_fn = run)]
-    pub fn prepare(
+    pub fn prepare<A: Authenticator<R>>(
         authenticator: A,
         bind_addr: SocketAddr,
         socket_buffer_size: Option<usize>,
@@ -302,7 +299,6 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
             send_limits,
             local_addr,
             inner: Arc::new(ServerInner {
-                _phantom: PhantomData,
                 event_rx,
                 cmd_tx,
                 waker,

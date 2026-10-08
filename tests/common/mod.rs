@@ -32,7 +32,7 @@ impl Authenticator<()> for AcceptAll {
     }
 }
 
-pub type TestServer = Server<(), AcceptAll>;
+pub type TestServer = Server<()>;
 
 pub fn channel_config() -> ChannelConfiguration {
     ChannelConfiguration {
