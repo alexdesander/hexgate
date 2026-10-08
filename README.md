@@ -33,7 +33,8 @@ Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
     - DoS hardening: stateless handshake cookies bound to the client address, per-IP rate limits, requests padded
       so the server never amplifies traffic
     - Key file helpers (`hexgate::keys`)
-- Paced congestion window controlled by standing RTT and loss; all channels share the same network budget
+- Paced congestion window controlled by standing RTT and loss; all channels share the same network budget.
+  Tuned for average or better connections; bad ones (heavy jitter, loss, outages) are survived, not optimized for
 - Freshness measured from application submission, including connection startup
 - Per-tick API for games: `flush()` sends a tick as one burst, `gross_send_budget(tick)` gives an approximate gross packet budget
 - Timeouts, keepalives and connection statistics (RTT, queueing delay, send and delivery rate, loss, queued bytes)

@@ -6,6 +6,10 @@
 //! links without sockets or threads, so a minute of traffic takes about a second. For tuning;
 //! `benches/network` measures the real thing.
 //!
+//! Tune on `perfect`, `good`, `average`, `clean`, `step` and `narrow`: a change must not regress
+//! there. `bad`, `terrible`, `jitter` and `reverse` are robustness checks: a change only has to
+//! avoid stalls and collapse there, and must not be made for their sake.
+//!
 //! ```text
 //! cargo bench --features bench --bench cc -- [--seconds N] [--drain N] [--seed N] [--seeds N] [--trace]
 //!     [--scenario NAME,..] [--profile NAME,..]

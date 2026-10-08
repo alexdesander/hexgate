@@ -23,6 +23,9 @@ fn mbit(mbit: f64) -> u64 {
 /// The presets are typical connections, from measurements of home Wi-Fi, cellular and
 /// satellite links (bursty loss, long-tailed jitter, bufferbloat, Starlink's 15 s
 /// reconfigurations). Fields can be changed for anything in between.
+///
+/// Hexgate is tuned for `perfect` to `average`. `bad` and `terrible` are stress tests:
+/// connections have to survive them, not perform well on them.
 #[derive(Debug, Clone, Default)]
 pub struct Profile {
     /// Client to server.

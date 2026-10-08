@@ -3,6 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Copa-derived window control with bounded aggregate pacing and application-limited growth
+//!
+//! Tuned for average or better connections, where most players are. Behavior on bad or
+//! terrible connections (heavy jitter, loss, outages) only has to stay robust: no stalls, no
+//! collapse. It must not cost anything on good connections.
 
 use crate::common::{error::ConfigError, transport::recovery::Rtt};
 use filter::Windowed;
