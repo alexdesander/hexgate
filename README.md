@@ -59,8 +59,9 @@ let server = Server::prepare()
     .bind_addr(SERVER_ADDR)
     .info(b"Example of a hexgate server".to_vec())
     .allowed_client_versions(|_| Ok(()))
-    .secret_key([0u8; 32])
-    .auth_salt([0u8; 16])
+    // Generated and saved on the first run, keep them secret.
+    .secret_key(keys::load_or_generate("server.key")?)
+    .auth_salt(keys::load_or_generate("server.salt")?)
     .authenticator(UselessAuthenticator)
     .channel_config(ChannelConfiguration {
         weight_unreliable: 15,
@@ -76,7 +77,8 @@ match server.next() {
 
 Creating a hexgate client and connecting to a server. The client pins the server's public key
 (`hexgate::server::public_key(&secret_key)`, shipped with the game), so nobody else can pose as the
-server. `ServerKey::Unverified` turns this off explicitly.
+server (`hexgate::common::fingerprint` formats it for comparing). `ServerKey::Unverified` turns this off explicitly; for
+trust on first use, connect unverified once and store `client.get_server_key()` with `keys::save`.
 ```rust
 let client = Client::prepare()
     .client_version(ClientVersion::ZERO)

@@ -10,7 +10,7 @@ use std::{
 
 use hexgate::{
     client::request_infos,
-    common::channel::scheduler::ChannelConfiguration,
+    common::{channel::scheduler::ChannelConfiguration, keys},
     server::{auth::Authenticator, Server},
 };
 
@@ -29,8 +29,8 @@ fn main() {
         .bind_addr(SERVER_ADDR)
         .info(b"Hello, world! This is a placeholder server info! It could be anything serializable to a Vec<u8>!".to_vec())
         .allowed_client_versions(|_| Ok(()))
-        .secret_key([0u8; 32])
-        .auth_salt([0u8; 16])
+        .secret_key(keys::generate())
+        .auth_salt(keys::generate())
         .authenticator(MockAuthenticator)
         .channel_config(ChannelConfiguration { weight_unreliable: 10, weights_unreliable_ordered: vec![10], weights_reliable: vec![10] })
         .run()

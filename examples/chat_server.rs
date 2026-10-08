@@ -11,9 +11,10 @@ use ahash::HashMap;
 use hexgate::{
     common::{
         channel::{scheduler::ChannelConfiguration, Channel},
+        fingerprint, keys,
         socket::net_sym::NetworkSimulator,
     },
-    server::{auth::Authenticator, Event, Server},
+    server::{self, auth::Authenticator, Event, Server},
 };
 use rand::{thread_rng, Rng};
 
@@ -43,12 +44,18 @@ impl Authenticator<String> for MockAuthenticator {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Generated on the first run. Clients pin the public key, so keep the file.
+    let secret_key = keys::load_or_generate("chat_server.key")?;
+    println!(
+        "Server key: {}",
+        fingerprint(&server::public_key(&secret_key))
+    );
     let server = Server::prepare()
         .bind_addr(SERVER_ADDR)
         .info(b"Example of a chat server".to_vec())
         .allowed_client_versions(|_| Ok(()))
-        .secret_key([0u8; 32])
-        .auth_salt([0u8; 16])
+        .secret_key(secret_key)
+        .auth_salt(keys::load_or_generate("chat_server.salt")?)
         .authenticator(MockAuthenticator)
         .channel_config(ChannelConfiguration {
             weight_unreliable: 10,

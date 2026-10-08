@@ -11,16 +11,18 @@ use hexgate::{
     client::{Client, Event, ServerKey},
     common::{
         channel::{scheduler::ChannelConfiguration, Channel},
+        fingerprint, keys,
         socket::net_sym::NetworkSimulator,
         ClientVersion,
     },
-    server,
 };
 use rand::{thread_rng, Rng};
 use text_io::read;
 
 const SERVER_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 44444);
 const USERNAME: &str = "Anon";
+/// The server key trusted on the first connection.
+const KNOWN_SERVER_KEY: &str = "chat_client_known_server.key";
 
 struct Simulator;
 impl NetworkSimulator for Simulator {
@@ -33,11 +35,11 @@ impl NetworkSimulator for Simulator {
 }
 
 fn main() -> anyhow::Result<()> {
+    let known_server_key = keys::load(KNOWN_SERVER_KEY)?;
     let client = Client::prepare()
         .client_version(ClientVersion::ZERO)
         .server_socket_addr(SERVER_ADDR)
-        // The chat server example runs with the secret key [0; 32].
-        .server_key(ServerKey::Pinned(server::public_key(&[0u8; 32])))
+        .server_key(known_server_key.map_or(ServerKey::Unverified, ServerKey::Pinned))
         .auth_data(USERNAME.as_bytes().to_vec())
         .hash_auth_data(false)
         .channel_config(ChannelConfiguration {
@@ -46,6 +48,11 @@ fn main() -> anyhow::Result<()> {
             weights_reliable: vec![10, 10, 10, 10, 10],
         })
         .connect()?;
+    if known_server_key.is_none() {
+        let server_key = client.get_server_key();
+        println!("Trusting server key {}", fingerprint(&server_key));
+        keys::save(KNOWN_SERVER_KEY, &server_key)?;
+    }
     client.set_simulator(Some(Box::new(Simulator)));
 
     let _client = client.clone();
