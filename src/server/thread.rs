@@ -44,7 +44,7 @@ use crate::common::{
         unreliable_payload::UnreliablePayload,
         PacketIdentifier,
     },
-    socket::net_sym::NetworkSimulator,
+    socket::sim::Simulator,
     stats::Stats,
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, Cipher, ClientVersion, PROTOCOL_VERSION, RECV_TOKEN, WAKE_TOKEN,
@@ -72,7 +72,7 @@ pub struct PendingLogin {
 }
 
 pub enum Cmd<R: AuthResult> {
-    SetSimulator(Option<Box<dyn NetworkSimulator>>),
+    SetSimulator(Simulator),
     Shutdown(Vec<u8>),
     Disconnect(SocketAddr, Vec<u8>),
     SetInfo(Vec<u8>),
@@ -193,7 +193,12 @@ impl<R: AuthResult> ServerThreadState<R> {
             if self.shutting_down && self.connections.is_empty() {
                 break;
             }
-            let max_poll_time = self.timed_events.next().map(|deadline| {
+            let deadline = self
+                .timed_events
+                .next()
+                .into_iter()
+                .chain(self.socket.next_deadline());
+            let max_poll_time = deadline.min().map(|deadline| {
                 deadline
                     .saturating_duration_since(Instant::now())
                     .max(Duration::from_millis(1))
@@ -209,6 +214,10 @@ impl<R: AuthResult> ServerThreadState<R> {
                     WAKE_TOKEN => {}
                     _ => unreachable!(),
                 }
+            }
+            self.socket.flush();
+            if self.socket.inbound_due() {
+                self.handle_all_recvs()?;
             }
         }
         self.failure.take().map_or(Ok(()), Err)
@@ -276,14 +285,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                         )
                     }));
                 }
-                Cmd::SetSimulator(network_simulator) => {
-                    if let Some(network_simulator) = network_simulator {
-                        self.socket.set_network_simulator(network_simulator)?;
-                        self.socket.set_use_simulator(true);
-                    } else {
-                        self.socket.set_use_simulator(false);
-                    }
-                }
+                Cmd::SetSimulator(simulator) => self.socket.set_simulator(simulator),
             }
         }
         Ok(false)

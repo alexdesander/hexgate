@@ -31,7 +31,7 @@ use crate::common::{
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver},
     packets::{disconnect, info_response::MAX_INFO_SIZE},
-    socket::{net_sym::NetworkSimulator, Socket},
+    socket::{sim::Simulator, Socket},
     stats::Stats,
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
@@ -253,8 +253,9 @@ impl<R: AuthResult> Server<R> {
         Ok(())
     }
 
-    /// Simulates loss and delay for the packets the server sends, `None` turns it off.
-    pub fn set_simulator(&self, simulator: Option<Box<dyn NetworkSimulator>>) {
+    /// Simulates network conditions for the server's packets (of all clients),
+    /// `Simulator::default()` turns it off. See [`crate::sim`].
+    pub fn set_simulator(&self, simulator: Simulator) {
         let _ = self.inner.cmd_tx.send(Cmd::SetSimulator(simulator));
         let _ = self.inner.waker.wake();
     }
@@ -281,8 +282,8 @@ impl<R: AuthResult> Server<R> {
         bind_addr: SocketAddr,
         /// Send and receive buffer size of the socket, the OS default otherwise.
         socket_buffer_size: Option<usize>,
-        /// Simulates loss and delay for sent packets, see [`NetworkSimulator`].
-        simulator: Option<Box<dyn NetworkSimulator>>,
+        /// Simulates network conditions from the first packet on, see [`crate::sim`].
+        simulator: Option<Simulator>,
         /// At most 256 bytes.
         info: Vec<u8>,
         /// Decides which client versions may connect, e.g. `|_| Ok(())` or

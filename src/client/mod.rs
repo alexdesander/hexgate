@@ -27,7 +27,7 @@ use crate::common::{
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver},
     packets::{disconnect, info_request::InfoRequest, info_response::InfoResponse, login_request},
-    socket::{is_transient, net_sym::NetworkSimulator, Socket},
+    socket::{is_transient, sim::Simulator, Socket},
     stats::Stats,
     timed_event_queue::TimedEventQueue,
     AllowedClientVersions, ClientVersion, RECV_TOKEN, WAKE_TOKEN,
@@ -223,8 +223,9 @@ impl Client {
         Ok(())
     }
 
-    /// Simulates loss and delay for the packets this client sends, `None` turns it off.
-    pub fn set_simulator(&self, simulator: Option<Box<dyn NetworkSimulator>>) {
+    /// Simulates network conditions for this client's packets, `Simulator::default()` turns it
+    /// off. See [`crate::sim`].
+    pub fn set_simulator(&self, simulator: Simulator) {
         let _ = self.inner.cmd_tx.send(Cmd::SetSimulator(simulator));
         let _ = self.inner.waker.wake();
     }
@@ -294,8 +295,8 @@ impl Client {
         /// server's key and `auth_salt`. The hash is as good as the password for logging in to
         /// this server, so the server has to hash it again before storing it.
         hash_auth_data: bool,
-        /// Simulates loss and delay for sent packets, see [`NetworkSimulator`].
-        simulator: Option<Box<dyn NetworkSimulator>>,
+        /// Simulates network conditions from the first packet on, see [`crate::sim`].
+        simulator: Option<Simulator>,
         /// Send and receive buffer size of the socket, the OS default otherwise.
         socket_buffer_size: Option<usize>,
         /// The app's version, checked by the server's `allowed_client_versions`.

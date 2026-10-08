@@ -11,8 +11,10 @@ use std::{
 };
 
 use hexgate::{
-    error::RecvError, server, Authenticator, ChannelConfiguration, Client, ClientVersion,
-    NetworkSimulator, Server, ServerKey,
+    error::RecvError,
+    server,
+    sim::{Fate, NetworkSimulator},
+    Authenticator, ChannelConfiguration, Client, ClientVersion, Server, ServerKey, Simulator,
 };
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -65,22 +67,21 @@ pub struct Lossy {
 }
 
 impl Lossy {
-    pub fn new(seed: u64, network: Network) -> Box<Self> {
-        Box::new(Self {
+    pub fn new(seed: u64, network: Network) -> Self {
+        Self {
             rng: Xoshiro256PlusPlus::seed_from_u64(seed),
             network,
-        })
+        }
     }
 }
 
 impl NetworkSimulator for Lossy {
-    fn simulate(&mut self, _: SocketAddr, _: usize) -> Option<Duration> {
+    fn simulate(&mut self, now: Instant, _: SocketAddr, _: &mut [u8]) -> Fate {
         if self.rng.gen_bool(self.network.loss) {
-            return None;
+            return Fate::Drop;
         }
-        Some(Duration::from_millis(
-            self.rng.gen_range(self.network.delay_ms.clone()),
-        ))
+        let delay = self.rng.gen_range(self.network.delay_ms.clone());
+        Fate::Deliver(now + Duration::from_millis(delay))
     }
 }
 
@@ -91,15 +92,19 @@ pub struct DropNth {
 }
 
 impl DropNth {
-    pub fn new(n: usize) -> Box<Self> {
-        Box::new(Self { n, seen: 0 })
+    pub fn new(n: usize) -> Self {
+        Self { n, seen: 0 }
     }
 }
 
 impl NetworkSimulator for DropNth {
-    fn simulate(&mut self, _: SocketAddr, _: usize) -> Option<Duration> {
+    fn simulate(&mut self, now: Instant, _: SocketAddr, _: &mut [u8]) -> Fate {
         self.seen += 1;
-        (self.seen - 1 != self.n).then_some(Duration::ZERO)
+        if self.seen - 1 == self.n {
+            Fate::Drop
+        } else {
+            Fate::Deliver(now)
+        }
     }
 }
 
@@ -107,8 +112,8 @@ impl NetworkSimulator for DropNth {
 pub struct Blackhole;
 
 impl NetworkSimulator for Blackhole {
-    fn simulate(&mut self, _: SocketAddr, _: usize) -> Option<Duration> {
-        None
+    fn simulate(&mut self, _: Instant, _: SocketAddr, _: &mut [u8]) -> Fate {
+        Fate::Drop
     }
 }
 
@@ -160,8 +165,8 @@ pub fn connected(network: Option<Network>, timeout_dur: Duration) -> (TestServer
     let server = server(timeout_dur);
     let client = client(server.local_addr(), timeout_dur);
     if let Some(network) = network {
-        server.set_simulator(Some(Lossy::new(1, network.clone())));
-        client.set_simulator(Some(Lossy::new(2, network)));
+        server.set_simulator(Simulator::sending(Lossy::new(1, network.clone())));
+        client.set_simulator(Simulator::sending(Lossy::new(2, network)));
     }
     (server, client)
 }

@@ -18,7 +18,7 @@ use hexgate::{
     client::{self as hexclient, ConnectError},
     error::SendError,
     server as hexserver, AllowedClientVersions, Authenticator, Channel, ChannelConfiguration,
-    Client, ClientVersion, NetworkSimulator, Server, ServerKey,
+    Client, ClientVersion, Server, ServerKey, Simulator,
 };
 use rand::Rng;
 
@@ -28,7 +28,7 @@ fn client_with(
     server_addr: SocketAddr,
     server_key: ServerKey,
     channel_config: ChannelConfiguration,
-    simulator: Option<Box<dyn NetworkSimulator>>,
+    simulator: Option<Simulator>,
 ) -> Result<Client, ConnectError> {
     Client::prepare()
         .client_version(ClientVersion::ZERO)
@@ -67,11 +67,11 @@ fn handshake_survives_a_lost_packet_at_each_step() {
                 .auth_salt([0; 16])
                 .authenticator(AcceptAll)
                 .channel_config(channel_config())
-                .maybe_simulator((!client_side).then(|| DropNth::new(lost) as _))
+                .maybe_simulator((!client_side).then(|| Simulator::sending(DropNth::new(lost))))
                 .run()
                 .unwrap();
             let start = Instant::now();
-            let simulator = client_side.then(|| DropNth::new(lost) as _);
+            let simulator = client_side.then(|| Simulator::sending(DropNth::new(lost)));
             let _client =
                 client_with(server.local_addr(), pinned(), channel_config(), simulator).unwrap();
             let elapsed = start.elapsed();
@@ -196,7 +196,7 @@ fn server_times_out_silent_client() {
         Some(hexserver::Event::Connected(..))
     ));
     std::thread::sleep(Duration::from_secs(2));
-    client.set_simulator(Some(Box::new(Blackhole)));
+    client.set_simulator(Simulator::sending(Blackhole));
     let start = Instant::now();
     let event = next_event(|| server.try_next(), WAIT);
     let elapsed = start.elapsed();
@@ -215,7 +215,7 @@ fn client_times_out_silent_server() {
     let timeout = Duration::from_secs(1);
     let (server, client) = connected(None, timeout);
     std::thread::sleep(Duration::from_secs(2));
-    server.set_simulator(Some(Box::new(Blackhole)));
+    server.set_simulator(Simulator::sending(Blackhole));
     let start = Instant::now();
     let event = next_event(|| client.try_next(), WAIT);
     let elapsed = start.elapsed();

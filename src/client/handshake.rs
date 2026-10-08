@@ -219,6 +219,7 @@ impl Link<'_> {
         let mut resend_at = Instant::now();
         loop {
             self.take_cmds()?;
+            self.socket.flush();
             let now = Instant::now();
             if now >= deadline {
                 return Ok(None);
@@ -238,6 +239,7 @@ impl Link<'_> {
             }
             let wait = resend_at
                 .min(deadline)
+                .min(self.socket.next_deadline().unwrap_or(deadline))
                 .saturating_duration_since(Instant::now());
             match self.poll.poll(&mut events, Some(wait)) {
                 Err(e) if e.kind() != ErrorKind::Interrupted => return Err(e.into()),

@@ -2,32 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    time::Duration,
-};
+use std::net::{Ipv4Addr, SocketAddr};
 
 use hexgate::{
-    client::Event, fingerprint, keys, Channel, ChannelConfiguration, Client, ClientVersion,
-    NetworkSimulator, ServerKey,
+    client::Event, fingerprint, keys, sim::Profile, Channel, ChannelConfiguration, Client,
+    ClientVersion, ServerKey,
 };
-use rand::{thread_rng, Rng};
 use text_io::read;
 
 const SERVER_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 44444);
 const USERNAME: &str = "Anon";
 /// The server key trusted on the first connection.
 const KNOWN_SERVER_KEY: &str = "chat_client_known_server.key";
-
-struct Simulator;
-impl NetworkSimulator for Simulator {
-    fn simulate(&mut self, _to: SocketAddr, _size: usize) -> Option<Duration> {
-        if thread_rng().gen_bool(0.0) {
-            return None;
-        }
-        Some(Duration::from_millis(thread_rng().gen_range(150..151)))
-    }
-}
 
 fn main() -> anyhow::Result<()> {
     let known_server_key = keys::load(KNOWN_SERVER_KEY)?;
@@ -47,7 +33,8 @@ fn main() -> anyhow::Result<()> {
         println!("Trusting server key {}", fingerprint(&server_key));
         keys::save(KNOWN_SERVER_KEY, &server_key)?;
     }
-    client.set_simulator(Some(Box::new(Simulator)));
+    // Both directions as on an average home connection.
+    client.set_simulator(Profile::average().client(1));
 
     let _client = client.clone();
     let thread = std::thread::spawn(move || {

@@ -33,7 +33,9 @@ Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
     - Key file helpers (`hexgate::keys`)
 - Timeouts, latency probes and connection statistics (RTT, jitter, loss, send rate, queued bytes)
 - Basic send-rate control (a delay-based congestion controller is being designed)
-- Network simulation (loss, delay, reordering)
+- Network simulation (`hexgate::sim`), both directions, on the network thread: presets from perfect to terrible,
+  bottleneck with buffer and cross traffic, jitter distributions, bursty loss, spikes, stalls, outages, reordering,
+  duplication, corruption
 - Optional `tracing` instrumentation (`tracing` feature)
 
 Hexgate does NOT do:

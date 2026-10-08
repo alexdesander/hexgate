@@ -30,7 +30,7 @@ use crate::common::{
         unreliable_payload::UnreliablePayload,
         PacketIdentifier,
     },
-    socket::net_sym::NetworkSimulator,
+    socket::sim::Simulator,
     stats::{ProbeLoss, Stats},
     timed_event_queue::TimedEventQueue,
     RECV_TOKEN, WAKE_TOKEN,
@@ -42,7 +42,7 @@ use super::{Event, Socket};
 const TIMEOUT_CHECKS: u32 = 4;
 
 pub enum Cmd {
-    SetSimulator(Option<Box<dyn NetworkSimulator>>),
+    SetSimulator(Simulator),
     Disconnect(Vec<u8>),
     Send(Channel, Vec<u8>),
     Stats(Sender<Stats>),
@@ -107,7 +107,12 @@ impl ClientThreadState {
             if self.handle_all_cmds()? || self.handle_all_events() {
                 break;
             }
-            let max_poll_time = self.timed_events.next().map(|deadline| {
+            let deadline = self
+                .timed_events
+                .next()
+                .into_iter()
+                .chain(self.socket.next_deadline());
+            let max_poll_time = deadline.min().map(|deadline| {
                 deadline
                     .saturating_duration_since(Instant::now())
                     .max(Duration::from_millis(1))
@@ -127,6 +132,10 @@ impl ClientThreadState {
                     WAKE_TOKEN => {}
                     _ => unreachable!(),
                 }
+            }
+            self.socket.flush();
+            if self.socket.inbound_due() && self.handle_all_recvs()? {
+                break;
             }
         }
         Ok(())
@@ -173,14 +182,7 @@ impl ClientThreadState {
                     &self.probe_loss,
                 ));
             }
-            Cmd::SetSimulator(network_simulator) => {
-                if let Some(network_simulator) = network_simulator {
-                    self.socket.set_network_simulator(network_simulator)?;
-                    self.socket.set_use_simulator(true);
-                } else {
-                    self.socket.set_use_simulator(false);
-                }
-            }
+            Cmd::SetSimulator(simulator) => self.socket.set_simulator(simulator),
         }
         Ok(())
     }

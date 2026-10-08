@@ -69,8 +69,8 @@
 //!
 //! Each `Server` and `Client` runs a network thread (`hexgate-server`, `hexgate-client`) that
 //! does all socket IO, encryption, retransmission and timers. The server runs your
-//! `Authenticator` on a second thread (`hexgate-auth`), and a [`NetworkSimulator`] runs on its
-//! own thread (`hexgate-sim`). `Server` and `Client` are cheap handles (`Clone`, `Send`, `Sync`)
+//! `Authenticator` on a second thread (`hexgate-auth`). A [`Simulator`] runs on the network
+//! thread. `Server` and `Client` are cheap handles (`Clone`, `Send`, `Sync`)
 //! that talk to the network thread through channels, so they can be used from any thread.
 //! Dropping the last handle closes the connections gracefully (see `close_linger`) and joins the
 //! threads.
@@ -137,7 +137,7 @@ pub use common::{
     channel::{Channel, ChannelConfiguration},
     congestion::CongestionConfiguration,
     error, fingerprint, keys,
-    socket::net_sym::NetworkSimulator,
+    socket::sim::{self, NetworkSimulator, Simulator},
     stats::Stats,
     AllowedClientVersions, Cipher, ClientVersion,
 };

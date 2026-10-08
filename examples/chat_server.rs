@@ -2,30 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    time::Duration,
-};
+use std::net::{Ipv4Addr, SocketAddr};
 
 use ahash::HashMap;
 use hexgate::{
     fingerprint, keys,
     server::{self, Event},
-    Authenticator, Channel, ChannelConfiguration, NetworkSimulator, Server,
+    Authenticator, Channel, ChannelConfiguration, Server,
 };
-use rand::{thread_rng, Rng};
 
 const SERVER_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 44444);
-
-struct Simulator;
-impl NetworkSimulator for Simulator {
-    fn simulate(&mut self, _to: SocketAddr, _size: usize) -> Option<Duration> {
-        if thread_rng().gen_bool(0.0) {
-            return None;
-        }
-        Some(Duration::from_millis(thread_rng().gen_range(150..351)))
-    }
-}
 
 struct MockAuthenticator;
 impl Authenticator<String> for MockAuthenticator {
@@ -60,7 +46,6 @@ fn main() -> anyhow::Result<()> {
             weights_reliable: vec![10, 10, 10, 10, 10],
         })
         .run()?;
-    server.set_simulator(Some(Box::new(Simulator)));
 
     let mut clients: HashMap<SocketAddr, String> = HashMap::default();
 
