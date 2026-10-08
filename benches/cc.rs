@@ -6,8 +6,8 @@
 //! links without sockets or threads, so a minute of traffic takes about a second. For tuning;
 //! `benches/network` measures the real thing.
 //!
-//! Tune on `perfect`, `good`, `average`, `clean`, `step` and `narrow`: a change must not regress
-//! there. `bad`, `terrible`, `jitter` and `reverse` are robustness checks: a change only has to
+//! Tune on `perfect`, `good`, `average`, `clean`, `clean25`, `clean100`, `step` and `narrow`: a
+//! change must not regress there. `bad`, `terrible`, `jitter` and `reverse` are robustness checks: a change only has to
 //! avoid stalls and collapse there, and must not be made for their sake.
 //!
 //! ```text
@@ -573,6 +573,20 @@ fn profiles() -> Vec<(&'static str, Profile)> {
             Profile {
                 up: clean(0.1, 200),
                 down: clean(10.0, 200),
+            },
+        ),
+        (
+            "clean25",
+            Profile {
+                up: clean(5.0, 100),
+                down: clean(25.0, 100),
+            },
+        ),
+        (
+            "clean100",
+            Profile {
+                up: clean(20.0, 50),
+                down: clean(100.0, 50),
             },
         ),
         (

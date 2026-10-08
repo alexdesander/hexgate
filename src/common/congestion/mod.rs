@@ -26,6 +26,18 @@ const MIN_WINDOW: f64 = 2.0 * MTU;
 const RATE_WINDOW: Duration = Duration::from_millis(200);
 const MAX_RATE_SAMPLES: usize = 2048;
 const LOSS_MAX_AGE: Duration = Duration::from_secs(1);
+/// The standing RTT is the minimum over this many base RTTs: long enough to see through the
+/// correlated jitter of home Wi-Fi, which a window of half an RTT reads as queueing.
+const STANDING_WINDOW_RTTS: u32 = 2;
+/// Queueing delay up to this multiple of the packet-to-packet RTT variation is treated as
+/// path jitter rather than queue, up to `MAX_TOLERANCE` seconds.
+const JITTER_TOLERANCE: f64 = 4.0;
+const MAX_TOLERANCE: f64 = 0.004;
+/// Growth is paced so that the queue it can build before the short filter reports it (about
+/// one and a half RTTs) stays below this many seconds.
+const MAX_OVERSHOOT: f64 = 0.006;
+/// The window changes by at most this fraction of itself per RTT.
+const MAX_STEP: f64 = 0.1;
 
 /// The congestion controller's limits, in bytes per second. `min_rate == max_rate` sends at a
 /// fixed rate.
@@ -101,9 +113,13 @@ pub(crate) struct Controller {
     window: f64,
     pacer: Pacer,
     standing_rtt: Windowed<Duration>,
+    short_rtt: Windowed<Duration>,
     min_rtt: Windowed<Duration>,
     srtt: Duration,
     queue_delay: f64,
+    short_queue_delay: f64,
+    last_sample: Option<Duration>,
+    jitter: f64,
     samples: VecDeque<(Instant, u64, usize)>,
     acked_bytes: usize,
     demand_bytes: usize,
@@ -133,9 +149,13 @@ impl Controller {
             window,
             pacer: Pacer::new(now),
             standing_rtt: Windowed::min(),
+            short_rtt: Windowed::min(),
             min_rtt: Windowed::min(),
             srtt: Duration::from_millis(100),
             queue_delay: 0.0,
+            short_queue_delay: 0.0,
+            last_sample: None,
+            jitter: 0.0,
             samples: VecDeque::new(),
             acked_bytes: 0,
             demand_bytes: 0,
@@ -234,10 +254,19 @@ impl Controller {
 
     pub fn on_rtt(&mut self, now: Instant, sample: Duration) {
         let base = self.min_rtt.update(now, sample, Duration::from_secs(10));
-        let standing =
-            self.standing_rtt
+        let short =
+            self.short_rtt
                 .update(now, sample, (self.srtt / 2).max(Duration::from_millis(1)));
+        let standing = self.standing_rtt.update(
+            now,
+            sample,
+            (base * STANDING_WINDOW_RTTS).max(Duration::from_millis(1)),
+        );
         self.queue_delay = standing.saturating_sub(base).as_secs_f64();
+        self.short_queue_delay = short.saturating_sub(base).as_secs_f64();
+        if let Some(last) = self.last_sample.replace(sample) {
+            self.jitter += (sample.abs_diff(last).as_secs_f64() - self.jitter) / 16.0;
+        }
     }
 
     fn pacing_rate(&self) -> f64 {
@@ -255,11 +284,13 @@ impl Controller {
         }
         self.srtt = rtt.smoothed().max(Duration::from_millis(1));
         let total = self.acked_packets + self.lost_packets;
-        if total >= 4
+        if f64::from(total) >= (self.window / MTU).max(4.0)
             || (total > 0 && now.saturating_duration_since(self.loss_since) >= LOSS_MAX_AGE)
         {
             let observed = f64::from(self.lost_packets) / f64::from(total);
-            let excess = self.lost_packets >= 2 && observed > (2.0 * self.loss).max(0.02);
+            let expected = self.loss * f64::from(total);
+            let excess = f64::from(self.lost_packets) > 2.0 + 4.0 * expected
+                && observed > (2.0 * self.loss).max(0.02);
             self.loss += (observed - self.loss) / 8.0;
             if now >= self.loss_until && (excess || observed > 0.1) {
                 self.window = (0.7 * self.window).max(MIN_WINDOW);
@@ -278,8 +309,24 @@ impl Controller {
             .as_secs_f64()
             .max(0.001);
         let current = self.window / standing;
-        let target = MTU / (DELTA * self.queue_delay.max(0.000001));
-        let direction = if target > current { 1 } else { -1 };
+        let tolerance = if self.slow_start {
+            0.0
+        } else {
+            ((self.jitter * JITTER_TOLERANCE).min(MAX_TOLERANCE) - MTU / (DELTA * current)).max(0.0)
+        };
+        let target_rate = |queue_delay: f64| MTU / (DELTA * (queue_delay - tolerance).max(1e-6));
+        let target = target_rate(if self.slow_start {
+            self.queue_delay.max(self.short_queue_delay)
+        } else {
+            self.queue_delay
+        });
+        let direction = if target <= current {
+            -1
+        } else if !self.slow_start && target_rate(self.short_queue_delay) <= current {
+            0
+        } else {
+            1
+        };
         if now.saturating_duration_since(self.direction_at) >= self.srtt {
             let observed_direction = if self.window > self.round_window {
                 1
@@ -301,12 +348,18 @@ impl Controller {
             self.direction_at = now;
             self.round_window = self.window;
         }
-        if direction != self.direction && self.velocity > 1.0 {
-            self.direction = direction;
-            self.velocity = 1.0;
-            self.direction_rounds = 0;
-        }
         self.velocity = self.velocity.min(self.window * DELTA / MTU).max(1.0);
+        // Window change per acknowledged byte, at most `fraction` of the window per RTT
+        let step = |fraction: f64| {
+            self.velocity
+                .min((self.window * DELTA * fraction / MTU).max(1.0))
+                * MTU
+                / (DELTA * self.window)
+        };
+        let growth = self.min_rtt.get().map_or(MAX_STEP, |base| {
+            (MAX_OVERSHOOT / (1.5 * base.as_secs_f64())).min(MAX_STEP)
+        });
+        let (decrease, increase) = (step(MAX_STEP), step(growth));
         let acked = std::mem::take(&mut self.acked_bytes) as f64;
         let demand = std::mem::take(&mut self.demand_bytes) as f64;
         if demand == 0.0 {
@@ -315,15 +368,14 @@ impl Controller {
         }
         if direction < 0 {
             self.slow_start = false;
-            self.window -=
-                (acked * self.velocity * MTU / (DELTA * self.window)).min(self.window * 0.25);
-        } else if now >= self.loss_until && demand > 0.0 {
-            let increase = if self.slow_start {
+            self.window -= (acked * decrease).min(self.window * 0.25);
+        } else if direction > 0 && now >= self.loss_until && demand > 0.0 {
+            let added = if self.slow_start {
                 demand
             } else {
-                demand * self.velocity * MTU / (DELTA * self.window)
+                demand * increase
             };
-            self.window += increase.min(self.window * 0.25);
+            self.window += added.min(self.window * 0.25);
         }
         self.window = self.window.clamp(
             MIN_WINDOW.max(f64::from(self.config.min_rate) * self.srtt.as_secs_f64()),

@@ -64,8 +64,8 @@ fn loss_reduces_once_per_rtt_and_clean_feedback_releases_the_hold() {
     let rtt = path(now);
     let before = cc.window;
     for offset in [0, 1] {
-        cc.acked_packets = 2;
-        cc.lost_packets = 2;
+        cc.acked_packets = 7;
+        cc.lost_packets = 3;
         cc.on_ack_end(now + Duration::from_millis(offset), &rtt);
         assert_eq!(cc.window, before * 0.7);
     }
@@ -74,6 +74,27 @@ fn loss_reduces_once_per_rtt_and_clean_feedback_releases_the_hold() {
     cc.acked_packets = 10;
     cc.on_ack_end(now + Duration::from_secs(1), &rtt);
     assert!(cc.window > before * 0.7);
+}
+
+#[test]
+fn random_loss_pairs_within_a_window_of_packets_do_not_cut() {
+    let now = Instant::now();
+    let mut cc = Controller::new(CongestionConfig::default(), now);
+    let rtt = path(now);
+    cc.window = 150.0 * MTU;
+    cc.slow_start = false;
+    let before = cc.window;
+    for i in 0..20 {
+        cc.acked_packets = 148;
+        cc.lost_packets = 2;
+        cc.on_ack_end(now + Duration::from_millis(i * 40), &rtt);
+    }
+    assert!(cc.window >= before, "{} < {before}", cc.window);
+    assert!((cc.loss() - 2.0 / 150.0).abs() < 0.002, "{}", cc.loss());
+    cc.acked_packets = 130;
+    cc.lost_packets = 20;
+    cc.on_ack_end(now + Duration::from_secs(1), &rtt);
+    assert!(cc.window < before);
 }
 
 #[test]
