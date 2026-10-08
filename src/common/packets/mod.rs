@@ -2,6 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+//! AEAD nonces: payload packets begin theirs with the packet identifier (never 0xff), the
+//! handshake packets and Disconnect use fixed nonces beginning with 0xff. A fixed nonce is only
+//! safe while each key encrypts a single plaintext under it, so such a packet is serialized once
+//! per key and only ever resent as the same bytes.
+
 pub mod acks;
 pub mod client_hello;
 pub mod connection_request;

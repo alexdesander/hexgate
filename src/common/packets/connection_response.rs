@@ -46,6 +46,8 @@ impl Transcript<'_> {
     }
 }
 
+/// Fixed, see the `packets` docs: once per key exchange, retransmitted requests get the stored
+/// response.
 const NONCE: [u8; 12] = [0xff; 12];
 impl ConnectionResponse {
     pub fn serialize(

@@ -14,6 +14,7 @@ pub struct LoginRequest<'a> {
 pub const MAX_AUTH_DATA_SIZE: usize = 1177;
 
 // 2^96 - 2
+/// Fixed, see the `packets` docs: every handshake try has new keys, resends are the same bytes.
 const NONCE: [u8; 12] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
 ];

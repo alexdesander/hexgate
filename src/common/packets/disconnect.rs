@@ -15,6 +15,8 @@ pub const MAX_DATA_SIZE: usize = 1183;
 pub const REPEATS: usize = 3;
 
 // 2^96 - 5
+/// Fixed, see the `packets` docs: sent only when a connection ends, the `REPEATS` are the same
+/// bytes.
 const NONCE: [u8; 12] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfb,
 ];

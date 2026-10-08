@@ -14,6 +14,8 @@ pub enum LoginResponse<'a> {
 pub const MAX_FAILURE_DATA_SIZE: usize = 1181;
 
 // 2^96 - 3
+/// Fixed, see the `packets` docs: each login attempt gets one Success or Failure, retransmitted
+/// requests get the stored response.
 const NONCE: [u8; 12] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd,
 ];
