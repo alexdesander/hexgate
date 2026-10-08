@@ -222,8 +222,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
         let local_addr = socket.local_addr()?;
         let (event_tx, event_rx) = events::channel(max_events);
 
-        // TODO: Benchmark for optimal cipher
-        let cipher = cipher.unwrap_or(SymCipher::better());
+        let cipher = cipher.unwrap_or_else(SymCipher::better);
 
         // Has to be unbounded to prevent deadlocks
         let (cmd_tx, cmd_rx) = unbounded();

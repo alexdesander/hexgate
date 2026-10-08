@@ -2,11 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::time::Instant;
-
 use aes_gcm::{aead::AeadInPlace, Aes256Gcm, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
-use rand::{thread_rng, Rng};
 
 use crate::common::Cipher;
 
@@ -55,33 +52,19 @@ impl SymCipher {
         }
     }
 
-    /// Benchmarking function that returns the most efficient cipher
+    /// AES-256-GCM on CPUs with AES and carry-less multiplication instructions, otherwise
+    /// ChaCha20-Poly1305 (faster in software). On aarch64 the `aes` and `polyval` crates use
+    /// these instructions only when built with `--cfg aes_armv8 --cfg polyval_armv8`.
     pub fn better() -> Cipher {
-        let aes = SymCipher::new(Cipher::AES256GCM, thread_rng().gen());
-        let chacha = SymCipher::new(Cipher::ChaCha20Poly1305, thread_rng().gen());
-
-        let mut data = [0u8; 1200];
-        let nonce: [u8; 12] = thread_rng().gen();
-
-        // Warmup
-        aes.encrypt(&nonce, &[], &mut data);
-        chacha.encrypt(&nonce, &[], &mut data);
-
-        let runs = 500;
-
-        let start = Instant::now();
-        for _ in 0..runs {
-            aes.encrypt(&nonce, &[], &mut data);
-        }
-        let aes_time = start.elapsed();
-
-        let start = Instant::now();
-        for _ in 0..runs {
-            chacha.encrypt(&nonce, &[], &mut data);
-        }
-        let chacha_time = start.elapsed();
-
-        if aes_time < chacha_time {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let aes_hardware = std::arch::is_x86_feature_detected!("aes")
+            && std::arch::is_x86_feature_detected!("pclmulqdq");
+        #[cfg(target_arch = "aarch64")]
+        let aes_hardware =
+            cfg!(all(aes_armv8, polyval_armv8)) && std::arch::is_aarch64_feature_detected!("aes");
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+        let aes_hardware = false;
+        if aes_hardware {
             Cipher::AES256GCM
         } else {
             Cipher::ChaCha20Poly1305

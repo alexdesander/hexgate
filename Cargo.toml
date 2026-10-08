@@ -40,7 +40,11 @@ bitvec = "1.0.1"
 priority-queue = "2.1.1"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(fuzzing)",
+    "cfg(aes_armv8)",
+    "cfg(polyval_armv8)",
+] }
 
 [dev-dependencies]
 anyhow = "1.0.93"
