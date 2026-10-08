@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::{
-    io,
+    fmt, io,
     net::SocketAddr,
     panic::{self, AssertUnwindSafe},
     sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -87,6 +87,15 @@ impl<R: AuthResult> Clone for Server<R> {
             local_addr: self.local_addr,
             inner: self.inner.clone(),
         }
+    }
+}
+
+impl<R: AuthResult> fmt::Debug for Server<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Server")
+            .field("local_addr", &self.local_addr)
+            .field("connections", &self.connected().len())
+            .finish_non_exhaustive()
     }
 }
 

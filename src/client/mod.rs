@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::{
+    fmt,
     io::{self, ErrorKind},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     panic::{self, AssertUnwindSafe},
@@ -37,7 +38,7 @@ mod thread;
 pub enum ConnectError {
     #[error("Some io error occurred: {0}")]
     IoError(#[from] io::Error),
-    #[error("Client version not supported by server: {0:?}")]
+    #[error("Client version not supported by server, it allows {0}")]
     VersionNotSupported(AllowedClientVersions),
     #[error("Server denied login")]
     ServerDeniedLogin(Vec<u8>),
@@ -208,6 +209,15 @@ impl Client {
     /// The server's public key, `None` until connected.
     pub fn get_server_key(&self) -> Option<[u8; 32]> {
         self.inner.server_key.get().copied()
+    }
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("local_addr", &self.local_addr)
+            .field("server_key", &self.get_server_key())
+            .finish_non_exhaustive()
     }
 }
 

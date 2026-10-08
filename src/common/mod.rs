@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::fmt;
+
 use mio::Token;
 
 pub mod channel;
@@ -61,11 +63,23 @@ impl ClientVersion {
     };
 }
 
+impl fmt::Display for ClientVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
 /// An inclusive range of client versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AllowedClientVersions {
     pub min: ClientVersion,
     pub max: ClientVersion,
+}
+
+impl fmt::Display for AllowedClientVersions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} to {}", self.min, self.max)
+    }
 }
 
 impl AllowedClientVersions {

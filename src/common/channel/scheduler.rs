@@ -4,10 +4,23 @@
 
 use crate::common::error::ConfigError;
 
+/// The channels and their send weights. Client and server need the same channel counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelConfiguration {
     pub weight_unreliable: u16,
     pub weights_unreliable_ordered: Vec<u16>,
     pub weights_reliable: Vec<u16>,
+}
+
+/// One channel of each kind, with equal weights.
+impl Default for ChannelConfiguration {
+    fn default() -> Self {
+        Self {
+            weight_unreliable: 1,
+            weights_unreliable_ordered: vec![1],
+            weights_reliable: vec![1],
+        }
+    }
 }
 
 impl ChannelConfiguration {
