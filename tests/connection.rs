@@ -18,6 +18,7 @@ use hexgate::{
     client::{self as hexclient, Client, ConnectError, ServerKey},
     common::{
         channel::{scheduler::ChannelConfiguration, Channel},
+        error::SendError,
         socket::net_sym::NetworkSimulator,
         AllowedClientVersions, ClientVersion,
     },
@@ -295,9 +296,10 @@ fn kick_disconnects_one_client() {
         .send(kicked_addr, Channel::Reliable(0), b"banned".to_vec())
         .unwrap();
     server.disconnect(kicked_addr, b"kicked".to_vec()).unwrap();
-    server
-        .send(kicked_addr, Channel::Reliable(0), b"too late".to_vec())
-        .unwrap();
+    assert!(matches!(
+        server.send(kicked_addr, Channel::Reliable(0), b"too late".to_vec()),
+        Err(SendError::NotConnected(_))
+    ));
     assert!(matches!(
         next_event(|| kicked.try_next(), WAIT),
         Some(hexclient::Event::Received(message)) if message == b"banned"

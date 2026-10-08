@@ -7,7 +7,7 @@ use std::{
     io,
     net::SocketAddr,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, PoisonError},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -53,7 +53,7 @@ use super::{
     auth::{AuthCmd, AuthResult, LoginAttempt},
     connection::Connection,
     rate_limit::RateLimiter,
-    Event, Socket,
+    ConnectedSet, Event, Socket,
 };
 
 /// Timeouts are checked this many times per timeout duration.
@@ -134,6 +134,8 @@ pub struct ServerThreadState<R: AuthResult> {
     /// Sent LoginResponses, resent for retransmitted LoginRequests.
     pub answered_logins: HashMap<LoginAttempt, Vec<u8>>,
     pub connections: HashMap<SocketAddr, Connection>,
+    /// Connected clients that aren't being closed, shared with `Server`.
+    pub connected: ConnectedSet,
 
     pub latency_discoveries_sent: BTreeMap<u32, Instant>,
     pub is_discovering_latencies: bool,
@@ -331,18 +333,19 @@ impl<R: AuthResult> ServerThreadState<R> {
     }
 
     fn handle_event_check_for_timeouts(&mut self) {
-        let mut timed_outs = Vec::new();
-        for (addr, connection) in &self.connections {
-            if connection.last_received.elapsed() > self.timeout_dur {
-                let disconnect = Disconnect { data: b"Timeout" };
-                let size = disconnect.serialize(&connection.crypto, &mut self.buf);
-                self.socket.send_to(*addr, &self.buf[..size]);
-                self.event_tx.send(Event::TimedOut(*addr));
-                timed_outs.push(*addr);
-            }
-        }
+        let timed_outs: Vec<SocketAddr> = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| connection.last_received.elapsed() > self.timeout_dur)
+            .map(|(addr, _)| *addr)
+            .collect();
         for addr in timed_outs {
-            self.connections.remove(&addr);
+            let connection = self.connections.remove(&addr).unwrap();
+            let disconnect = Disconnect { data: b"Timeout" };
+            let size = disconnect.serialize(&connection.crypto, &mut self.buf);
+            self.socket.send_to(addr, &self.buf[..size]);
+            self.set_connected(addr, false);
+            self.event_tx.send(Event::TimedOut(addr));
         }
         if !self.connections.is_empty() {
             self.timed_events.push(
@@ -424,6 +427,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                     let size = disconnect.serialize(&connection.crypto, &mut self.buf);
                     self.socket.send_to(to, &self.buf[..size]);
                     self.connections.remove(&to);
+                    self.set_connected(to, false);
                     self.event_tx
                         .send(Event::Disconnected(to, IDS_EXHAUSTED.to_vec()));
                     return;
@@ -435,6 +439,20 @@ impl<R: AuthResult> ServerThreadState<R> {
             now + connection.congestion.time_until_send().max(downtime),
             TimedEventData::Nothing,
         );
+    }
+
+    /// Updates the clients the app can send to (`Server::connections`), before the event that
+    /// tells it.
+    fn set_connected(&self, addr: SocketAddr, connected: bool) {
+        let mut set = self
+            .connected
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if connected {
+            set.insert(addr);
+        } else {
+            set.remove(&addr);
+        }
     }
 
     fn schedule_rate_limit_prune(&mut self, now: Instant) {
@@ -461,6 +479,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         }
         connection.closing = Some(reason);
+        self.set_connected(addr, false);
         let now = Instant::now();
         self.timed_events.push(
             TimedEventKey::CloseDeadline(addr),
@@ -516,6 +535,9 @@ impl<R: AuthResult> ServerThreadState<R> {
         }
         let from = attempt.0;
         let size = LoginResponse::Success.serialize(&crypto, &mut self.buf);
+        // The connection is inserted before the next command, so sends can go to it as soon as
+        // the client is connected.
+        self.set_connected(from, true);
         self.answer_login(attempt, size);
         let connection = Connection::new(
             crypto,
@@ -745,9 +767,10 @@ impl<R: AuthResult> ServerThreadState<R> {
         else {
             return;
         };
+        let data = disconnect.data.to_vec();
         self.connections.remove(&from);
-        self.event_tx
-            .send(Event::Disconnected(from, disconnect.data.to_vec()));
+        self.set_connected(from, false);
+        self.event_tx.send(Event::Disconnected(from, data));
     }
 
     fn handle_packet_latency_discovery_response(&mut self, size: usize, from: SocketAddr) {
@@ -867,6 +890,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Some(connection) = self.connections.remove(&addr) else {
             return;
         };
+        self.set_connected(addr, false);
         let reason = violation.to_string();
         let disconnect = Disconnect {
             data: reason.as_bytes(),

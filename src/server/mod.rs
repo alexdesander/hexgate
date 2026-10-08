@@ -6,11 +6,12 @@ use std::{
     io,
     net::SocketAddr,
     panic::{self, AssertUnwindSafe},
-    sync::Arc,
+    sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
     thread::JoinHandle,
     time::Duration,
 };
 
+use ahash::HashSet;
 use auth::{AuthResult, AuthThreadState, Authenticator};
 use bon::bon;
 use crossbeam::channel::{bounded, unbounded};
@@ -44,6 +45,9 @@ const CONNECTION_REQUEST_BURST: f64 = 20.0;
 /// ClientHellos answered per client IP (IPv6: per /64), including retransmissions.
 const CLIENT_HELLOS_PER_SECOND: f64 = 20.0;
 const CLIENT_HELLO_BURST: f64 = 40.0;
+
+/// Connected clients that aren't being closed, kept up to date by the network thread.
+type ConnectedSet = Arc<RwLock<HashSet<SocketAddr>>>;
 
 /// The public key clients pin (`client::ServerKey::Pinned`) for a server's `secret_key`.
 pub fn public_key(secret_key: &[u8; 32]) -> [u8; 32] {
@@ -87,6 +91,7 @@ impl<R: AuthResult> Clone for Server<R> {
 }
 
 struct ServerInner<R: AuthResult> {
+    connected: ConnectedSet,
     event_rx: EventReceiver<Event<R>>,
     cmd_tx: crossbeam::channel::Sender<thread::Cmd<R>>,
     waker: Arc<Waker>,
@@ -98,6 +103,31 @@ impl<R: AuthResult> Server<R> {
     /// The address the server is bound to (e.g. the port chosen for `bind_addr` port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The connected clients. A client is connected from its `Connected` event until it
+    /// disconnects, times out or is disconnected with `disconnect`.
+    pub fn connections(&self) -> Vec<SocketAddr> {
+        self.connected().iter().copied().collect()
+    }
+
+    pub fn is_connected(&self, client: SocketAddr) -> bool {
+        self.connected().contains(&client)
+    }
+
+    fn connected(&self) -> RwLockReadGuard<'_, HashSet<SocketAddr>> {
+        self.inner
+            .connected
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `disconnect` and `shutdown` take effect for sends right away.
+    fn connected_mut(&self) -> RwLockWriteGuard<'_, HashSet<SocketAddr>> {
+        self.inner
+            .connected
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Asks the network thread for a client's connection statistics, `None` if it isn't
@@ -135,6 +165,9 @@ impl<R: AuthResult> Server<R> {
         message: Vec<u8>,
     ) -> Result<(), SendError> {
         self.send_limits.check(channel, message.len())?;
+        if !self.is_connected(to) {
+            return Err(SendError::NotConnected(to));
+        }
         self.inner
             .cmd_tx
             .send(Cmd::Send(to, channel, message))
@@ -148,6 +181,7 @@ impl<R: AuthResult> Server<R> {
     /// The reason is sent to every client, at most 1183 bytes.
     pub fn shutdown(&self, reason: Vec<u8>) -> Result<(), TooLarge> {
         TooLarge::check(reason.len(), disconnect::MAX_DATA_SIZE)?;
+        self.connected_mut().clear();
         let _ = self.inner.cmd_tx.send(Cmd::Shutdown(reason));
         let _ = self.inner.waker.wake();
         Ok(())
@@ -157,6 +191,7 @@ impl<R: AuthResult> Server<R> {
     /// The reason is sent to the client, at most 1183 bytes.
     pub fn disconnect(&self, client: SocketAddr, reason: Vec<u8>) -> Result<(), TooLarge> {
         TooLarge::check(reason.len(), disconnect::MAX_DATA_SIZE)?;
+        self.connected_mut().remove(&client);
         let _ = self.inner.cmd_tx.send(Cmd::Disconnect(client, reason));
         let _ = self.inner.waker.wake();
         Ok(())
@@ -230,6 +265,8 @@ impl<R: AuthResult> Server<R> {
             .build()?;
         let local_addr = socket.local_addr()?;
         let (event_tx, event_rx) = events::channel(max_events);
+        let connected = ConnectedSet::default();
+        let thread_connected = connected.clone();
 
         let cipher = cipher.unwrap_or_else(SymCipher::better);
 
@@ -291,6 +328,7 @@ impl<R: AuthResult> Server<R> {
                     expecting_auth_result: Default::default(),
                     answered_logins: Default::default(),
                     connections: Default::default(),
+                    connected: thread_connected,
 
                     latency_discoveries_sent: Default::default(),
                     is_discovering_latencies: false,
@@ -304,6 +342,11 @@ impl<R: AuthResult> Server<R> {
                 };
                 let result = panic::catch_unwind(AssertUnwindSafe(|| state.run()))
                     .unwrap_or_else(|payload| Err(RecvError::panicked(payload)));
+                state
+                    .connected
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clear();
                 if let Err(e) = result {
                     state.event_tx.fail(e);
                 }
@@ -313,6 +356,7 @@ impl<R: AuthResult> Server<R> {
             send_limits,
             local_addr,
             inner: Arc::new(ServerInner {
+                connected,
                 event_rx,
                 cmd_tx,
                 waker,

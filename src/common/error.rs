@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{any::Any, io};
+use std::{any::Any, io, net::SocketAddr};
 
 use super::channel::Channel;
 
@@ -61,6 +61,10 @@ pub enum SendError {
     MessageTooLarge(TooLarge),
     #[error("channel {0:?} is not configured")]
     UnknownChannel(Channel),
+    /// The client isn't connected (see `Server::connections`). A client disconnecting at the
+    /// same time can still drop the message without this error.
+    #[error("{0} is not connected")]
+    NotConnected(SocketAddr),
     /// `next`/`try_next` report why.
     #[error("the network thread has stopped")]
     Stopped,
