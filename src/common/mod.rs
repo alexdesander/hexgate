@@ -18,9 +18,11 @@ const PROTOCOL_VERSION: u8 = 0;
 pub(crate) const RECV_TOKEN: Token = Token(0);
 pub(crate) const WAKE_TOKEN: Token = Token(1);
 
+/// The symmetric cipher of all connections, chosen by the server (`cipher`, by default the
+/// faster one on its CPU).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Cipher {
+pub enum Cipher {
     AES256GCM = 0,
     ChaCha20Poly1305 = 1,
 }
