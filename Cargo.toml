@@ -57,6 +57,8 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 [dev-dependencies]
 anyhow = "1.0.93"
 criterion = "0.8.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 text_io = "0.1.12"
 
 [[bench]]
@@ -71,4 +73,9 @@ required-features = ["bench"]
 
 [[bench]]
 name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "network"
+path = "benches/network/main.rs"
 harness = false
