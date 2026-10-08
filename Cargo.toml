@@ -15,7 +15,8 @@ include = [
     "/src",
     "/examples",
     "/LICENSE",
-    "/README.md"
+    "/README.md",
+    "/CHANGELOG.md"
 ]
 
 [package.metadata.docs.rs]
