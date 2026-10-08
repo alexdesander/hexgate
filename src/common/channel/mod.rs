@@ -281,26 +281,26 @@ impl Channels {
             if frames.resets_len == frames.resets.len() {
                 break;
             }
-            if let Some(offset) = send.reset_pending() {
-                if super::transport::frame::write_reset(w, channel as u8, offset) {
-                    send.reset_sent();
-                    frames.resets[frames.resets_len] = (channel as u8, offset);
-                    frames.resets_len += 1;
-                    wrote = true;
-                }
+            if let Some(offset) = send.reset_pending()
+                && super::transport::frame::write_reset(w, channel as u8, offset)
+            {
+                send.reset_sent();
+                frames.resets[frames.resets_len] = (channel as u8, offset);
+                frames.resets_len += 1;
+                wrote = true;
             }
         }
         for (channel, (_, recv)) in self.reliable.iter_mut().enumerate() {
             if frames.credits_len == frames.credits.len() {
                 break;
             }
-            if let Some(limit) = recv.credit_pending() {
-                if super::transport::frame::write_credit(w, channel as u8, limit) {
-                    recv.credit_sent(limit);
-                    frames.credits[frames.credits_len] = (channel as u8, limit);
-                    frames.credits_len += 1;
-                    wrote = true;
-                }
+            if let Some(limit) = recv.credit_pending()
+                && super::transport::frame::write_credit(w, channel as u8, limit)
+            {
+                recv.credit_sent(limit);
+                frames.credits[frames.credits_len] = (channel as u8, limit);
+                frames.credits_len += 1;
+                wrote = true;
             }
         }
         loop {
@@ -339,11 +339,9 @@ impl Channels {
                 Some((send, _)) => {
                     let receipt = send.receipt();
                     let written = matches!(send.write(w, capacity), Write::Wrote);
-                    if written {
-                        if let Some(id) = receipt {
-                            frames.receipts[frames.receipts_len] = (slot as u16, id);
-                            frames.receipts_len += 1;
-                        }
+                    if written && let Some(id) = receipt {
+                        frames.receipts[frames.receipts_len] = (slot as u16, id);
+                        frames.receipts_len += 1;
                     }
                     written
                 }
@@ -417,26 +415,26 @@ impl Channels {
             return Ok(None);
         }
         self.maintain(now);
-        if let Some(fragment) = fragment {
-            if fragment.total <= self.max_recv_msg_size as u64 {
-                let needed = self.unreliable[slot]
-                    .1
-                    .needs(msg_id, fragment.total as usize);
-                while needed > self.budget.left {
-                    let largest = self
-                        .unreliable
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, (_, recv))| {
-                            recv.oldest()
-                                .map(|created| (recv.allocated(), std::cmp::Reverse(created), i))
-                        })
-                        .max();
-                    let Some((_, _, channel)) = largest else {
-                        break;
-                    };
-                    self.unreliable[channel].1.reclaim(&mut self.budget);
-                }
+        if let Some(fragment) = fragment
+            && fragment.total <= self.max_recv_msg_size as u64
+        {
+            let needed = self.unreliable[slot]
+                .1
+                .needs(msg_id, fragment.total as usize);
+            while needed > self.budget.left {
+                let largest = self
+                    .unreliable
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (_, recv))| {
+                        recv.oldest()
+                            .map(|created| (recv.allocated(), std::cmp::Reverse(created), i))
+                    })
+                    .max();
+                let Some((_, _, channel)) = largest else {
+                    break;
+                };
+                self.unreliable[channel].1.reclaim(&mut self.budget);
             }
         }
         let recv = &mut self.unreliable[slot].1;

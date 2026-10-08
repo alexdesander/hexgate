@@ -113,12 +113,12 @@ impl Handshake {
                 continue;
             };
 
-            if let ServerKey::Pinned(key) = self.server_key {
-                if server_ed25519_pubkey.to_bytes() != key {
-                    return Err(ConnectError::ServerKeyMismatch {
-                        received_key: server_ed25519_pubkey.to_bytes(),
-                    });
-                }
+            if let ServerKey::Pinned(key) = self.server_key
+                && server_ed25519_pubkey.to_bytes() != key
+            {
+                return Err(ConnectError::ServerKeyMismatch {
+                    received_key: server_ed25519_pubkey.to_bytes(),
+                });
             }
             if channel_counts != self.channel_counts {
                 return Err(ConnectError::ChannelMismatch {
@@ -244,10 +244,10 @@ impl Link<'_> {
                     break;
                 };
                 receive_pending = true;
-                if (1..=1200).contains(&size) {
-                    if let Some(result) = parse(&mut buf[..size]) {
-                        return result.map(Some);
-                    }
+                if (1..=1200).contains(&size)
+                    && let Some(result) = parse(&mut buf[..size])
+                {
+                    return result.map(Some);
                 }
             }
             let wait = resend_at

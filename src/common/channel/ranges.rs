@@ -23,11 +23,11 @@ impl RangeSet {
             return;
         }
         let (mut start, mut end) = (range.start, range.end);
-        if let Some((&before, &before_end)) = self.ranges.range(..=start).next_back() {
-            if before_end >= start {
-                start = before;
-                end = end.max(before_end);
-            }
+        if let Some((&before, &before_end)) = self.ranges.range(..=start).next_back()
+            && before_end >= start
+        {
+            start = before;
+            end = end.max(before_end);
         }
         while let Some((&next, &next_end)) = self.ranges.range(start..).next() {
             if next > end {
@@ -43,13 +43,13 @@ impl RangeSet {
         if range.is_empty() {
             return;
         }
-        if let Some((&before, &before_end)) = self.ranges.range(..range.start).next_back() {
-            if before_end > range.start {
-                self.ranges.insert(before, range.start);
-                if before_end > range.end {
-                    self.ranges.insert(range.end, before_end);
-                    return;
-                }
+        if let Some((&before, &before_end)) = self.ranges.range(..range.start).next_back()
+            && before_end > range.start
+        {
+            self.ranges.insert(before, range.start);
+            if before_end > range.end {
+                self.ranges.insert(range.end, before_end);
+                return;
             }
         }
         while let Some((&next, &next_end)) = self.ranges.range(range.start..).next() {

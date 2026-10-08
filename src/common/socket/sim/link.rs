@@ -304,11 +304,11 @@ impl LinkState {
         self.stats.packets += 1;
         self.stats.bytes += packet.len() as u64;
 
-        if let Some(outages) = &mut self.outages {
-            if outages.at(now, &mut self.rng).contains(&now) {
-                self.stats.lost_outage += 1;
-                return Fate::Drop;
-            }
+        if let Some(outages) = &mut self.outages
+            && outages.at(now, &mut self.rng).contains(&now)
+        {
+            self.stats.lost_outage += 1;
+            return Fate::Drop;
         }
         if self.lose() {
             self.stats.lost += 1;
@@ -338,10 +338,10 @@ impl LinkState {
         self.stats.max_queue_delay = self.stats.max_queue_delay.max(waited);
 
         let mut delivery = departure + self.config.delay + self.jitter(departure);
-        if let (Some(spikes), Some(config)) = (&mut self.spikes, self.config.spikes) {
-            if spikes.at(departure, &mut self.rng).contains(&departure) {
-                delivery += config.extra;
-            }
+        if let (Some(spikes), Some(config)) = (&mut self.spikes, self.config.spikes)
+            && spikes.at(departure, &mut self.rng).contains(&departure)
+        {
+            delivery += config.extra;
         }
         let reordered = self
             .config

@@ -80,14 +80,14 @@ pub fn packets(data: &[u8]) {
     }
     let _ = LoginRequest::deserialize(&crypto, &mut buf);
     let _ = LoginResponse::deserialize(&crypto, &mut buf);
-    if let Ok(header) = packet::parse_header(&buf) {
-        if let Ok(payload) = packet::open(&crypto, &header, &mut buf) {
-            let mut r = Reader::new(payload);
-            while let Ok(Some(frame)) = frame::parse(&mut r) {
-                if let frame::Frame::Ack(ack) = frame {
-                    ack.ranges().for_each(drop);
-                    ack.timestamps().for_each(drop);
-                }
+    if let Ok(header) = packet::parse_header(&buf)
+        && let Ok(payload) = packet::open(&crypto, &header, &mut buf)
+    {
+        let mut r = Reader::new(payload);
+        while let Ok(Some(frame)) = frame::parse(&mut r) {
+            if let frame::Frame::Ack(ack) = frame {
+                ack.ranges().for_each(drop);
+                ack.timestamps().for_each(drop);
             }
         }
     }
@@ -239,11 +239,11 @@ pub fn progress(input: &[u8]) {
                 sender.on_acked(&frames);
             }
         }
-        if round % 4 == 3 {
-            if let Some((packet, frames)) = held.take() {
-                receive_frames(&mut receiver, &packet, Some(&mut expected));
-                sender.on_acked(&frames);
-            }
+        if round % 4 == 3
+            && let Some((packet, frames)) = held.take()
+        {
+            receive_frames(&mut receiver, &packet, Some(&mut expected));
+            sender.on_acked(&frames);
         }
         if round >= 32 || round % 8 == 0 {
             let mut budget = DeliveryBudget {

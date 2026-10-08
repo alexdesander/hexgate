@@ -961,7 +961,7 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
                 stream.latencies.push(latency);
                 if let Kind::Burst { count, .. } = stream.spec.kind {
                     let seq = u32::from_le_bytes(message[2..6].try_into().unwrap()) as usize;
-                    if (seq + 1) % count == 0 {
+                    if (seq + 1).is_multiple_of(count) {
                         stream.completions.push(latency);
                     }
                 }

@@ -527,10 +527,10 @@ fn send_phase(
             .unwrap_or(end)
             .min(end);
         // A pong ends the wait early, it is handled in the next round.
-        if let Ok(pong) = pong_rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
-            if let Some(sender) = senders.get_mut(pong as usize) {
-                sender.ping = None;
-            }
+        if let Ok(pong) = pong_rx.recv_timeout(next.saturating_duration_since(Instant::now()))
+            && let Some(sender) = senders.get_mut(pong as usize)
+        {
+            sender.ping = None;
         }
     }
     senders

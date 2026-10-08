@@ -393,24 +393,23 @@ impl<R: AuthResult> ServerThreadState<R> {
         let mut work = self.pending_work.take().unwrap();
         let remaining = match &mut work {
             PendingWork::Send(channel, recipients) => {
-                if let Some((addr, message)) = recipients.next() {
-                    if let Some(peer) = self.connections.get_mut(&addr) {
-                        if message.reservation.as_ref().is_some_and(|reservation| {
-                            Arc::ptr_eq(reservation.admission(), &peer.shared.admission)
-                        }) {
-                            peer.connection.push_message(*channel, message);
-                            self.dirty.push(addr);
-                        }
-                    }
+                if let Some((addr, message)) = recipients.next()
+                    && let Some(peer) = self.connections.get_mut(&addr)
+                    && message.reservation.as_ref().is_some_and(|reservation| {
+                        Arc::ptr_eq(reservation.admission(), &peer.shared.admission)
+                    })
+                {
+                    peer.connection.push_message(*channel, message);
+                    self.dirty.push(addr);
                 }
                 !recipients.as_slice().is_empty()
             }
             PendingWork::Flush(recipients) => {
-                if let Some(addr) = recipients.next() {
-                    if let Some(peer) = self.connections.get_mut(&addr) {
-                        peer.connection.flush();
-                        self.dirty.push(addr);
-                    }
+                if let Some(addr) = recipients.next()
+                    && let Some(peer) = self.connections.get_mut(&addr)
+                {
+                    peer.connection.flush();
+                    self.dirty.push(addr);
                 }
                 !recipients.as_slice().is_empty()
             }

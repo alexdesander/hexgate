@@ -381,13 +381,13 @@ impl Connection {
                     .channels
                     .on_unreliable(now, channel, msg_id, fragment, data)
                     .map(|message| {
-                        if let Some(message) = message {
-                            if budget.take(message.len()) {
-                                out.push(Output::Message(
-                                    channel.map_or(Channel::Unreliable, Channel::UnreliableOrdered),
-                                    message,
-                                ));
-                            }
+                        if let Some(message) = message
+                            && budget.take(message.len())
+                        {
+                            out.push(Output::Message(
+                                channel.map_or(Channel::Unreliable, Channel::UnreliableOrdered),
+                                message,
+                            ));
                         }
                     }),
                 Frame::Reliable {
@@ -551,20 +551,21 @@ impl Connection {
                 // case losses come in bursts.
                 self.pto_count += 1;
                 self.probes = 2;
-                if !self.channels.has_data(now) {
-                    if let Some(frames) = self.history.oldest_frames().copied() {
-                        self.channels.on_lost(&frames);
-                    }
+                if !self.channels.has_data(now)
+                    && let Some(frames) = self.history.oldest_frames().copied()
+                {
+                    self.channels.on_lost(&frames);
                 }
             }
         }
         if now >= self.last_eliciting + self.keepalive() {
             self.ping = true;
         }
-        if let Some(Close::Closing { attempts, next, .. }) = &self.close {
-            if *attempts >= CLOSE_ATTEMPTS && now >= *next {
-                self.close = Some(Close::Closed);
-            }
+        if let Some(Close::Closing { attempts, next, .. }) = &self.close
+            && *attempts >= CLOSE_ATTEMPTS
+            && now >= *next
+        {
+            self.close = Some(Close::Closed);
         }
         self.controller.maintain(now);
         false

@@ -45,12 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for frame in 0..180u32 {
         let started = Instant::now();
         while let Some(event) = server.try_next()? {
-            if let server::Event::Received(peer, Channel::UnreliableOrdered(0), input) = event {
-                if let Err(error) = server.send(peer, Channel::UnreliableOrdered(0), input) {
-                    if !matches!(error, SendError::Backpressure) {
-                        return Err(error.into());
-                    }
-                }
+            if let server::Event::Received(peer, Channel::UnreliableOrdered(0), input) = event
+                && let Err(error) = server.send(peer, Channel::UnreliableOrdered(0), input)
+                && !matches!(error, SendError::Backpressure)
+            {
+                return Err(error.into());
             }
         }
         while let Some(event) = client.try_next()? {
@@ -67,10 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..SendOptions::default()
             },
         );
-        if let Err(error) = result {
-            if !matches!(error, SendError::Backpressure) {
-                return Err(error.into());
-            }
+        if let Err(error) = result
+            && !matches!(error, SendError::Backpressure)
+        {
+            return Err(error.into());
         }
         if frame == 60 {
             client.reset_channel(1)?;

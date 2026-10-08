@@ -51,8 +51,8 @@ pub fn load<const N: usize>(path: impl AsRef<Path>) -> Result<Option<[u8; N]>, K
     }
     let digit = |d: u8| char::from(d).to_digit(16);
     let mut key = [0u8; N];
-    for (byte, pair) in key.iter_mut().zip(text.chunks_exact(2)) {
-        *byte = match (digit(pair[0]), digit(pair[1])) {
+    for (byte, &[high, low]) in key.iter_mut().zip(text.as_chunks::<2>().0) {
+        *byte = match (digit(high), digit(low)) {
             (Some(high), Some(low)) => (high * 16 + low) as u8,
             _ => return Err(malformed),
         };

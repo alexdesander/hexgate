@@ -165,10 +165,10 @@ impl SendStream {
     }
 
     pub fn reset_lost(&mut self, offset: u64) {
-        if let Some((latest, sent)) = &mut self.reset {
-            if *latest == offset {
-                *sent = false;
-            }
+        if let Some((latest, sent)) = &mut self.reset
+            && *latest == offset
+        {
+            *sent = false;
         }
     }
 
@@ -502,28 +502,28 @@ impl RecvStream {
     fn insert(&mut self, offset: u64, data: &[u8]) -> Result<(), ProtocolViolation> {
         let end = offset + data.len() as u64;
         let following = self.pending.remove(&end);
-        if let Some((&start, segment)) = self.pending.range_mut(..offset).next_back() {
-            if start + segment.len() as u64 == offset {
-                // Reuse the larger buffer when merging reordered fragments
-                match following {
-                    Some(mut following) if following.len() > segment.len() => {
-                        for &byte in data.iter().rev() {
-                            following.push_front(byte);
-                        }
-                        for byte in std::mem::take(segment).into_iter().rev() {
-                            following.push_front(byte);
-                        }
-                        *segment = following;
+        if let Some((&start, segment)) = self.pending.range_mut(..offset).next_back()
+            && start + segment.len() as u64 == offset
+        {
+            // Reuse the larger buffer when merging reordered fragments
+            match following {
+                Some(mut following) if following.len() > segment.len() => {
+                    for &byte in data.iter().rev() {
+                        following.push_front(byte);
                     }
-                    following => {
-                        segment.extend(data.iter().copied());
-                        if let Some(mut following) = following {
-                            segment.append(&mut following);
-                        }
+                    for byte in std::mem::take(segment).into_iter().rev() {
+                        following.push_front(byte);
+                    }
+                    *segment = following;
+                }
+                following => {
+                    segment.extend(data.iter().copied());
+                    if let Some(mut following) = following {
+                        segment.append(&mut following);
                     }
                 }
-                return Ok(());
             }
+            return Ok(());
         }
         if following.is_none() && self.pending.len() >= MAX_SEGMENTS {
             return Err(ProtocolViolation::Malformed);
