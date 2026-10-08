@@ -28,6 +28,8 @@ use rate_limit::RateLimiter;
 use siphasher::sip::SipHasher;
 use thread::{Cmd, ServerThreadState};
 
+#[cfg(feature = "sim")]
+use crate::common::socket::sim::Simulator;
 use crate::common::{
     AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
     channel::{Channel, SendLimits, scheduler::ChannelConfiguration},
@@ -37,7 +39,7 @@ use crate::common::{
     events::{self, EventReceiver, Payload},
     packets::info_response::MAX_INFO_SIZE,
     send::{self, Admission, Message, SendOptions, SendOutcome, SendQueueLimits},
-    socket::{Socket, sim::Simulator},
+    socket::Socket,
     stats::{ChannelStats, Stats},
     timed_event_queue::TimedEventQueue,
     transport,
@@ -398,6 +400,7 @@ impl<R: AuthResult> Server<R> {
 
     /// Simulates network conditions for the server's packets (of all clients),
     /// `Simulator::default()` turns it off. See [`crate::sim`].
+    #[cfg(feature = "sim")]
     pub fn set_simulator(&self, simulator: Simulator) -> Result<(), SendError> {
         self.command(Cmd::SetSimulator(simulator))
     }
@@ -429,6 +432,7 @@ impl<R: AuthResult> Server<R> {
         /// Send and receive buffer size of the socket, the OS default otherwise.
         socket_buffer_size: Option<usize>,
         /// Simulates network conditions from the first packet on, see [`crate::sim`].
+        #[cfg(feature = "sim")]
         simulator: Option<Simulator>,
         /// At most 256 bytes.
         info: Vec<u8>,
@@ -488,9 +492,10 @@ impl<R: AuthResult> Server<R> {
         let send_limits = SendLimits::new(&channel_config, max_send_msg_size);
         let socket = Socket::builder()
             .bind_addr(bind_addr)
-            .maybe_buffer_size_bytes(socket_buffer_size)
-            .maybe_simulator(simulator)
-            .build()?;
+            .maybe_buffer_size_bytes(socket_buffer_size);
+        #[cfg(feature = "sim")]
+        let socket = socket.maybe_simulator(simulator);
+        let socket = socket.build()?;
         let local_addr = socket.local_addr()?;
         let (event_tx, event_rx) = events::channel(max_events, max_recv_msg_size);
         let connected = ConnectedSet::default();

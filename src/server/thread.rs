@@ -21,6 +21,8 @@ use mio::{Events, Interest, Poll, Waker};
 use sha2::{Digest, Sha256};
 use siphasher::sip::SipHasher;
 
+#[cfg(feature = "sim")]
+use crate::common::socket::sim::Simulator;
 use crate::common::{
     AllowedClientVersions, Cipher, ClientVersion, PROTOCOL_VERSION, RECV_TOKEN, WAKE_TOKEN,
     channel::Channel,
@@ -40,7 +42,6 @@ use crate::common::{
         server_hello::{self, ServerHello},
     },
     send::{Admission, Message, SendQueueLimits},
-    socket::sim::Simulator,
     stats::{ChannelStats, Stats},
     timed_event_queue::TimedEventQueue,
     transport::{self, Connection, Output},
@@ -74,6 +75,7 @@ pub struct AnsweredLogin {
 }
 
 pub enum Cmd<R: AuthResult> {
+    #[cfg(feature = "sim")]
     SetSimulator(Simulator),
     Shutdown(Vec<u8>),
     Disconnect(SocketAddr, Arc<PeerState>, Vec<u8>),
@@ -380,6 +382,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                         self.dirty.push(addr);
                     }
                 }
+                #[cfg(feature = "sim")]
                 Cmd::SetSimulator(simulator) => self.socket.set_simulator(simulator),
             }
         }

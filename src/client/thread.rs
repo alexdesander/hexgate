@@ -15,6 +15,8 @@ use std::{
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use mio::{Events, Poll, Waker};
 
+#[cfg(feature = "sim")]
+use crate::common::socket::sim::Simulator;
 use crate::common::{
     RECV_TOKEN, WAKE_TOKEN,
     channel::Channel,
@@ -22,7 +24,6 @@ use crate::common::{
     events::{DeliveryBudget, EventSender},
     packets::rejected,
     send::Message,
-    socket::sim::Simulator,
     stats::{ChannelStats, Stats},
     transport::{Connection, Output},
 };
@@ -30,6 +31,7 @@ use crate::common::{
 use super::{Event, Socket};
 
 pub enum Cmd {
+    #[cfg(feature = "sim")]
     SetSimulator(Simulator),
     Disconnect(Vec<u8>),
     Send(Channel, Message),
@@ -169,6 +171,7 @@ impl ClientThreadState {
             }
             Cmd::ResetChannel(channel) => self.connection.reset_channel(channel),
             Cmd::SetPriority(channel, priority) => self.connection.set_priority(channel, priority),
+            #[cfg(feature = "sim")]
             Cmd::SetSimulator(simulator) => self.socket.set_simulator(simulator),
         }
     }

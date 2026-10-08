@@ -39,7 +39,7 @@ Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
 - Freshness measured from application submission, including connection startup
 - Per-tick API for games: `flush()` sends a tick as one burst, `gross_send_budget(tick)` gives an approximate gross packet budget
 - Timeouts, keepalives and connection statistics (RTT, queueing delay, send and delivery rate, loss, queued bytes)
-- Network simulation (`hexgate::sim`), both directions, on the network thread: presets from perfect to terrible,
+- Network simulation (`hexgate::sim`, `sim` feature), both directions, on the network thread: presets from perfect to terrible,
   bottleneck with buffer and cross traffic, jitter distributions, bursty loss, spikes, stalls, outages, reordering,
   duplication, corruption
 - Optional `tracing` instrumentation (`tracing` feature)

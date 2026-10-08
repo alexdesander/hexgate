@@ -17,11 +17,9 @@ use super::{
     handshake::{Handshake, Link},
     thread::Cmd,
 };
-use crate::common::{
-    RECV_TOKEN,
-    crypto::Crypto,
-    socket::{Socket, sim::Simulator},
-};
+#[cfg(feature = "sim")]
+use crate::common::socket::sim::Simulator;
+use crate::common::{RECV_TOKEN, crypto::Crypto, socket::Socket};
 
 type Connected = (Socket, Crypto, VerifyingKey, Vec<Cmd>);
 
@@ -30,7 +28,7 @@ pub(super) fn connect<A: ToSocketAddrs + Send + 'static>(
     address: A,
     bind: Option<SocketAddr>,
     buffer: Option<usize>,
-    mut simulator: Option<Simulator>,
+    #[cfg(feature = "sim")] mut simulator: Option<Simulator>,
     handshake: &Handshake,
     poll: &mut Poll,
     cmds: &Receiver<Cmd>,
@@ -94,6 +92,7 @@ pub(super) fn connect<A: ToSocketAddrs + Send + 'static>(
                 continue;
             }
         };
+        #[cfg(feature = "sim")]
         socket.set_simulator(simulator.take().unwrap_or_default());
         *local_addr.write().unwrap_or_else(PoisonError::into_inner) = Some(socket.local_addr()?);
         poll.registry()
@@ -113,7 +112,10 @@ pub(super) fn connect<A: ToSocketAddrs + Send + 'static>(
             Err(error) => return Err(error),
         }
         poll.registry().deregister(socket.mio_socket())?;
-        simulator = Some(socket.take_simulator());
+        #[cfg(feature = "sim")]
+        {
+            simulator = Some(socket.take_simulator());
+        }
         socket.discard_pending();
     }
     Err(last_error.into())

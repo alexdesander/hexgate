@@ -69,7 +69,7 @@
 //! Each `Server` and `Client` runs a network thread (`hexgate-server`, `hexgate-client`) that
 //! does all socket IO, encryption, retransmission and timers. The server runs your
 //! `Authenticator` on a second thread (`hexgate-auth`) and the key exchanges of new handshakes on
-//! a third (`hexgate-handshake`). A [`Simulator`] runs on the network thread. `Server` and `Client` are cheap handles (`Clone`, `Send`, `Sync`)
+//! a third (`hexgate-handshake`). A `Simulator` (`sim` feature) runs on the network thread. `Server` and `Client` are cheap handles (`Clone`, `Send`, `Sync`)
 //! that talk to the network thread through channels, so they can be used from any thread.
 //! Dropping the last handle closes the connections gracefully (see `close_linger`) and joins the
 //! network threads. A blocked authenticator or resolver can outlive the handle; late results
@@ -151,13 +151,14 @@ pub mod fuzz;
 pub mod server;
 
 pub use client::{Client, ServerKey};
+#[cfg(feature = "sim")]
+pub use common::socket::sim::{self, NetworkSimulator, Simulator};
 pub use common::{
     AllowedClientVersions, Cipher, ClientVersion,
     channel::{Channel, ChannelConfiguration},
     congestion::{Congestion, CongestionConfig},
     error, fingerprint, keys,
     send::{SendOptions, SendOutcome, SendQueueLimits},
-    socket::sim::{self, NetworkSimulator, Simulator},
     stats::{ChannelStats, Stats},
 };
 pub use server::{Authenticator, Server};

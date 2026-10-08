@@ -7,7 +7,7 @@
 //! to `target/netbench/`.
 //!
 //! ```text
-//! cargo bench --bench network -- [--quick] [--duration SECS] [--drain SECS] [--seed N]
+//! cargo bench --features sim --bench network -- [--quick] [--duration SECS] [--drain SECS] [--seed N]
 //!     [--profile NAME,..] [--workload NAME,..] [--out DIR] [--json] [--list]
 //! ```
 

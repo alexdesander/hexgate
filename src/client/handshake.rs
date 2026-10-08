@@ -276,6 +276,7 @@ impl Link<'_> {
             match cmd {
                 Cmd::Disconnect(_) => return Err(ConnectError::Cancelled),
                 Cmd::Stats(_) | Cmd::ChannelStats(_, _) => {}
+                #[cfg(feature = "sim")]
                 Cmd::SetSimulator(simulator) => {
                     self.pending.retain(|cmd| !matches!(cmd, Cmd::SetSimulator(_)));
                     self.pending.push(Cmd::SetSimulator(simulator));

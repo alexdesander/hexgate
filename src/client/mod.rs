@@ -25,6 +25,8 @@ use handshake::Handshake;
 use mio::{Poll, Waker};
 use thread::{ClientThreadState, Cmd};
 
+#[cfg(feature = "sim")]
+use crate::common::socket::sim::Simulator;
 use crate::common::{
     AllowedClientVersions, ClientVersion, WAKE_TOKEN,
     channel::{Channel, SendLimits, scheduler::ChannelConfiguration},
@@ -33,7 +35,7 @@ use crate::common::{
     events::{self, EventReceiver, Payload},
     packets::{info_request::InfoRequest, info_response::InfoResponse, login_request},
     send::{self, Admission, Message, SendOptions, SendOutcome, SendQueueLimits},
-    socket::{Socket, is_transient, sim::Simulator},
+    socket::{Socket, is_transient},
     stats::{ChannelStats, Stats},
     transport::{self, Connection},
 };
@@ -315,6 +317,7 @@ impl Client {
 
     /// Simulates network conditions for this client's packets, `Simulator::default()` turns it
     /// off. See [`crate::sim`].
+    #[cfg(feature = "sim")]
     pub fn set_simulator(&self, simulator: Simulator) -> Result<(), SendError> {
         self.command(Cmd::SetSimulator(simulator))
     }
@@ -397,6 +400,7 @@ impl Client {
         #[builder(default)]
         hash_auth_data: bool,
         /// Simulates network conditions from the first packet on, see [`crate::sim`].
+        #[cfg(feature = "sim")]
         simulator: Option<Simulator>,
         /// Send and receive buffer size of the socket, the OS default otherwise.
         socket_buffer_size: Option<usize>,
@@ -486,6 +490,7 @@ impl Client {
                         server_socket_addr,
                         bind_addr,
                         socket_buffer_size,
+                        #[cfg(feature = "sim")]
                         simulator,
                         &handshake,
                         &mut poll,
