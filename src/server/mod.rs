@@ -19,7 +19,7 @@ use ed25519_dalek::SigningKey;
 use mio::{Poll, Waker};
 use rate_limit::RateLimiter;
 use siphasher::sip::SipHasher;
-use thread::{Cmd, ServerThreadState};
+use thread::{Cmd, Recipients, ServerThreadState};
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, SendLimits},
@@ -168,9 +168,37 @@ impl<R: AuthResult> Server<R> {
         if !self.is_connected(to) {
             return Err(SendError::NotConnected(to));
         }
+        self.send_cmd(Recipients::One(to), channel, message)
+    }
+
+    /// Sends one message to every connected client, sharing one buffer.
+    pub fn broadcast(&self, channel: Channel, message: Vec<u8>) -> Result<(), SendError> {
+        self.send_limits.check(channel, message.len())?;
+        self.send_cmd(Recipients::All, channel, message)
+    }
+
+    /// Sends one message to several clients, sharing one buffer. Clients that aren't connected
+    /// are skipped.
+    pub fn send_many(
+        &self,
+        clients: impl IntoIterator<Item = SocketAddr>,
+        channel: Channel,
+        message: Vec<u8>,
+    ) -> Result<(), SendError> {
+        self.send_limits.check(channel, message.len())?;
+        let clients = clients.into_iter().collect();
+        self.send_cmd(Recipients::Many(clients), channel, message)
+    }
+
+    fn send_cmd(
+        &self,
+        recipients: Recipients,
+        channel: Channel,
+        message: Vec<u8>,
+    ) -> Result<(), SendError> {
         self.inner
             .cmd_tx
-            .send(Cmd::Send(to, channel, message))
+            .send(Cmd::Send(recipients, channel, message))
             .map_err(|_| SendError::Stopped)?;
         let _ = self.inner.waker.wake();
         Ok(())

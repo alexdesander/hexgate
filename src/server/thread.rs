@@ -77,10 +77,35 @@ pub enum Cmd<R: AuthResult> {
     SetInfo(Vec<u8>),
     AuthSuccess(LoginAttempt, R),
     AuthFailed(LoginAttempt, Vec<u8>),
-    Send(SocketAddr, Channel, Vec<u8>),
+    Send(Recipients, Channel, Vec<u8>),
     Stats(SocketAddr, Sender<Option<Stats>>),
     /// The authenticator panicked, the server shuts down and reports this.
     Failed(RecvError),
+}
+
+pub enum Recipients {
+    One(SocketAddr),
+    Many(Vec<SocketAddr>),
+    All,
+}
+
+/// Queues a message for a client that isn't being closed. Recipients share the buffer.
+fn queue_message(
+    timed_events: &mut TimedEventQueue<TimedEventKey, TimedEventData>,
+    addr: SocketAddr,
+    connection: &mut Connection,
+    channel: Channel,
+    message: &Rc<Vec<u8>>,
+) {
+    if connection.closing.is_some() {
+        return;
+    }
+    connection.channels.push(channel, message.clone());
+    timed_events.push(
+        TimedEventKey::Send(addr),
+        connection.last_sent + connection.congestion.downtime_between_batches(),
+        TimedEventData::Nothing,
+    );
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -213,20 +238,30 @@ impl<R: AuthResult> ServerThreadState<R> {
                 Cmd::AuthFailed(attempt, vec) => {
                     self.handle_cmd_auth_failure(attempt, vec);
                 }
-                Cmd::Send(socket_addr, channel, message) => {
-                    let Some(connection) = self
-                        .connections
-                        .get_mut(&socket_addr)
-                        .filter(|connection| connection.closing.is_none())
-                    else {
-                        continue;
+                Cmd::Send(recipients, channel, message) => {
+                    let message = Rc::new(message);
+                    let mut queue = |addr: SocketAddr, connection: &mut Connection| {
+                        queue_message(&mut self.timed_events, addr, connection, channel, &message)
                     };
-                    connection.channels.push(channel, Rc::new(message));
-                    self.timed_events.push(
-                        TimedEventKey::Send(socket_addr),
-                        connection.last_sent + connection.congestion.downtime_between_batches(),
-                        TimedEventData::Nothing,
-                    );
+                    match recipients {
+                        Recipients::One(addr) => {
+                            if let Some(connection) = self.connections.get_mut(&addr) {
+                                queue(addr, connection);
+                            }
+                        }
+                        Recipients::Many(addrs) => {
+                            for addr in addrs {
+                                if let Some(connection) = self.connections.get_mut(&addr) {
+                                    queue(addr, connection);
+                                }
+                            }
+                        }
+                        Recipients::All => {
+                            for (addr, connection) in &mut self.connections {
+                                queue(*addr, connection);
+                            }
+                        }
+                    }
                 }
                 Cmd::Stats(addr, reply) => {
                     let _ = reply.send(self.connections.get(&addr).map(|connection| {
