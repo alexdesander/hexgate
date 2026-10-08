@@ -108,24 +108,24 @@ impl ServerHello {
         }
     }
 
-    pub fn deserialize(buf: &[u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(buf: &[u8]) -> Result<Self, PacketError> {
         if buf.is_empty() {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
         if buf[0] == PacketIdentifier::ServerHelloVersionSupported as u8 {
             if buf.len() != 58 {
-                return Err(ERROR_INVALID_BUFFER_SIZE);
+                return Err(PacketError::Size);
             }
             let salt = buf[1..5].try_into().unwrap();
             let timestamp = buf[5..13].try_into().unwrap();
             let Ok(server_ed25519_pubkey) =
                 VerifyingKey::from_bytes(&buf[13..45].try_into().unwrap())
             else {
-                return Err(ERROR_INVALID_SERVER_ED25519_PUBKEY);
+                return Err(PacketError::ServerKey);
             };
             let siphash = u64::from_le_bytes(buf[45..53].try_into().unwrap());
-            let Ok(cipher) = Cipher::try_from(buf[53]) else {
-                return Err(ERROR_INVALID_CIPHER);
+            let Some(cipher) = Cipher::from_byte(buf[53]) else {
+                return Err(PacketError::Cipher);
             };
             return Ok(ServerHello::VersionSupported {
                 salt,
@@ -142,7 +142,7 @@ impl ServerHello {
 
         if buf[0] == PacketIdentifier::ServerHelloVersionNotSupported as u8 {
             if buf.len() != 17 {
-                return Err(ERROR_INVALID_BUFFER_SIZE);
+                return Err(PacketError::Size);
             }
             let salt = buf[1..5].try_into().unwrap();
             let allowed_versions = AllowedClientVersions {
@@ -165,7 +165,7 @@ impl ServerHello {
 
         if buf[0] == PacketIdentifier::ServerHelloServerFull as u8 {
             if buf.len() != 5 {
-                return Err(ERROR_INVALID_BUFFER_SIZE);
+                return Err(PacketError::Size);
             }
             return Ok(ServerHello::ServerFull {
                 salt: buf[1..5].try_into().unwrap(),
@@ -174,7 +174,7 @@ impl ServerHello {
 
         if buf[0] == PacketIdentifier::ServerHelloProtocolMismatch as u8 {
             if buf.len() != 6 {
-                return Err(ERROR_INVALID_BUFFER_SIZE);
+                return Err(PacketError::Size);
             }
             return Ok(ServerHello::ProtocolMismatch {
                 salt: buf[1..5].try_into().unwrap(),
@@ -182,6 +182,6 @@ impl ServerHello {
             });
         }
 
-        Err(ERROR_INVALID_PACKET_IDENTIFIER)
+        Err(PacketError::Identifier)
     }
 }

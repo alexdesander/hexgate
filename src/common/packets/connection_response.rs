@@ -74,13 +74,13 @@ impl ConnectionResponse {
         client_x25519_key: &ReusableSecret,
         hkdf_salt: [u8; 32],
         transcript: &Transcript,
-    ) -> Result<(Self, Crypto), &'static str> {
+    ) -> Result<(Self, Crypto), PacketError> {
         if buf.len() != SIZE {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
 
         if buf[0] != PacketIdentifier::ConnectionResponse as u8 {
-            return Err(ERROR_INVALID_PACKET_IDENTIFIER);
+            return Err(PacketError::Identifier);
         }
 
         let signature = buf[69..SIZE].try_into().unwrap();
@@ -88,7 +88,7 @@ impl ConnectionResponse {
             .verify_strict(&transcript.digest(&buf[..69]), &signature)
             .is_err()
         {
-            return Err(ERROR_INVALID_SIGNATURE);
+            return Err(PacketError::Signature);
         }
 
         let server_x25519_pubkey: [u8; 32] = buf[5..37].try_into().unwrap();
@@ -100,7 +100,7 @@ impl ConnectionResponse {
         let tag: [u8; 16] = buf[53..69].try_into().unwrap();
         let mut auth_salt: [u8; 16] = buf[37..53].try_into().unwrap();
         if crypto.decrypt(&NONCE, &[], &mut auth_salt, &tag).is_err() {
-            return Err(ERROR_INVALID_TAG);
+            return Err(PacketError::Tag);
         }
 
         Ok((

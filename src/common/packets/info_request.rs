@@ -21,21 +21,21 @@ impl InfoRequest {
         257
     }
 
-    pub fn deserialize(buf: &[u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(buf: &[u8]) -> Result<Self, PacketError> {
         if buf.len() != 257 {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
 
         if buf[0] != PacketIdentifier::InfoRequest as u8 {
-            return Err(ERROR_INVALID_PACKET_IDENTIFIER);
+            return Err(PacketError::Identifier);
         }
 
         if &buf[1..8] != MAGIC.as_bytes() {
-            return Err(ERROR_INVALID_MAGIC);
+            return Err(PacketError::Magic);
         }
 
         if buf[8] != PROTOCOL_VERSION {
-            return Err(ERROR_INVALID_PROTOCOL_VERSION);
+            return Err(PacketError::ProtocolVersion);
         }
 
         Ok(InfoRequest)

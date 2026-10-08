@@ -21,19 +21,19 @@ impl LatencyDiscoveryResponse {
         9
     }
 
-    pub fn deserialize(crypto: &Crypto, buf: &[u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(crypto: &Crypto, buf: &[u8]) -> Result<Self, PacketError> {
         if buf.len() != 9 {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
         if PacketIdentifier::try_from(buf[0])? != PacketIdentifier::LatencyDiscoveryResponse {
-            return Err(ERROR_INVALID_PACKET_IDENTIFIER);
+            return Err(PacketError::Identifier);
         }
         let sequence_number = u32::from_le_bytes(buf[1..5].try_into().unwrap());
         let truncated_siphash = u32::from_le_bytes(buf[5..9].try_into().unwrap());
         let hash = crypto.hash_in(&buf[0..5]).to_le_bytes();
         let expected_truncated_siphash = u32::from_le_bytes(hash[..4].try_into().unwrap());
         if truncated_siphash != expected_truncated_siphash {
-            return Err(ERROR_SIPHASH_MISMATCH);
+            return Err(PacketError::SipHash);
         }
         Ok(Self {
             sequence_number,

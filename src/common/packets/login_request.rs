@@ -43,13 +43,13 @@ impl<'a> LoginRequest<'a> {
         1200
     }
 
-    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, PacketError> {
         if buf.len() != 1200 {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
 
         if buf[0] != PacketIdentifier::LoginRequest as u8 {
-            return Err(ERROR_INVALID_PACKET_IDENTIFIER);
+            return Err(PacketError::Identifier);
         }
 
         let tag: [u8; 16] = buf[1184..1200].try_into().unwrap();
@@ -58,12 +58,12 @@ impl<'a> LoginRequest<'a> {
             .decrypt(&NONCE, &aad, &mut buf[5..1184], &tag)
             .is_err()
         {
-            return Err(ERROR_INVALID_TAG);
+            return Err(PacketError::Tag);
         }
 
         let auth_data_len = u16::from_le_bytes(buf[5..7].try_into().unwrap()) as usize;
         if auth_data_len > MAX_AUTH_DATA_SIZE {
-            return Err(ERROR_INVALID_DATA_SIZE);
+            return Err(PacketError::DataSize);
         }
         let auth_data = &buf[7..7 + auth_data_len];
 

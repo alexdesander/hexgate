@@ -6,11 +6,9 @@
 
 use integer_encoding::VarInt;
 
-use crate::common::{crypto::Crypto, packets::ERROR_INVALID_BUFFER_SIZE};
+use crate::common::crypto::Crypto;
 
-use super::{
-    PacketIdentifier, ERROR_INVALID_PACKET_IDENTIFIER, ERROR_INVALID_TAG, ERROR_MALFORMED_PACKET,
-};
+use super::{PacketError, PacketIdentifier};
 
 #[derive(Debug)]
 pub enum ReliablePayload<'a> {
@@ -97,18 +95,18 @@ impl<'a> ReliablePayload<'a> {
         }
     }
 
-    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, PacketError> {
         if buf.len() < 19 {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
         if buf[0] == PacketIdentifier::ReliablePayloadNoAcks as u8 {
             let channel_id = buf[1];
             let Some((packet_id, packet_id_size)) = u64::decode_var(&buf[2..]) else {
-                return Err(ERROR_MALFORMED_PACKET);
+                return Err(PacketError::Malformed);
             };
             let len = buf.len();
             if 18 + packet_id_size > len {
-                return Err(ERROR_INVALID_BUFFER_SIZE);
+                return Err(PacketError::Size);
             }
             let mut nonce = [0u8; 12];
             nonce[0] = buf[0];
@@ -119,7 +117,7 @@ impl<'a> ReliablePayload<'a> {
                 .decrypt(&nonce, &[], &mut buf[2 + packet_id_size..len - 16], &tag)
                 .is_err()
             {
-                return Err(ERROR_INVALID_TAG);
+                return Err(PacketError::Tag);
             }
             return Ok(ReliablePayload::NoAcks {
                 channel_id,
@@ -127,7 +125,7 @@ impl<'a> ReliablePayload<'a> {
                 payload: &buf[2 + packet_id_size..len - 16],
             });
         }
-        Err(ERROR_INVALID_PACKET_IDENTIFIER)
+        Err(PacketError::Identifier)
     }
 }
 
@@ -209,18 +207,18 @@ impl ReliablePayloadOwned {
         }
     }
 
-    pub fn deserialize(crypto: &Crypto, buf: &mut [u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(crypto: &Crypto, buf: &mut [u8]) -> Result<Self, PacketError> {
         if buf.len() < 19 {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
         if buf[0] == PacketIdentifier::ReliablePayloadNoAcks as u8 {
             let channel_id = buf[1];
             let Some((packet_id, packet_id_size)) = u64::decode_var(&buf[2..]) else {
-                return Err(ERROR_MALFORMED_PACKET);
+                return Err(PacketError::Malformed);
             };
             let len = buf.len();
             if 18 + packet_id_size > len {
-                return Err(ERROR_INVALID_BUFFER_SIZE);
+                return Err(PacketError::Size);
             }
             let mut nonce = [0u8; 12];
             nonce[0] = buf[0];
@@ -231,7 +229,7 @@ impl ReliablePayloadOwned {
                 .decrypt(&nonce, &[], &mut buf[2 + packet_id_size..len - 16], &tag)
                 .is_err()
             {
-                return Err(ERROR_INVALID_TAG);
+                return Err(PacketError::Tag);
             }
             return Ok(ReliablePayloadOwned::NoAcks {
                 channel_id,
@@ -239,7 +237,7 @@ impl ReliablePayloadOwned {
                 payload: buf[2 + packet_id_size..len - 16].to_vec(),
             });
         }
-        Err(ERROR_INVALID_PACKET_IDENTIFIER)
+        Err(PacketError::Identifier)
     }
 }
 

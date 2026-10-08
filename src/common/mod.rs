@@ -28,14 +28,12 @@ pub enum Cipher {
     ChaCha20Poly1305 = 1,
 }
 
-impl TryFrom<u8> for Cipher {
-    type Error = &'static str;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Cipher::AES256GCM),
-            1 => Ok(Cipher::ChaCha20Poly1305),
-            _ => Err("Invalid cipher"),
+impl Cipher {
+    pub(crate) fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Cipher::AES256GCM),
+            1 => Some(Cipher::ChaCha20Poly1305),
+            _ => None,
         }
     }
 }

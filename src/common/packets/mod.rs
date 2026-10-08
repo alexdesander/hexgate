@@ -22,17 +22,32 @@ use integer_encoding::VarInt;
 
 const MAGIC: &str = "HEXGATE";
 
-const ERROR_INVALID_PROTOCOL_VERSION: &str = "Invalid protocol version";
-const ERROR_INVALID_MAGIC: &str = "Invalid magic";
-const ERROR_INVALID_BUFFER_SIZE: &str = "Invalid buffer size";
-const ERROR_INVALID_PACKET_IDENTIFIER: &str = "Invalid packet identifier";
-const ERROR_INVALID_CIPHER: &str = "Invalid cipher";
-const ERROR_INVALID_SERVER_ED25519_PUBKEY: &str = "Invalid server ed25519 pubkey";
-const ERROR_INVALID_SIGNATURE: &str = "Invalid signature";
-const ERROR_INVALID_TAG: &str = "Invalid tag";
-const ERROR_INVALID_DATA_SIZE: &str = "Invalid auth data size";
-const ERROR_SIPHASH_MISMATCH: &str = "Siphash mismatch";
-const ERROR_MALFORMED_PACKET: &str = "Malformed packet";
+/// Why a datagram was not accepted as a packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PacketError {
+    #[error("invalid protocol version")]
+    ProtocolVersion,
+    #[error("invalid magic")]
+    Magic,
+    #[error("invalid packet size")]
+    Size,
+    #[error("invalid packet identifier")]
+    Identifier,
+    #[error("invalid cipher")]
+    Cipher,
+    #[error("invalid server ed25519 key")]
+    ServerKey,
+    #[error("invalid signature")]
+    Signature,
+    #[error("invalid authentication tag")]
+    Tag,
+    #[error("invalid data size")]
+    DataSize,
+    #[error("siphash mismatch")]
+    SipHash,
+    #[error("malformed packet")]
+    Malformed,
+}
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -70,7 +85,7 @@ fn decode_var_u32(buf: &[u8]) -> Option<(u32, usize)> {
 }
 
 impl TryFrom<u8> for PacketIdentifier {
-    type Error = &'static str;
+    type Error = PacketError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -98,7 +113,7 @@ impl TryFrom<u8> for PacketIdentifier {
             21 => Ok(PacketIdentifier::ReliablePayloadNoAcks),
             22 => Ok(PacketIdentifier::ServerHelloServerFull),
             23 => Ok(PacketIdentifier::ServerHelloProtocolMismatch),
-            _ => Err(ERROR_INVALID_PACKET_IDENTIFIER),
+            _ => Err(PacketError::Identifier),
         }
     }
 }

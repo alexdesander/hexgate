@@ -25,13 +25,13 @@ impl<'a> InfoResponse<'a> {
         1 + self.data.len()
     }
 
-    pub fn deserialize(buf: &'a [u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(buf: &'a [u8]) -> Result<Self, PacketError> {
         if buf.len() > 257 || buf.is_empty() {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
 
         if buf[0] != PacketIdentifier::InfoResponse as u8 {
-            return Err(ERROR_INVALID_PACKET_IDENTIFIER);
+            return Err(PacketError::Identifier);
         }
 
         Ok(InfoResponse { data: &buf[1..] })

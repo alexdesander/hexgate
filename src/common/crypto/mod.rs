@@ -8,7 +8,7 @@ use siphasher::sip::SipHasher;
 use sym::SymCipher;
 use x25519_dalek::SharedSecret;
 
-use super::Cipher;
+use super::{packets::PacketError, Cipher};
 
 pub mod sym;
 
@@ -61,12 +61,14 @@ impl Crypto {
         aad: &[u8],
         to_decrypt: &mut [u8],
         tag: &[u8; 16],
-    ) -> Result<(), ()> {
+    ) -> Result<(), PacketError> {
         // Fuzzing must reach the code behind authentication, see `crate::fuzz`.
         if cfg!(fuzzing) {
             return Ok(());
         }
-        self.sym_in.decrypt(nonce, aad, to_decrypt, tag)
+        self.sym_in
+            .decrypt(nonce, aad, to_decrypt, tag)
+            .map_err(|_| PacketError::Tag)
     }
 
     pub fn hash_out(&self, data: &[u8]) -> u64 {

@@ -6,10 +6,8 @@ use integer_encoding::VarInt;
 
 use crate::common::{
     crypto::Crypto,
-    packets::{PacketIdentifier, ERROR_INVALID_TAG, ERROR_MALFORMED_PACKET},
+    packets::{PacketError, PacketIdentifier},
 };
-
-use super::{ERROR_INVALID_BUFFER_SIZE, ERROR_INVALID_PACKET_IDENTIFIER};
 
 pub const ACK_BITFIELD_SIZE: usize = 16;
 
@@ -38,29 +36,29 @@ impl Acks {
         end + 8
     }
 
-    pub fn deserialize(crypto: &Crypto, buf: &[u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(crypto: &Crypto, buf: &[u8]) -> Result<Self, PacketError> {
         if buf.len() < 12 {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
         if buf[0] != PacketIdentifier::Acks as u8 {
-            return Err(ERROR_INVALID_PACKET_IDENTIFIER);
+            return Err(PacketError::Identifier);
         }
         let (data, hash) = buf.split_at(buf.len() - 8);
         if crypto.hash_in(data).to_le_bytes() != hash {
-            return Err(ERROR_INVALID_TAG);
+            return Err(PacketError::Tag);
         }
         let channel_id = data[1];
         let Some((packet_id, packet_id_size)) = u64::decode_var(&data[2..]) else {
-            return Err(ERROR_MALFORMED_PACKET);
+            return Err(PacketError::Malformed);
         };
         let Some((lowest_unreceived, lowest_unreceived_size)) =
             u64::decode_var(&data[2 + packet_id_size..])
         else {
-            return Err(ERROR_MALFORMED_PACKET);
+            return Err(PacketError::Malformed);
         };
         let Ok(ack_bitfield) = data[2 + packet_id_size + lowest_unreceived_size..].try_into()
         else {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         };
         Ok(Acks {
             channel_id,

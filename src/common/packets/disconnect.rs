@@ -32,9 +32,9 @@ impl<'a> Disconnect<'a> {
         17 + self.data.len()
     }
 
-    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, PacketError> {
         if buf.len() < 17 || buf.len() > 1200 {
-            return Err(ERROR_INVALID_DATA_SIZE);
+            return Err(PacketError::DataSize);
         }
         let aad: [u8; 1] = buf[0..1].try_into().unwrap();
         let tag: [u8; 16] = buf[buf.len() - 16..].try_into().unwrap();
@@ -43,7 +43,7 @@ impl<'a> Disconnect<'a> {
             .decrypt(&NONCE, &aad, &mut buf[1..len - 16], &tag)
             .is_err()
         {
-            return Err(ERROR_INVALID_TAG);
+            return Err(PacketError::Tag);
         }
         Ok(Disconnect {
             data: &buf[1..buf.len() - 16],

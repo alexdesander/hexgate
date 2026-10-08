@@ -6,10 +6,7 @@ use integer_encoding::VarInt;
 
 use crate::common::{crypto::Crypto, packets::PacketIdentifier};
 
-use super::{
-    decode_var_u32, ERROR_INVALID_BUFFER_SIZE, ERROR_INVALID_PACKET_IDENTIFIER,
-    ERROR_MALFORMED_PACKET,
-};
+use super::{decode_var_u32, PacketError};
 
 pub const UNRELIABLE_STANDALONE_PAYLOAD_MAX_PAYLOAD_SIZE: usize = 1178;
 pub const UNRELIABLE_FRAGMENTED_PAYLOAD_MAX_PAYLOAD_SIZE: usize = 1173;
@@ -183,21 +180,21 @@ impl<'a> UnreliablePayload<'a> {
         }
     }
 
-    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, PacketError> {
         let Some(&identifier) = buf.first() else {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         };
         match PacketIdentifier::try_from(identifier)? {
             PacketIdentifier::UnreliableStandalonePayload => {
                 if buf.len() < 18 {
-                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                    return Err(PacketError::Size);
                 }
                 let Some((message_id, message_id_size)) = decode_var_u32(&buf[1..]) else {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 };
                 let len = buf.len();
                 if 1 + message_id_size + 16 > len {
-                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                    return Err(PacketError::Size);
                 }
                 let mut nonce = [0u8; 12];
                 nonce[0] = buf[0];
@@ -207,7 +204,7 @@ impl<'a> UnreliablePayload<'a> {
                     .decrypt(&nonce, &[], &mut buf[1 + message_id_size..len - 16], &tag)
                     .is_err()
                 {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 }
                 Ok(UnreliablePayload::Standalone {
                     message_id,
@@ -217,19 +214,19 @@ impl<'a> UnreliablePayload<'a> {
             PacketIdentifier::UnreliableFragmentedPayload
             | PacketIdentifier::UnreliableFragmentedPayloadLast => {
                 if buf.len() < 19 {
-                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                    return Err(PacketError::Size);
                 }
                 let Some((message_id, message_id_size)) = decode_var_u32(&buf[1..]) else {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 };
                 let Some((fragment_id, fragment_id_size)) =
                     decode_var_u32(&buf[1 + message_id_size..])
                 else {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 };
                 let len = buf.len();
                 if 1 + message_id_size + fragment_id_size + 16 > len {
-                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                    return Err(PacketError::Size);
                 }
                 let mut nonce = [0u8; 12];
                 nonce[0] = buf[0];
@@ -247,7 +244,7 @@ impl<'a> UnreliablePayload<'a> {
                     )
                     .is_err()
                 {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 }
                 Ok(UnreliablePayload::Fragmented {
                     message_id,
@@ -258,15 +255,15 @@ impl<'a> UnreliablePayload<'a> {
             }
             PacketIdentifier::UnreliableOrderedStandalonePayload => {
                 if buf.len() < 19 {
-                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                    return Err(PacketError::Size);
                 }
                 let channel_id = buf[1];
                 let Some((message_id, message_id_size)) = decode_var_u32(&buf[2..]) else {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 };
                 let len = buf.len();
                 if 2 + message_id_size + 16 > len {
-                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                    return Err(PacketError::Size);
                 }
                 let mut nonce = [0u8; 12];
                 nonce[0] = buf[0];
@@ -277,7 +274,7 @@ impl<'a> UnreliablePayload<'a> {
                     .decrypt(&nonce, &[], &mut buf[2 + message_id_size..len - 16], &tag)
                     .is_err()
                 {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 }
                 Ok(UnreliablePayload::OrderedStandalone {
                     channel_id,
@@ -288,20 +285,20 @@ impl<'a> UnreliablePayload<'a> {
             PacketIdentifier::UnreliableOrderedFragmentedPayload
             | PacketIdentifier::UnreliableOrderedFragmentedPayloadLast => {
                 if buf.len() < 20 {
-                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                    return Err(PacketError::Size);
                 }
                 let channel_id = buf[1];
                 let Some((message_id, message_id_size)) = decode_var_u32(&buf[2..]) else {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 };
                 let Some((fragment_id, fragment_id_size)) =
                     decode_var_u32(&buf[2 + message_id_size..])
                 else {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 };
                 let len = buf.len();
                 if 2 + message_id_size + fragment_id_size + 16 > len {
-                    return Err(ERROR_INVALID_BUFFER_SIZE);
+                    return Err(PacketError::Size);
                 }
                 let mut nonce = [0u8; 12];
                 nonce[0] = buf[0];
@@ -320,7 +317,7 @@ impl<'a> UnreliablePayload<'a> {
                     )
                     .is_err()
                 {
-                    return Err(ERROR_MALFORMED_PACKET);
+                    return Err(PacketError::Malformed);
                 }
                 Ok(UnreliablePayload::OrderedFragmented {
                     channel_id,
@@ -331,7 +328,7 @@ impl<'a> UnreliablePayload<'a> {
                     payload: &buf[2 + message_id_size + fragment_id_size..len - 16],
                 })
             }
-            _ => Err(ERROR_INVALID_PACKET_IDENTIFIER),
+            _ => Err(PacketError::Identifier),
         }
     }
 }

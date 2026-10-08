@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use aes_gcm::{aead::AeadInPlace, Aes256Gcm, KeyInit};
+use aes_gcm::{
+    aead::{self, AeadInPlace},
+    Aes256Gcm, KeyInit,
+};
 use chacha20poly1305::ChaCha20Poly1305;
 
 use crate::common::Cipher;
@@ -41,14 +44,14 @@ impl SymCipher {
         aad: &[u8],
         to_decrypt: &mut [u8],
         tag: &[u8; 16],
-    ) -> Result<(), ()> {
+    ) -> Result<(), aead::Error> {
         match self {
-            SymCipher::AES256GCM(cipher) => cipher
-                .decrypt_in_place_detached(nonce.into(), aad, to_decrypt, tag.into())
-                .map_err(|_| ()),
-            SymCipher::ChaCha20Poly1305(cipher) => cipher
-                .decrypt_in_place_detached(nonce.into(), aad, to_decrypt, tag.into())
-                .map_err(|_| ()),
+            SymCipher::AES256GCM(cipher) => {
+                cipher.decrypt_in_place_detached(nonce.into(), aad, to_decrypt, tag.into())
+            }
+            SymCipher::ChaCha20Poly1305(cipher) => {
+                cipher.decrypt_in_place_detached(nonce.into(), aad, to_decrypt, tag.into())
+            }
         }
     }
 

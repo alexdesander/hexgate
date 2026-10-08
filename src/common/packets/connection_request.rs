@@ -32,18 +32,18 @@ impl ConnectionRequest {
         SIZE
     }
 
-    pub fn deserialize(buf: &[u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(buf: &[u8]) -> Result<Self, PacketError> {
         if buf.len() != SIZE {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
 
         if buf[0] != PacketIdentifier::ConnectionRequest as u8 {
-            return Err(ERROR_INVALID_PACKET_IDENTIFIER);
+            return Err(PacketError::Identifier);
         }
 
         let Ok(server_ed25519_pubkey) = VerifyingKey::from_bytes(buf[13..45].try_into().unwrap())
         else {
-            return Err(ERROR_INVALID_SERVER_ED25519_PUBKEY);
+            return Err(PacketError::ServerKey);
         };
 
         let client_x25519_pubkey: [u8; 32] = buf[53..85].try_into().unwrap();

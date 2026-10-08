@@ -44,24 +44,24 @@ impl<'a> LoginResponse<'a> {
         }
     }
 
-    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, &'static str> {
+    pub fn deserialize(crypto: &Crypto, buf: &'a mut [u8]) -> Result<Self, PacketError> {
         if buf.is_empty() {
-            return Err(ERROR_INVALID_BUFFER_SIZE);
+            return Err(PacketError::Size);
         }
         if buf[0] == PacketIdentifier::LoginSuccess as u8 {
             if buf.len() != 17 {
-                return Err(ERROR_INVALID_BUFFER_SIZE);
+                return Err(PacketError::Size);
             }
             let tag: [u8; 16] = buf[1..17].try_into().unwrap();
             if crypto.decrypt(&NONCE, &buf[0..1], &mut [], &tag).is_err() {
-                return Err(ERROR_INVALID_TAG);
+                return Err(PacketError::Tag);
             }
             return Ok(LoginResponse::Success);
         }
 
         if buf[0] == PacketIdentifier::LoginFailure as u8 {
             if buf.len() != 1200 {
-                return Err(ERROR_INVALID_BUFFER_SIZE);
+                return Err(PacketError::Size);
             }
             let tag: [u8; 16] = buf[1184..1200].try_into().unwrap();
             let aad: [u8; 1] = buf[0..1].try_into().unwrap();
@@ -69,17 +69,17 @@ impl<'a> LoginResponse<'a> {
                 .decrypt(&NONCE, &aad, &mut buf[1..1184], &tag)
                 .is_err()
             {
-                return Err(ERROR_INVALID_TAG);
+                return Err(PacketError::Tag);
             }
 
             let data_size = u16::from_le_bytes(buf[1..3].try_into().unwrap()) as usize;
             if data_size > MAX_FAILURE_DATA_SIZE {
-                return Err(ERROR_INVALID_DATA_SIZE);
+                return Err(PacketError::DataSize);
             }
             let failure_data = &buf[3..3 + data_size];
             return Ok(LoginResponse::Failure { failure_data });
         }
 
-        Err(ERROR_INVALID_PACKET_IDENTIFIER)
+        Err(PacketError::Identifier)
     }
 }
