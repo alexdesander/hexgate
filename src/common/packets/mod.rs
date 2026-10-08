@@ -20,6 +20,8 @@ pub mod server_hello;
 
 use std::fmt::Display;
 
+use num_enum::TryFromPrimitive;
+
 const MAGIC: &str = "HEXGATE";
 
 /// Logs a datagram that was dropped because it isn't a valid `packet`.
@@ -55,8 +57,15 @@ pub enum PacketError {
     Replay,
 }
 
+impl PacketError {
+    fn identifier(_: u8) -> Self {
+        Self::Identifier
+    }
+}
+
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, TryFromPrimitive)]
+#[num_enum(error_type(name = PacketError, constructor = PacketError::identifier))]
 pub enum PacketIdentifier {
     InfoRequest = 0,
     InfoResponse = 1,
@@ -74,28 +83,4 @@ pub enum PacketIdentifier {
     ServerHelloServerFull = 22,
     /// Stays the same in every protocol version, like the ClientHello prefix.
     ServerHelloProtocolMismatch = 23,
-}
-
-impl TryFrom<u8> for PacketIdentifier {
-    type Error = PacketError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(PacketIdentifier::InfoRequest),
-            1 => Ok(PacketIdentifier::InfoResponse),
-            2 => Ok(PacketIdentifier::ClientHello),
-            3 => Ok(PacketIdentifier::ServerHelloVersionNotSupported),
-            4 => Ok(PacketIdentifier::ServerHelloVersionSupported),
-            5 => Ok(PacketIdentifier::ConnectionRequest),
-            6 => Ok(PacketIdentifier::ConnectionResponse),
-            7 => Ok(PacketIdentifier::LoginRequest),
-            8 => Ok(PacketIdentifier::LoginSuccess),
-            9 => Ok(PacketIdentifier::LoginFailure),
-            10 => Ok(PacketIdentifier::Data),
-            11 => Ok(PacketIdentifier::DataAckNow),
-            22 => Ok(PacketIdentifier::ServerHelloServerFull),
-            23 => Ok(PacketIdentifier::ServerHelloProtocolMismatch),
-            _ => Err(PacketError::Identifier),
-        }
-    }
 }

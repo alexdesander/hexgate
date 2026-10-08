@@ -38,6 +38,7 @@ rand_xoshiro = "0.6.0"
 priority-queue = "2.1.1"
 tracing = { version = "0.1.44", optional = true }
 rand_distr = "0.4.3"
+num_enum = { version = "0.7.6", default-features = false }
 
 [features]
 # Debug and trace events for handshakes, connection changes and rejected packets.
