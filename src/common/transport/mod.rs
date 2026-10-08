@@ -43,9 +43,9 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 /// With `flush()`, queued messages wait for the next flush at most this many tick intervals.
 const CORK_TICKS: u32 = 2;
 const MAX_CORK: Duration = Duration::from_millis(100);
-// Below RFC 9001 section 6.6 limits for every supported cipher
-const MAX_KEY_PACKETS: u64 = 1 << 22;
-const MAX_AUTH_FAILURES: u64 = 1 << 22;
+// RFC 9001 appendix B limits for packets of at most 2^11 bytes, the lower of both ciphers
+const MAX_KEY_PACKETS: u64 = 1 << 28;
+const MAX_AUTH_FAILURES: u64 = 1 << 36;
 const KEY_LIMIT_REASON: &[u8] = b"Session key limit; reconnect";
 const HISTORY_LIMIT_REASON: &[u8] = b"Recovery history limit; reconnect";
 

@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Sessions close after 2²⁸ encrypted packets per direction instead of 2²² (RFC 9001's AES-GCM limit for packets
+  of at most 2 KiB), so bulk transfers no longer reconnect every few minutes, and after 2³⁶ failed authentication
+  attempts instead of 2²², so forged packets can no longer end a session within seconds.
+
 ## [0.0.2] - 2026-10-08
 
 Rewrite of the whole crate; protocol version 1 is not compatible with 0.0.1.

@@ -126,8 +126,9 @@
 //!   authenticator.
 //! - **Traffic.** After the handshake, every packet is encrypted and authenticated with
 //!   AES-256-GCM or ChaCha20-Poly1305 ([`Cipher`]), with one key per direction and the packet
-//!   number as nonce. Replayed and duplicated packets are dropped. Sessions close after at most
-//!   2²² encrypted packets per direction or failed authentication attempts; reconnect for fresh keys.
+//!   number as nonce. Replayed and duplicated packets are dropped. Sessions close after 2²⁸
+//!   encrypted packets per direction (about 300 GB) or 2³⁶ failed authentication attempts;
+//!   reconnect for fresh keys.
 //! - Keep the server's `secret_key` and `auth_salt` secret and stable, see [`keys`].
 
 #![warn(missing_docs)]
