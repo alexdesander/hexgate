@@ -492,13 +492,15 @@ impl<R: AuthResult> ServerThreadState<R> {
 
     /// Ends a graceful disconnect: everything was sent and acked, or the linger ran out.
     fn finish_close(&mut self, addr: SocketAddr) {
-        let Some(connection) = self
+        // The client may have reconnected from the same address since.
+        if !self
             .connections
-            .remove(&addr)
-            .filter(|connection| connection.closing.is_some())
-        else {
+            .get(&addr)
+            .is_some_and(|connection| connection.closing.is_some())
+        {
             return;
-        };
+        }
+        let connection = self.connections.remove(&addr).unwrap();
         self.timed_events
             .remove(&TimedEventKey::CloseDeadline(addr));
         let reason = connection.closing.as_deref().unwrap_or_default();
