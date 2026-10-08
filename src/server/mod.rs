@@ -22,6 +22,7 @@ pub use auth::{AuthResult, Authenticator};
 use bon::bon;
 use crossbeam_channel::bounded;
 use ed25519_dalek::SigningKey;
+use handshake::HandshakeThreadState;
 use mio::{Poll, Waker};
 use rate_limit::RateLimiter;
 use siphasher::sip::SipHasher;
@@ -42,6 +43,7 @@ use crate::common::{
 };
 
 mod auth;
+mod handshake;
 mod rate_limit;
 mod thread;
 
@@ -141,6 +143,7 @@ struct ServerInner<R: AuthResult> {
     waker: Arc<Waker>,
     thread: Option<JoinHandle<()>>,
     auth_thread: Option<JoinHandle<()>>,
+    handshake_thread: Option<JoinHandle<()>>,
 }
 
 impl<R: AuthResult> Server<R> {
@@ -404,6 +407,7 @@ impl<R: AuthResult> Drop for ServerInner<R> {
         let _ = self.cmd_tx.send(Cmd::Shutdown(vec![]));
         let _ = self.waker.wake();
         let _ = self.thread.take().unwrap().join();
+        let _ = self.handshake_thread.take().unwrap().join();
         let auth_thread = self.auth_thread.take().unwrap();
         if auth_thread.is_finished() {
             let _ = auth_thread.join();
@@ -511,6 +515,22 @@ impl<R: AuthResult> Server<R> {
             .spawn(move || auth::auth_thread(auth_state))?;
 
         let signing_key = SigningKey::from_bytes(&secret_key);
+        let verifying_key = signing_key.verifying_key();
+        let (key_exchanges, key_exchange_rx) = bounded(256);
+        let (key_exchanged_tx, key_exchanged) = bounded(256);
+        let handshake_state = HandshakeThreadState {
+            signing_key,
+            cipher,
+            auth_salt,
+            channel_counts: channel_config.counts(),
+            requests: key_exchange_rx,
+            results: key_exchanged_tx,
+            waker: waker.clone(),
+        };
+        let handshake_thread = std::thread::Builder::new()
+            .name("hexgate-handshake".into())
+            .spawn(move || handshake::handshake_thread(handshake_state))?;
+
         let _waker = waker.clone();
         let thread = std::thread::Builder::new()
             .name("hexgate-server".into())
@@ -527,9 +547,7 @@ impl<R: AuthResult> Server<R> {
                     info,
                     allowed_client_versions: Box::new(allowed_client_versions),
                     cipher,
-                    verifying_key: signing_key.verifying_key(),
-                    signing_key,
-                    auth_salt,
+                    verifying_key,
 
                     cookie_epoch: Instant::now(),
                     connection_request_max_timestamp_age,
@@ -542,6 +560,9 @@ impl<R: AuthResult> Server<R> {
                         CONNECTION_REQUESTS_PER_SECOND,
                         CONNECTION_REQUEST_BURST,
                     ),
+                    key_exchanges,
+                    key_exchanged,
+                    exchanging: Default::default(),
                     expecting_login_requests: Default::default(),
                     auth_cmd_tx,
                     expecting_auth_result: Default::default(),
@@ -588,6 +609,7 @@ impl<R: AuthResult> Server<R> {
                 waker,
                 thread: Some(thread),
                 auth_thread: Some(auth_thread),
+                handshake_thread: Some(handshake_thread),
             }),
         })
     }

@@ -16,12 +16,10 @@ use std::{
 
 use ahash::{HashMap, HashSet};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use mio::{Events, Interest, Poll, Waker};
-use rand::thread_rng;
 use sha2::{Digest, Sha256};
 use siphasher::sip::SipHasher;
-use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::common::{
     channel::Channel,
@@ -31,7 +29,7 @@ use crate::common::{
     packets::{
         client_hello::ClientHello,
         connection_request::ConnectionRequest,
-        connection_response::{self, ConnectionResponse, Transcript},
+        connection_response,
         info_request::InfoRequest,
         info_response::InfoResponse,
         login_request::LoginRequest,
@@ -50,6 +48,7 @@ use crate::common::{
 
 use super::{
     auth::{AuthCmd, AuthResult, Exchange, LoginAttempt},
+    handshake::{KeyExchange, KeyExchanged},
     rate_limit::RateLimiter,
     ConnectedSet, Event, PeerState, Socket,
 };
@@ -151,8 +150,6 @@ pub struct ServerThreadState<R: AuthResult> {
     pub info: Vec<u8>,
     pub allowed_client_versions: VersionCheck,
     pub cipher: Cipher,
-    pub auth_salt: [u8; 16],
-    pub signing_key: SigningKey,
     pub verifying_key: VerifyingKey,
     pub siphasher: SipHasher,
 
@@ -164,6 +161,10 @@ pub struct ServerThreadState<R: AuthResult> {
     /// Limit answered ClientHellos and new key exchanges per client IP.
     pub client_hellos: RateLimiter,
     pub connection_requests: RateLimiter,
+    pub key_exchanges: Sender<KeyExchange>,
+    pub key_exchanged: Receiver<KeyExchanged>,
+    /// Requests on the handshake thread, to ignore their retransmissions until it answers.
+    pub exchanging: HashMap<LoginAttempt, [u8; 116]>,
     pub auth_cmd_tx: Sender<AuthCmd>,
     pub expecting_login_requests: HashMap<LoginAttempt, PendingLogin>,
     pub expecting_auth_result: HashMap<LoginAttempt, PendingLogin>,
@@ -199,6 +200,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             if self.handle_all_cmds() {
                 break;
             }
+            self.handle_key_exchanges();
             let mut budget = self.event_tx.budget();
             let before_delivery = (budget.messages, budget.work);
             self.handle_all_events(&mut budget);
@@ -222,6 +224,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                 || !self.dirty.is_empty()
                 || self.pending_work.is_some()
                 || !self.cmds.is_empty()
+                || !self.key_exchanged.is_empty()
             {
                 Some(Duration::ZERO)
             } else {
@@ -824,10 +827,9 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         }
         let attempt = (from, connection_request.salt);
-        let signed_request: [u8; 116] = self.buf[connection_response::SIGNED_REQUEST]
+        let request: [u8; 116] = self.buf[connection_response::SIGNED_REQUEST]
             .try_into()
             .unwrap();
-        let request = signed_request;
         if self.answered_logins.contains_key(&attempt) {
             return;
         }
@@ -842,6 +844,9 @@ impl<R: AuthResult> ServerThreadState<R> {
             }
             return;
         }
+        if self.exchanging.contains_key(&attempt) {
+            return;
+        }
         // Each new request costs a key exchange and a signature.
         let now = Instant::now();
         if !self.connection_requests.allow(from.ip(), now) {
@@ -849,53 +854,54 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         }
         self.schedule_rate_limit_prune(now);
-        log!(debug, %from, "key exchange");
-        let x25519_secret_key = EphemeralSecret::random_from_rng(thread_rng());
-        let x25519_public_key = PublicKey::from(&x25519_secret_key);
-        let shared_secret =
-            x25519_secret_key.diffie_hellman(&connection_request.client_x25519_pubkey);
-        let crypto = Crypto::new(
-            shared_secret,
-            connection_request.hkdf_salt,
-            true,
-            self.cipher,
-        );
-
-        let connection_response = ConnectionResponse {
-            salt: connection_request.salt,
-            server_x25519_pubkey: x25519_public_key,
-            auth_salt: self.auth_salt,
-        };
-        let transcript = Transcript {
-            request: &signed_request,
-            cipher: self.cipher,
-            channel_counts: self.config.channels.counts(),
-        };
-        let size =
-            connection_response.serialize(&crypto, &self.signing_key, &transcript, &mut self.buf);
-        self.socket.send_to(from, &self.buf[..size]);
-        let generation = self.next_generation;
-        let Some(next) = generation.checked_add(1) else {
-            return;
-        };
-        self.next_generation = next;
-        self.expecting_login_requests.insert(
+        let exchange = KeyExchange {
             attempt,
-            PendingLogin {
-                crypto,
-                generation,
-                request,
-                response: self.buf[..size].to_vec(),
-                login_request: None,
-            },
-        );
-        self.timed_events.push(
-            TimedEventKey::RemoveExpectingLoginRequest(Exchange {
+            request,
+            client_x25519_pubkey: connection_request.client_x25519_pubkey,
+            hkdf_salt: connection_request.hkdf_salt,
+        };
+        if self.key_exchanges.try_send(exchange).is_err() {
+            log!(warn, %from, "handshake thread busy, key exchange dropped");
+            return;
+        }
+        log!(debug, %from, "key exchange");
+        self.exchanging.insert(attempt, request);
+    }
+
+    fn handle_key_exchanges(&mut self) {
+        for _ in 0..256 {
+            let Ok(exchanged) = self.key_exchanged.try_recv() else {
+                return;
+            };
+            let attempt = exchanged.attempt;
+            self.exchanging.remove(&attempt);
+            if self.shutting_down {
+                continue;
+            }
+            self.socket.send_to(attempt.0, &exchanged.response);
+            let generation = self.next_generation;
+            let Some(next) = generation.checked_add(1) else {
+                continue;
+            };
+            self.next_generation = next;
+            self.expecting_login_requests.insert(
                 attempt,
-                generation,
-            }),
-            Instant::now() + HANDSHAKE_STATE_TTL,
-        );
+                PendingLogin {
+                    crypto: exchanged.crypto,
+                    generation,
+                    request: exchanged.request,
+                    response: exchanged.response,
+                    login_request: None,
+                },
+            );
+            self.timed_events.push(
+                TimedEventKey::RemoveExpectingLoginRequest(Exchange {
+                    attempt,
+                    generation,
+                }),
+                Instant::now() + HANDSHAKE_STATE_TTL,
+            );
+        }
     }
 
     fn handle_packet_login_request(&mut self, size: usize, from: SocketAddr) {
@@ -945,9 +951,11 @@ impl<R: AuthResult> ServerThreadState<R> {
 mod tests {
     use std::{net::UdpSocket, sync::mpsc};
 
-    use x25519_dalek::ReusableSecret;
+    use rand::thread_rng;
+    use x25519_dalek::{PublicKey, ReusableSecret};
 
     use super::*;
+    use crate::common::packets::connection_response::{ConnectionResponse, Transcript};
     use crate::{Authenticator, ChannelConfiguration, Server};
 
     struct PausedAuth {
