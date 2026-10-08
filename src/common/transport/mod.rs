@@ -442,13 +442,8 @@ impl Connection {
     fn on_ack(&mut self, now: Instant, ack: &frame::AckFrame) {
         for (pn, recv_us) in ack.timestamps() {
             if let Some(packet) = self.history.get(pn).filter(|p| p.state == State::InFlight) {
-                self.controller.on_timestamp(
-                    (pn, packet.cc),
-                    packet.time,
-                    usize::from(packet.size),
-                    recv_us,
-                    now,
-                );
+                self.controller
+                    .on_timestamp(now, usize::from(packet.size), recv_us);
             }
         }
         let mut acked = recovery::Acked::default();
@@ -462,10 +457,10 @@ impl Connection {
             close_acked |= close_pn.is_some_and(|pn| (low..=high).contains(&pn));
             let (channels, controller) = (&mut self.channels, &mut self.controller);
             self.history
-                .on_ack_range(low, high, &mut acked, ack.largest, now, |pn, packet| {
+                .on_ack_range(low, high, &mut acked, ack.largest, now, |_, packet| {
                     channels.on_acked(&packet.frames);
                     if packet.state == State::InFlight {
-                        controller.on_acked(packet.cc, pn);
+                        controller.on_acked(packet.cc);
                     }
                 });
         }
@@ -482,12 +477,7 @@ impl Connection {
             self.pto_count = 0;
         }
         self.detect_lost(now);
-        self.controller.on_ack_end(
-            now,
-            self.history.next_pn(),
-            self.history.in_flight,
-            &self.rtt,
-        );
+        self.controller.on_ack_end(now, &self.rtt);
     }
 
     fn detect_lost(&mut self, now: Instant) {
@@ -534,10 +524,7 @@ impl Connection {
             ));
         }
         if self.channels.has_data(now) {
-            match self
-                .controller
-                .permit(now, self.history.in_flight, &self.rtt)
-            {
+            match self.controller.permit(now, self.history.in_flight) {
                 SendPermit::Now => at(Some(now)),
                 SendPermit::At(when) => at(Some(when)),
                 SendPermit::Blocked => {}
@@ -579,8 +566,7 @@ impl Connection {
                 self.close = Some(Close::Closed);
             }
         }
-        self.controller
-            .maintain(now, self.history.in_flight, &self.rtt);
+        self.controller.maintain(now);
         false
     }
 
@@ -653,17 +639,12 @@ impl Connection {
 
         let probe = self.probes > 0;
         let ack_due = self.acks.deadline().is_some_and(|at| at <= now);
-        let (data, realtime) = if probe {
-            (self.channels.has_data(now), false)
-        } else {
-            match self
-                .controller
-                .permit(now, self.history.in_flight, &self.rtt)
-            {
-                SendPermit::Now => (self.channels.has_data(now), false),
-                SendPermit::At(_) | SendPermit::Blocked => (false, false),
-            }
-        };
+        let data = (probe
+            || matches!(
+                self.controller.permit(now, self.history.in_flight),
+                SendPermit::Now
+            ))
+            && self.channels.has_data(now);
         if !(data || ack_due || self.ping || probe) {
             return None;
         }
@@ -676,10 +657,7 @@ impl Connection {
             self.acks.write(now, &mut w);
         }
         let mut frames = StreamFrames::default();
-        let wrote_data = data
-            && self
-                .channels
-                .write(now, &mut w, (capacity, realtime), &mut frames);
+        let wrote_data = data && self.channels.write(now, &mut w, capacity, &mut frames);
         if (self.ping || probe) && !wrote_data && w.remaining() > 0 {
             frame::write_ping(&mut w);
         }
@@ -693,9 +671,7 @@ impl Connection {
         if eliciting {
             let app_limited = !self.channels.has_data(now);
             let burst_end = app_limited || self.controller.ends_burst(now, size);
-            cc = self
-                .controller
-                .on_sent(now, size, (burst_end, app_limited, realtime));
+            cc = self.controller.on_sent(now, size, burst_end, app_limited);
             if burst_end && !cc.is_first() {
                 packet::write_header(buf, pn, true);
             }

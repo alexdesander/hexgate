@@ -164,8 +164,8 @@ impl Controller {
         self.tick.map(Duration::from_secs_f64)
     }
 
-    pub fn permit(&mut self, now: Instant, in_flight: usize, rtt: &Rtt) -> SendPermit {
-        self.maintain(now, in_flight, rtt);
+    pub fn permit(&mut self, now: Instant, in_flight: usize) -> SendPermit {
+        self.maintain(now);
         if !self.fixed() && in_flight as f64 >= self.window {
             return SendPermit::Blocked;
         }
@@ -179,12 +179,7 @@ impl Controller {
         self.pacer.ends_burst(now, size, self.pacing_rate())
     }
 
-    pub fn on_sent(
-        &mut self,
-        now: Instant,
-        size: usize,
-        (end, app_limited, _realtime): (bool, bool, bool),
-    ) -> SentInfo {
+    pub fn on_sent(&mut self, now: Instant, size: usize, end: bool, app_limited: bool) -> SentInfo {
         let first = self.previous_end;
         self.previous_end = end;
         if first {
@@ -207,21 +202,14 @@ impl Controller {
         }
     }
 
-    pub fn on_timestamp(
-        &mut self,
-        _: (u64, SentInfo),
-        _sent: Instant,
-        size: usize,
-        recv_us: u64,
-        now: Instant,
-    ) {
+    pub fn on_timestamp(&mut self, now: Instant, size: usize, recv_us: u64) {
         self.samples.push_back((now, recv_us, size));
         if self.samples.len() > MAX_RATE_SAMPLES {
             self.samples.pop_front();
         }
     }
 
-    pub fn on_acked(&mut self, info: SentInfo, _: u64) {
+    pub fn on_acked(&mut self, info: SentInfo) {
         if self.fixed() {
             return;
         }
@@ -256,8 +244,8 @@ impl Controller {
         }
     }
 
-    pub fn on_ack_end(&mut self, now: Instant, _: u64, in_flight: usize, rtt: &Rtt) {
-        self.maintain(now, in_flight, rtt);
+    pub fn on_ack_end(&mut self, now: Instant, rtt: &Rtt) {
+        self.maintain(now);
         if self.fixed() {
             return;
         }
@@ -343,7 +331,7 @@ impl Controller {
         );
     }
 
-    pub fn maintain(&mut self, now: Instant, _: usize, _: &Rtt) {
+    pub fn maintain(&mut self, now: Instant) {
         while self
             .samples
             .front()

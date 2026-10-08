@@ -221,7 +221,7 @@ pub fn progress(input: &[u8]) {
         let mut buf = [0; 1180];
         let mut writer = Writer::new(&mut buf);
         let mut frames = StreamFrames::default();
-        if sender.write(now, &mut writer, (1180, false), &mut frames) {
+        if sender.write(now, &mut writer, 1180, &mut frames) {
             let size = writer.len();
             let action = input
                 .get(round % input.len().max(1))
@@ -268,7 +268,7 @@ pub fn progress(input: &[u8]) {
         }
         let mut writer = Writer::new(&mut buf);
         let mut frames = StreamFrames::default();
-        if receiver.write(now, &mut writer, (1180, false), &mut frames) {
+        if receiver.write(now, &mut writer, 1180, &mut frames) {
             let size = writer.len();
             receive_frames(&mut sender, &buf[..size], None);
             receiver.on_acked(&frames);

@@ -264,22 +264,17 @@ impl Channels {
             || (0..self.scheduler.slots()).any(|slot| self.next_size(slot, now, 1) > 0)
     }
 
-    /// Fills the packet with frames in fair-queueing order, only from the unreliable channels
-    /// if `realtime_only`. `capacity` is the room of an empty packet. Returns whether anything
-    /// was written.
+    /// Fills the packet with frames in fair-queueing order. `capacity` is the room of an empty
+    /// packet. Returns whether anything was written.
     pub fn write(
         &mut self,
         now: Instant,
         w: &mut Writer,
-        (capacity, realtime_only): (usize, bool),
+        capacity: usize,
         frames: &mut StreamFrames,
     ) -> bool {
         let unreliable = self.unreliable.len();
-        let slots = if realtime_only {
-            unreliable
-        } else {
-            self.scheduler.slots()
-        };
+        let slots = self.scheduler.slots();
         self.no_room.fill(false);
         let mut wrote = false;
         for (channel, (send, _)) in self.reliable.iter_mut().enumerate() {
@@ -570,7 +565,7 @@ mod tests {
             let mut buf = [0; 1180];
             let mut w = Writer::new(&mut buf);
             let mut frames = StreamFrames::default();
-            assert!(channels.write(now, &mut w, (1180, false), &mut frames));
+            assert!(channels.write(now, &mut w, 1180, &mut frames));
             let len = w.len();
             let mut r = Reader::new(&buf[..len]);
             while let Some(frame) = frame::parse(&mut r).unwrap() {
@@ -595,7 +590,7 @@ mod tests {
         assert!(channels.has_data(now));
         let mut buf = [0; 1180];
         let mut w = Writer::new(&mut buf);
-        channels.write(now, &mut w, (1180, false), &mut StreamFrames::default());
+        channels.write(now, &mut w, 1180, &mut StreamFrames::default());
         let len = w.len();
         let mut r = Reader::new(&buf[..len]);
         assert!(matches!(
@@ -680,7 +675,7 @@ mod tests {
             let mut buf = [0; 1180];
             let mut w = Writer::new(&mut buf);
             let mut frames = StreamFrames::default();
-            channels.write(now, &mut w, (1180, false), &mut frames);
+            channels.write(now, &mut w, 1180, &mut frames);
             let len = w.len();
             let mut r = Reader::new(&buf[..len]);
             while let Some(frame) = frame::parse(&mut r).unwrap() {

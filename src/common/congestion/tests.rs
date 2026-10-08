@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use super::*;
 
 fn path(now: Instant) -> Rtt {
@@ -20,18 +24,18 @@ fn fixed_rate_has_bounded_feedback_state_with_loss_and_reordering() {
     );
     let rtt = path(now);
     for pn in 0..10_000 {
-        let info = cc.on_sent(now, 100, (true, true, false));
-        cc.on_timestamp((pn, info), now, 100, 10_000 - pn, now);
+        let info = cc.on_sent(now, 100, true, true);
+        cc.on_timestamp(now, 100, 10_000 - pn);
         if pn % 3 == 0 {
             cc.on_lost(info);
         } else {
-            cc.on_acked(info, pn);
+            cc.on_acked(info);
         }
-        cc.on_ack_end(now, pn + 1, 0, &rtt);
+        cc.on_ack_end(now, &rtt);
         assert!(cc.samples.len() <= MAX_RATE_SAMPLES);
         assert_eq!(cc.rate(), 100_000.0);
     }
-    cc.maintain(now + Duration::from_secs(1), 0, &rtt);
+    cc.maintain(now + Duration::from_secs(1));
     assert!(cc.samples.is_empty());
 }
 
@@ -41,15 +45,15 @@ fn sparse_loss_accumulates_and_ages_without_samples_disappearing() {
     let mut cc = Controller::new(CongestionConfig::default(), now);
     let rtt = path(now);
     for i in 0..100 {
-        cc.on_acked(SentInfo::default(), i);
+        cc.on_acked(SentInfo::default());
         cc.on_lost(SentInfo::default());
-        cc.on_ack_end(now + Duration::from_millis(i * 10), i + 1, 0, &rtt);
+        cc.on_ack_end(now + Duration::from_millis(i * 10), &rtt);
     }
     assert!(cc.loss() > 0.49);
     cc.acked_packets = 1;
     cc.lost_packets = 1;
     cc.loss_since = now;
-    cc.on_ack_end(now + LOSS_MAX_AGE, 101, 0, &rtt);
+    cc.on_ack_end(now + LOSS_MAX_AGE, &rtt);
     assert_eq!(cc.acked_packets + cc.lost_packets, 0);
 }
 
@@ -62,13 +66,13 @@ fn loss_reduces_once_per_rtt_and_clean_feedback_releases_the_hold() {
     for offset in [0, 1] {
         cc.acked_packets = 2;
         cc.lost_packets = 2;
-        cc.on_ack_end(now + Duration::from_millis(offset), 10, 0, &rtt);
+        cc.on_ack_end(now + Duration::from_millis(offset), &rtt);
         assert_eq!(cc.window, before * 0.7);
     }
     cc.acked_bytes = 1200;
     cc.demand_bytes = 1200;
     cc.acked_packets = 10;
-    cc.on_ack_end(now + Duration::from_secs(1), 20, 0, &rtt);
+    cc.on_ack_end(now + Duration::from_secs(1), &rtt);
     assert!(cc.window > before * 0.7);
 }
 
@@ -82,27 +86,21 @@ fn idle_feedback_does_not_accumulate_velocity_for_the_next_transfer() {
     for i in 0..100 {
         let at = now + Duration::from_millis(i * 100);
         cc.on_rtt(at, rtt.smoothed());
-        cc.on_acked(
-            SentInfo {
-                bytes: 100,
-                app_limited: true,
-                first: true,
-            },
-            i,
-        );
-        cc.on_ack_end(at, i + 1, 0, &rtt);
+        cc.on_acked(SentInfo {
+            bytes: 100,
+            app_limited: true,
+            first: true,
+        });
+        cc.on_ack_end(at, &rtt);
     }
     assert_eq!(cc.velocity, 1.0);
     assert_eq!(cc.window, before);
-    cc.on_acked(
-        SentInfo {
-            bytes: 1200,
-            app_limited: false,
-            first: true,
-        },
-        100,
-    );
-    cc.on_ack_end(now + Duration::from_secs(10), 101, 0, &rtt);
+    cc.on_acked(SentInfo {
+        bytes: 1200,
+        app_limited: false,
+        first: true,
+    });
+    cc.on_ack_end(now + Duration::from_secs(10), &rtt);
     assert!(cc.window - before <= MTU);
 }
 
@@ -129,7 +127,7 @@ fn delivery_rate_counts_actual_interval_bytes_despite_ack_order() {
             let mut cc = Controller::new(CongestionConfig::default(), now);
             for index in if reverse { [1, 0] } else { [0, 1] } {
                 let received = sizes[..=index].iter().sum::<usize>() as u64 * 10;
-                cc.on_timestamp((0, SentInfo::default()), now, sizes[index], received, now);
+                cc.on_timestamp(now, sizes[index], received);
             }
             assert_eq!(cc.delivery_rate(), 100_000.0);
         }
@@ -141,7 +139,7 @@ fn receiver_timestamps_cannot_affect_delay_control_or_overflow() {
     let now = Instant::now();
     let mut cc = Controller::new(CongestionConfig::default(), now);
     for received in [0, i64::MAX as u64, u64::MAX] {
-        cc.on_timestamp((0, SentInfo::default()), now, 1200, received, now);
+        cc.on_timestamp(now, 1200, received);
     }
     assert!(cc.delivery_rate().is_finite());
     assert_eq!(cc.queue_delay(), Duration::ZERO);
