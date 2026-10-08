@@ -62,7 +62,6 @@ fn end_to_end(c: &mut Criterion) {
         .server_socket_addr(server.local_addr())
         .server_key(ServerKey::Unverified)
         .auth_data(vec![])
-        .hash_auth_data(false)
         .channel_config(ChannelConfiguration::default())
         .connect()
         .unwrap();

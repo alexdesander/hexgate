@@ -51,7 +51,6 @@ fn startup_and_drop_do_not_wait_for_resolution_and_admission_includes_pending_co
         })
         .server_key(ServerKey::Unverified)
         .auth_data(vec![])
-        .hash_auth_data(false)
         .client_version(ClientVersion::ZERO)
         .channel_config(ChannelConfiguration::default())
         .send_queue_limits(limits())

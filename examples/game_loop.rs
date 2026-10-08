@@ -35,7 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .server_key(ServerKey::Pinned(server::public_key(&key)))
         .client_version(ClientVersion::ZERO)
         .auth_data(vec![])
-        .hash_auth_data(false)
         .channel_config(channels)
         .connect()?;
     client.set_priority(Channel::UnreliableOrdered(0), 1)?;

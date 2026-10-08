@@ -43,7 +43,6 @@
 //!     .server_socket_addr("localhost:44444")
 //!     .server_key(ServerKey::Pinned(server::public_key(&secret_key)))
 //!     .auth_data(b"Alice".to_vec())
-//!     .hash_auth_data(false)
 //!     .channel_config(ChannelConfiguration::default())
 //!     .connect()?;
 //! client.send(Channel::Reliable(0), b"Hello".to_vec())?;
@@ -121,9 +120,10 @@
 //!   `ServerKey::Unverified`, anyone on the network path can pose as the server and read
 //!   `auth_data`.
 //! - **Client identity** is up to your `Authenticator`. `auth_data` is encrypted;
-//!   `hash_auth_data` sends an Argon2id hash salted with the server's key and `auth_salt`
-//!   instead. That hash is as good as the password for this server, so hash it again before
-//!   storing it. Limit failed attempts per account in the authenticator.
+//!   `hash_auth_data` (`argon2` feature, on by default) sends an Argon2id hash salted with the
+//!   server's key and `auth_salt` instead. That hash is as good as the password for this
+//!   server, so hash it again before storing it. Limit failed attempts per account in the
+//!   authenticator.
 //! - **Traffic.** After the handshake, every packet is encrypted and authenticated with
 //!   AES-256-GCM or ChaCha20-Poly1305 ([`Cipher`]), with one key per direction and the packet
 //!   number as nonce. Replayed and duplicated packets are dropped. Sessions close after at most

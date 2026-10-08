@@ -160,7 +160,6 @@ macro_rules! client_builder {
             .server_socket_addr($server_addr)
             .server_key($crate::common::pinned())
             .auth_data(vec![])
-            .hash_auth_data(false)
     };
 }
 pub(crate) use client_builder;

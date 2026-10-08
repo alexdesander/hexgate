@@ -3,15 +3,18 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::{
+    borrow::Cow,
     io::{self, ErrorKind},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "argon2")]
 use argon2::{Argon2, Params};
 use crossbeam_channel::Receiver;
 use ed25519_dalek::VerifyingKey;
 use mio::{Events, Poll};
+#[cfg(feature = "argon2")]
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, ReusableSecret};
 
@@ -37,6 +40,7 @@ const MAX_HANDSHAKE_RESEND_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) struct Handshake {
     pub server_key: ServerKey,
     pub auth_data: Vec<u8>,
+    #[cfg(feature = "argon2")]
     pub hash_auth_data: bool,
     pub client_version: ClientVersion,
     pub channel_counts: [u16; 2],
@@ -157,29 +161,9 @@ impl Handshake {
             };
 
             // LoginRequest -> LoginResponse
-            let hashed_auth_data;
-            let login_auth_data = if self.hash_auth_data {
-                // A rogue server reusing another server's auth_salt must not get hashes valid there.
-                let argon2_salt = Sha256::new()
-                    .chain_update(server_ed25519_pubkey.as_bytes())
-                    .chain_update(auth_salt)
-                    .finalize();
-                let mut hashed = vec![0u8; 20];
-                Argon2::new(
-                    argon2::Algorithm::Argon2id,
-                    argon2::Version::V0x13,
-                    Params::new(65536, 2, 1, Some(20)).unwrap(),
-                )
-                .hash_password_into(&self.auth_data, &argon2_salt, &mut hashed)
-                .unwrap();
-                hashed_auth_data = hashed;
-                &hashed_auth_data
-            } else {
-                &self.auth_data
-            };
             let login_request = LoginRequest {
                 salt: real_salt,
-                auth_data: login_auth_data,
+                auth_data: &self.login_auth_data(&server_ed25519_pubkey, auth_salt),
             };
             let size = login_request.serialize(&crypto, &mut buf);
             let login =
@@ -202,6 +186,28 @@ impl Handshake {
             ErrorKind::TimedOut,
             format!("Hexgate Handshake timed out after {} tries", self.tries),
         )))
+    }
+
+    #[cfg_attr(not(feature = "argon2"), allow(unused_variables))]
+    fn login_auth_data(&self, server_key: &VerifyingKey, auth_salt: [u8; 16]) -> Cow<'_, [u8]> {
+        #[cfg(feature = "argon2")]
+        if self.hash_auth_data {
+            // A rogue server reusing another server's auth_salt must not get hashes valid there.
+            let argon2_salt = Sha256::new()
+                .chain_update(server_key.as_bytes())
+                .chain_update(auth_salt)
+                .finalize();
+            let mut hashed = vec![0u8; 20];
+            Argon2::new(
+                argon2::Algorithm::Argon2id,
+                argon2::Version::V0x13,
+                Params::new(65536, 2, 1, Some(20)).unwrap(),
+            )
+            .hash_password_into(&self.auth_data, &argon2_salt, &mut hashed)
+            .unwrap();
+            return Cow::Owned(hashed);
+        }
+        Cow::Borrowed(&self.auth_data)
     }
 }
 

@@ -392,7 +392,9 @@ impl Client {
         auth_data: Vec<u8>,
         /// Sends an Argon2id hash of `auth_data` (e.g. a password) instead, salted with the
         /// server's key and `auth_salt`. The hash is as good as the password for logging in to
-        /// this server, so the server has to hash it again before storing it.
+        /// this server, so the server has to hash it again before storing it. Off by default.
+        #[cfg(feature = "argon2")]
+        #[builder(default)]
         hash_auth_data: bool,
         /// Simulates network conditions from the first packet on, see [`crate::sim`].
         simulator: Option<Simulator>,
@@ -438,6 +440,8 @@ impl Client {
         channel_config.validate()?;
         send_queue_limits.validate()?;
         congestion_config.validate()?;
+        #[cfg(not(feature = "argon2"))]
+        let hash_auth_data = false;
         if !hash_auth_data {
             TooLarge::check(auth_data.len(), login_request::MAX_AUTH_DATA_SIZE)
                 .map_err(ConnectError::AuthDataTooLarge)?;
@@ -452,6 +456,7 @@ impl Client {
         let handshake = Handshake {
             server_key,
             auth_data,
+            #[cfg(feature = "argon2")]
             hash_auth_data,
             client_version,
             channel_counts: channel_config.counts(),

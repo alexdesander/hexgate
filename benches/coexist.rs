@@ -281,7 +281,6 @@ mod linux {
             .server_socket_addr(format!("{}:4000", settings.ip))
             .server_key(ServerKey::Pinned(server::public_key(&SECRET)))
             .auth_data(vec![])
-            .hash_auth_data(false)
             .channel_config(config())
             .send_queue_limits(SendQueueLimits {
                 max_bytes: 512 << 10,

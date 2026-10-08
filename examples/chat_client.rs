@@ -22,7 +22,6 @@ fn main() -> anyhow::Result<()> {
         .server_socket_addr(SERVER_ADDR)
         .server_key(known_server_key.map_or(ServerKey::Unverified, ServerKey::Pinned))
         .auth_data(USERNAME.as_bytes().to_vec())
-        .hash_auth_data(false)
         .channel_config(ChannelConfiguration {
             weight_unreliable: 10,
             weights_unreliable_ordered: vec![10, 10, 10, 10, 10],

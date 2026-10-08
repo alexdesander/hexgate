@@ -29,7 +29,8 @@ Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
 - Security:
     - Server identity: ed25519 key pinned by the client, signed x25519 key exchange over the whole handshake
     - AES-256-GCM or ChaCha20-Poly1305 encryption, one key per direction, replay protection
-    - Client authentication through your own `Authenticator` (optionally Argon2id-hashed passwords)
+    - Client authentication through your own `Authenticator` (optionally Argon2id-hashed passwords, `argon2`
+      feature, on by default)
     - DoS hardening: stateless handshake cookies bound to the client address, per-IP rate limits, requests padded
       so the server never amplifies traffic
     - Key file helpers (`hexgate::keys`)
@@ -119,7 +120,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .server_socket_addr("example.com:44444")
         .server_key(ServerKey::Pinned(SERVER_KEY))
         .auth_data(b"Alice".to_vec())
-        .hash_auth_data(false)
         .channel_config(ChannelConfiguration {
             weight_unreliable: 10,
             weights_unreliable_ordered: vec![10],

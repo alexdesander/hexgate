@@ -323,7 +323,6 @@ pub fn run(workload: &Workload, profile: &Profile, settings: &Settings) -> RawRu
         .server_socket_addr(server.local_addr())
         .server_key(ServerKey::Pinned(server::public_key(&SECRET_KEY)))
         .auth_data(vec![])
-        .hash_auth_data(false)
         .channel_config(channel_config())
         .simulator(Simulator::new(up.clone(), down.clone()))
         .connect();

@@ -106,7 +106,6 @@ fn rejects_wrong_server_key() {
         .server_socket_addr(server.local_addr())
         .server_key(ServerKey::Pinned(hexserver::public_key(&[8; 32])))
         .auth_data(vec![])
-        .hash_auth_data(false)
         .channel_config(channel_config())
         .connect();
     assert!(matches!(

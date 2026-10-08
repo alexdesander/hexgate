@@ -21,7 +21,7 @@ include = [
 [dependencies]
 aes-gcm = "0.11.1"
 ahash = "0.8.12"
-argon2 = "0.6.0"
+argon2 = { version = "0.6.0", optional = true }
 bon = "3.9.1"
 chacha20poly1305 = "0.11.0"
 crossbeam-channel = "0.5.17"
@@ -41,6 +41,9 @@ rand_distr = "0.6.0"
 num_enum = { version = "0.7.6", default-features = false }
 
 [features]
+default = ["argon2"]
+# Argon2id hashing of the client's auth data (`hash_auth_data`).
+argon2 = ["dep:argon2"]
 # Debug and trace events for handshakes, connection changes and rejected packets.
 tracing = ["dep:tracing"]
 # Internal entry points for the benchmarks in benches/, not part of the API.
