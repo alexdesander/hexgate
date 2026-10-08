@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         keys::save(KNOWN_SERVER_KEY, &server_key)?;
     }
     // Both directions as on an average home connection.
-    client.set_simulator(Profile::average().client(1));
+    client.set_simulator(Profile::average().client(1))?;
 
     let _client = client.clone();
     let thread = std::thread::spawn(move || {
@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
                     println!("Timed out!");
                     break;
                 }
-                Event::Received(message) => {
+                Event::Received(_, message) => {
                     let text = String::from_utf8_lossy(&message);
                     println!("{}", text);
                 }
@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
                     break;
                 }
                 // Only reported to clients started with `start()`.
-                Event::Connected | Event::ConnectFailed(_) => {}
+                Event::Connected | Event::ConnectFailed(_) | Event::SendResult(..) => {}
             }
         }
     });
@@ -78,15 +78,18 @@ fn main() -> anyhow::Result<()> {
             Some("/ch") => {
                 channel = match words.next() {
                     Some("unreliable") => Channel::Unreliable,
-                    Some("unreliable_ordered") => match words.next() {
-                        Some(channel) => Channel::UnreliableOrdered(channel.parse().unwrap()),
-                        _ => {
-                            println!("Invalid channel");
-                            continue;
+                    Some("unreliable_ordered") => {
+                        match words.next().and_then(|channel| channel.parse().ok()) {
+                            Some(channel) => Channel::UnreliableOrdered(channel),
+                            _ => {
+                                println!("Invalid channel");
+                                continue;
+                            }
                         }
-                    },
-                    Some("reliable") => match words.next() {
-                        Some(channel) => Channel::Reliable(channel.parse().unwrap()),
+                    }
+                    Some("reliable") => match words.next().and_then(|channel| channel.parse().ok())
+                    {
+                        Some(channel) => Channel::Reliable(channel),
                         _ => {
                             println!("Invalid channel");
                             continue;

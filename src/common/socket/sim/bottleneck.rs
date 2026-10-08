@@ -133,7 +133,8 @@ impl Queue {
             self.queued.pop_front();
         }
         // The packet being sent doesn't occupy the buffer.
-        if self.backlog > 0 && self.backlog + size > self.buffer {
+        let waiting = self.backlog - self.queued.front().map_or(0, |&(_, size)| size);
+        if !self.queued.is_empty() && waiting.saturating_add(size) > self.buffer {
             return None;
         }
         let departure = self.serve(at.max(self.free_at), size, stalls, rng);
@@ -217,5 +218,60 @@ impl Queue {
             offset -= duration;
         }
         unreachable!("the offset is within the cycle")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn buffer_excludes_the_packet_currently_being_serialized() {
+        let now = Instant::now();
+        let config = Bottleneck {
+            buffer: 1028,
+            ..Bottleneck::new(102_800, Duration::ZERO)
+        };
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
+        let mut queue = Queue::new(&config, now, &mut rng);
+        assert_eq!(
+            queue.enqueue(now, 1028, None, &mut rng),
+            Some(now + Duration::from_millis(10))
+        );
+        assert_eq!(
+            queue.enqueue(now, 1028, None, &mut rng),
+            Some(now + Duration::from_millis(20))
+        );
+        assert_eq!(queue.enqueue(now, 1, None, &mut rng), None);
+        assert_eq!(
+            queue.enqueue(now + Duration::from_millis(5), 1, None, &mut rng),
+            None
+        );
+        assert_eq!(
+            queue.enqueue(now + Duration::from_millis(10), 1028, None, &mut rng),
+            Some(now + Duration::from_millis(30))
+        );
+        assert_eq!(
+            queue.enqueue(now + Duration::from_millis(10), 1, None, &mut rng),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_buffer_admits_only_when_the_link_is_idle() {
+        let now = Instant::now();
+        let config = Bottleneck::new(100_000, Duration::ZERO);
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(1);
+        let mut queue = Queue::new(&config, now, &mut rng);
+        assert_eq!(
+            queue.enqueue(now, 1000, None, &mut rng),
+            Some(now + Duration::from_millis(10))
+        );
+        assert_eq!(queue.enqueue(now, 1, None, &mut rng), None);
+        assert_eq!(
+            queue.enqueue(now + Duration::from_millis(10), 1000, None, &mut rng),
+            Some(now + Duration::from_millis(20))
+        );
     }
 }

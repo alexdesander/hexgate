@@ -12,9 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam::channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use hexgate::{
-    client, server,
+    client,
+    error::SendError,
+    server,
     sim::{LinkStats, Profile, Simulator},
     Authenticator, Channel, Client, ClientVersion, Server, ServerKey, Stats,
 };
@@ -55,6 +57,7 @@ pub struct Arrival {
 pub struct StreamRecord {
     pub sent: u64,
     pub sent_bytes: u64,
+    pub backpressured: u64,
     pub arrivals: Vec<Arrival>,
     pub corrupt: u64,
 }
@@ -171,7 +174,7 @@ fn server_receiver(
                 let _ = addr_tx.send(addr);
                 continue;
             }
-            Ok(server::Event::Received(from, message)) => {
+            Ok(server::Event::Received(from, _, message)) => {
                 let stream = parse(&message).map(|header| header.stream);
                 if stream == Some(STOP) {
                     return;
@@ -203,7 +206,7 @@ fn client_receiver(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || loop {
         let ended = match client.next() {
-            Ok(client::Event::Received(message)) => {
+            Ok(client::Event::Received(_, message)) => {
                 if parse(&message).is_some_and(|header| header.stream == STOP) {
                     return;
                 }
@@ -231,6 +234,7 @@ struct StreamState {
     ping: Option<Instant>,
     sent: u64,
     sent_bytes: u64,
+    backpressured: u64,
 }
 
 struct Endpoints<'a> {
@@ -240,10 +244,10 @@ struct Endpoints<'a> {
 }
 
 impl Endpoints<'_> {
-    fn send(&self, dir: Dir, channel: Channel, message: Vec<u8>) -> bool {
+    fn send(&self, dir: Dir, channel: Channel, message: Vec<u8>) -> Result<(), SendError> {
         match dir {
-            Dir::Up => self.client.send(channel, message).is_ok(),
-            Dir::Down => self.server.send(self.addr, channel, message).is_ok(),
+            Dir::Up => self.client.send(channel, message),
+            Dir::Down => self.server.send(self.addr, channel, message),
         }
     }
 
@@ -362,7 +366,7 @@ pub fn run(workload: &Workload, profile: &Profile, settings: &Settings) -> RawRu
     raw.down = down.stats();
 
     // End both receivers through a clean link.
-    client.set_simulator(Simulator::default());
+    client.set_simulator(Simulator::default()).unwrap();
     let _ = client.send(CONTROL, message(STOP, 0, HEADER));
     let _ = server.send(addr, CONTROL, message(STOP, 0, HEADER));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -393,6 +397,7 @@ pub fn run(workload: &Workload, profile: &Profile, settings: &Settings) -> RawRu
             let mut record = std::mem::take(&mut side.streams[i]);
             record.sent = sender.sent;
             record.sent_bytes = sender.sent_bytes;
+            record.backpressured = sender.backpressured;
             record
         })
         .collect();
@@ -432,6 +437,7 @@ fn send_phase(
                 ping: None,
                 sent: 0,
                 sent_bytes: 0,
+                backpressured: 0,
             }
         })
         .collect();
@@ -450,10 +456,15 @@ fn send_phase(
         for (i, (spec, sender)) in workload.streams.iter().zip(&mut senders).enumerate() {
             let mut send = |sender: &mut StreamState, size: usize| {
                 let message = message(i as u8, sender.seq, size);
-                sender.seq += 1;
-                sender.sent += 1;
-                sender.sent_bytes += size as u64;
-                alive &= endpoints.send(spec.dir, spec.channel, message);
+                match endpoints.send(spec.dir, spec.channel, message) {
+                    Ok(()) => {
+                        sender.seq += 1;
+                        sender.sent += 1;
+                        sender.sent_bytes += size as u64;
+                    }
+                    Err(SendError::Backpressure) => sender.backpressured += 1,
+                    Err(_) => alive = false,
+                }
             };
             match spec.pattern {
                 Pattern::Periodic { size, .. } => {

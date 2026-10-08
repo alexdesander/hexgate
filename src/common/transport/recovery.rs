@@ -24,6 +24,8 @@ const PERSISTENT_CONGESTION_PTOS: u32 = 3;
 /// Probe timeouts back off exponentially up to this power of two: games need the connection
 /// to recover within seconds once packets get through again.
 const MAX_PTO_BACKOFF: u32 = 2;
+// Close before an unacknowledged packet can pin unbounded control history
+const MAX_HISTORY: usize = 16_384;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Rtt {
@@ -31,6 +33,7 @@ pub struct Rtt {
     pub smoothed: Option<Duration>,
     pub var: Duration,
     pub min: Duration,
+    pub first_sample: Option<Instant>,
 }
 
 impl Default for Rtt {
@@ -40,18 +43,20 @@ impl Default for Rtt {
             smoothed: None,
             var: INITIAL_RTT / 2,
             min: Duration::MAX,
+            first_sample: None,
         }
     }
 }
 
 impl Rtt {
-    pub fn update(&mut self, sample: Duration, ack_delay: Duration) {
+    pub fn update(&mut self, now: Instant, sample: Duration, ack_delay: Duration) -> Duration {
+        self.first_sample.get_or_insert(now);
         self.latest = sample;
         self.min = self.min.min(sample);
         let Some(smoothed) = self.smoothed else {
             self.smoothed = Some(sample);
             self.var = sample / 2;
-            return;
+            return sample;
         };
         let ack_delay = ack_delay.min(MAX_ACK_DELAY);
         let adjusted = if sample >= self.min + ack_delay {
@@ -61,6 +66,7 @@ impl Rtt {
         };
         self.var = (self.var * 3 + smoothed.abs_diff(adjusted)) / 4;
         self.smoothed = Some((smoothed * 7 + adjusted) / 8);
+        adjusted
     }
 
     pub fn smoothed(&self) -> Duration {
@@ -107,6 +113,9 @@ pub struct History {
     last_eliciting_sent: Option<Instant>,
     /// When the earliest in-flight packet below the largest acknowledged one is lost.
     loss_time: Option<Instant>,
+    pruned_loss_start: Option<(u64, Instant)>,
+    late: VecDeque<(u64, SentPacket)>,
+    persistent_end: Option<Instant>,
 }
 
 /// What an ACK changed.
@@ -118,6 +127,12 @@ pub struct Acked {
 }
 
 impl History {
+    #[cfg(test)]
+    pub fn set_next_pn_for_test(&mut self, pn: u64) {
+        assert!(self.packets.is_empty());
+        self.first_pn = pn;
+    }
+
     pub fn next_pn(&self) -> u64 {
         self.first_pn + self.packets.len() as u64
     }
@@ -131,7 +146,19 @@ impl History {
         self.in_flight_packets > 0
     }
 
+    pub fn at_capacity(&self) -> bool {
+        self.packets.len() >= MAX_HISTORY - 1
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.packets.len() >= MAX_HISTORY
+    }
+
     pub fn on_sent(&mut self, packet: SentPacket) {
+        if self.packets.is_empty() && packet.state == State::Control {
+            self.first_pn += 1;
+            return;
+        }
         if packet.state == State::InFlight {
             self.in_flight += usize::from(packet.size);
             self.in_flight_packets += 1;
@@ -151,20 +178,42 @@ impl History {
         now: Instant,
         mut on_acked: impl FnMut(u64, &SentPacket),
     ) {
+        if high >= self.next_pn() || low > high {
+            return;
+        }
+        if self
+            .pruned_loss_start
+            .is_some_and(|(first, _)| high >= first && low < self.first_pn)
+        {
+            self.pruned_loss_start = None;
+        }
+        self.late.retain(|(pn, packet)| {
+            if (low..=high).contains(pn) {
+                on_acked(*pn, packet);
+                false
+            } else {
+                true
+            }
+        });
         let end = self.next_pn().min(high.saturating_add(1));
         for pn in low.max(self.first_pn)..end {
             let packet = &mut self.packets[(pn - self.first_pn) as usize];
-            if packet.state != State::InFlight {
+            if packet.state == State::Control {
+                packet.state = State::Acked;
+            }
+            if !matches!(packet.state, State::InFlight | State::Lost) {
                 continue;
             }
-            packet.state = State::Acked;
-            self.in_flight -= usize::from(packet.size);
-            self.in_flight_packets -= 1;
-            acked.newly_acked += 1;
-            if pn == largest {
-                acked.rtt_sample = Some(now.saturating_duration_since(packet.time));
+            if packet.state == State::InFlight {
+                self.in_flight -= usize::from(packet.size);
+                self.in_flight_packets -= 1;
+                acked.newly_acked += 1;
+                if pn == largest {
+                    acked.rtt_sample = Some(now.saturating_duration_since(packet.time));
+                }
             }
             on_acked(pn, packet);
+            packet.state = State::Acked;
         }
         if end > low {
             self.largest_acked = self.largest_acked.max(Some(end - 1));
@@ -187,7 +236,10 @@ impl History {
         let persistent = rtt.pto() * PERSISTENT_CONGESTION_PTOS;
         // The current run of lost packets without an acknowledged one between: first and last
         // send time.
-        let mut run: Option<(Instant, Instant)> = None;
+        let mut run = self
+            .pruned_loss_start
+            .map(|(_, sent)| sent)
+            .filter(|&sent| rtt.first_sample.is_none_or(|at| sent >= at));
         let mut persistent_congestion = false;
         for (i, packet) in self.packets.iter_mut().enumerate() {
             let pn = self.first_pn + i as u64;
@@ -197,6 +249,10 @@ impl History {
             if packet.state != State::InFlight {
                 if packet.state == State::Acked {
                     run = None;
+                } else if packet.state == State::Lost
+                    && rtt.first_sample.is_none_or(|at| packet.time >= at)
+                {
+                    run.get_or_insert(packet.time);
                 }
                 continue;
             }
@@ -205,26 +261,58 @@ impl History {
                 packet.state = State::Lost;
                 self.in_flight -= usize::from(packet.size);
                 self.in_flight_packets -= 1;
-                let (first, _) = *run.get_or_insert((packet.time, packet.time));
-                run = Some((first, packet.time));
-                persistent_congestion |= rtt.smoothed.is_some()
-                    && packet.time.saturating_duration_since(first) >= persistent;
+                let eligible = rtt.first_sample.is_none_or(|at| packet.time >= at);
+                if !eligible {
+                    run = None;
+                }
+                let first = if eligible {
+                    *run.get_or_insert(packet.time)
+                } else {
+                    packet.time
+                };
+                if rtt.smoothed.is_some()
+                    && rtt.first_sample.is_none_or(|at| first >= at)
+                    && packet.time.saturating_duration_since(first) >= persistent
+                    && self.persistent_end.is_none_or(|end| first > end)
+                {
+                    persistent_congestion = true;
+                    self.persistent_end = Some(packet.time);
+                }
                 on_lost(pn, packet);
             } else {
+                run = None;
                 self.loss_time = Some(self.loss_time.map_or(lost_at, |at| at.min(lost_at)));
             }
         }
-        self.prune();
+        self.prune(rtt.first_sample);
         persistent_congestion
     }
 
-    fn prune(&mut self) {
+    fn prune(&mut self, eligible_after: Option<Instant>) {
         while self
             .packets
             .front()
-            .is_some_and(|packet| packet.state != State::InFlight)
+            .is_some_and(|p| p.state != State::InFlight)
         {
-            self.packets.pop_front();
+            let packet = self.packets.pop_front().unwrap();
+            match packet.state {
+                State::Lost => {
+                    if eligible_after.is_none_or(|at| packet.time >= at) {
+                        self.pruned_loss_start
+                            .get_or_insert((self.first_pn, packet.time));
+                    } else {
+                        self.pruned_loss_start = None;
+                    }
+                    if !packet.frames.is_empty() {
+                        self.late.push_back((self.first_pn, packet));
+                        if self.late.len() > 4096 {
+                            self.late.pop_front();
+                        }
+                    }
+                }
+                State::Acked => self.pruned_loss_start = None,
+                _ => {}
+            }
             self.first_pn += 1;
         }
     }
@@ -244,5 +332,136 @@ impl History {
             .iter()
             .find(|packet| packet.state == State::InFlight)
             .map(|packet| &packet.frames)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sent(time: Instant) -> SentPacket {
+        let mut frames = StreamFrames::default();
+        frames.push(crate::common::channel::StreamRange {
+            channel: 0,
+            start: 0,
+            len: 100,
+        });
+        SentPacket {
+            time,
+            size: 100,
+            state: State::InFlight,
+            frames,
+            cc: SentInfo::default(),
+        }
+    }
+
+    fn rtt(now: Instant) -> Rtt {
+        Rtt {
+            latest: Duration::from_millis(10),
+            smoothed: Some(Duration::from_millis(10)),
+            var: Duration::ZERO,
+            min: Duration::from_millis(10),
+            first_sample: Some(now),
+        }
+    }
+
+    #[test]
+    fn persistent_episode_survives_split_detection_passes() {
+        let now = Instant::now();
+        let mut history = History::default();
+        for ms in [0, 20, 65, 66, 70] {
+            history.on_sent(sent(now + Duration::from_millis(ms)));
+        }
+        history.on_ack_range(
+            4,
+            4,
+            &mut Acked::default(),
+            4,
+            now + Duration::from_millis(70),
+            |_, _| {},
+        );
+        assert!(!history.detect_lost(now + Duration::from_millis(70), &rtt(now), |_, _| {}));
+        assert_eq!(history.first_pn, 2);
+        assert!(history.detect_lost(now + Duration::from_millis(80), &rtt(now), |_, _| {}));
+        assert!(!history.detect_lost(now + Duration::from_millis(90), &rtt(now), |_, _| {}));
+    }
+
+    #[test]
+    fn acknowledgments_and_pre_sample_packets_break_persistent_episodes() {
+        let now = Instant::now();
+        for first_sample in [now, now + Duration::from_millis(30)] {
+            let mut history = History::default();
+            for ms in [0, 20, 65, 66, 70] {
+                history.on_sent(sent(now + Duration::from_millis(ms)));
+            }
+            history.on_ack_range(
+                4,
+                4,
+                &mut Acked::default(),
+                4,
+                now + Duration::from_millis(70),
+                |_, _| {},
+            );
+            if first_sample == now {
+                history.on_ack_range(
+                    1,
+                    1,
+                    &mut Acked::default(),
+                    4,
+                    now + Duration::from_millis(70),
+                    |_, _| {},
+                );
+            }
+            assert!(!history.detect_lost(
+                now + Duration::from_millis(80),
+                &rtt(first_sample),
+                |_, _| {}
+            ));
+        }
+    }
+
+    #[test]
+    fn late_ack_delivers_without_new_congestion_sample_and_future_ack_is_ignored() {
+        let now = Instant::now();
+        let mut history = History::default();
+        for _ in 0..4 {
+            history.on_sent(sent(now));
+        }
+        let mut acked = Acked::default();
+        history.on_ack_range(0, 1_000_000, &mut acked, 1_000_000, now, |_, _| panic!());
+        assert_eq!(history.in_flight, 400);
+        history.on_ack_range(3, 3, &mut acked, 3, now, |_, _| {});
+        history.detect_lost(now + Duration::from_millis(20), &rtt(now), |_, _| {});
+        assert_eq!(history.in_flight, 0);
+        let mut acked = Acked::default();
+        let mut delivered = 0;
+        history.on_ack_range(0, 2, &mut acked, 2, now, |_, packet| {
+            assert_eq!(packet.state, State::Lost);
+            delivered += 1;
+        });
+        assert_eq!(delivered, 3);
+        assert_eq!(acked.newly_acked, 0);
+        assert!(acked.rtt_sample.is_none());
+        assert!(history.late.is_empty());
+    }
+
+    #[test]
+    fn unpinned_control_history_is_reclaimed_immediately() {
+        let now = Instant::now();
+        let mut history = History::default();
+        for _ in 0..100_000 {
+            let mut packet = sent(now);
+            packet.state = State::Control;
+            history.on_sent(packet);
+        }
+        assert!(history.packets.is_empty());
+        assert_eq!(history.next_pn(), 100_000);
+        history.on_sent(sent(now));
+        while !history.at_capacity() {
+            let mut packet = sent(now);
+            packet.state = State::Control;
+            history.on_sent(packet);
+        }
+        assert_eq!(history.packets.len(), MAX_HISTORY - 1);
     }
 }

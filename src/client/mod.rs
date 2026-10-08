@@ -7,11 +7,11 @@
 use std::{
     fmt,
     io::{self, ErrorKind},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
+    net::{SocketAddr, ToSocketAddrs, UdpSocket},
     panic::{self, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc, Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, OnceLock, PoisonError, RwLock,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -19,9 +19,9 @@ use std::{
 
 use ahash::HashSet;
 use bon::bon;
-use crossbeam::channel::{bounded, unbounded, Sender};
-use handshake::{Handshake, Link};
-use mio::{Interest, Poll, Waker};
+use crossbeam_channel::{bounded, Sender};
+use handshake::Handshake;
+use mio::{Poll, Waker};
 use thread::{ClientThreadState, Cmd};
 
 use crate::common::{
@@ -30,13 +30,15 @@ use crate::common::{
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver, Payload},
     packets::{info_request::InfoRequest, info_response::InfoResponse, login_request},
+    send::{self, Admission, Message, SendOptions, SendOutcome, SendQueueLimits},
     socket::{is_transient, sim::Simulator, Socket},
-    stats::Stats,
+    stats::{ChannelStats, Stats},
     transport::{self, Connection},
-    AllowedClientVersions, ClientVersion, RECV_TOKEN, WAKE_TOKEN,
+    AllowedClientVersions, ClientVersion, WAKE_TOKEN,
 };
 
 mod handshake;
+mod startup;
 mod thread;
 
 /// Why the client couldn't connect.
@@ -178,7 +180,9 @@ pub enum Event {
     /// Nothing was received from the server for `timeout_dur`.
     TimedOut,
     /// A message from the server.
-    Received(Vec<u8>),
+    Received(Channel, Vec<u8>),
+    /// Feedback for an optional send receipt, independent of application processing
+    SendResult(u64, SendOutcome),
     /// The server violated the protocol and was disconnected.
     Violation(ProtocolViolation),
 }
@@ -186,7 +190,7 @@ pub enum Event {
 impl Payload for Event {
     fn payload_len(&self) -> usize {
         match self {
-            Event::Received(message) => message.len(),
+            Event::Received(_, message) => message.len(),
             _ => 0,
         }
     }
@@ -197,7 +201,6 @@ impl Payload for Event {
 #[derive(Clone)]
 pub struct Client {
     send_limits: SendLimits,
-    local_addr: SocketAddr,
     inner: Arc<ClientInner>,
 }
 
@@ -205,70 +208,128 @@ impl Client {
     /// The next event if there is one. An error means the network thread has stopped, the
     /// first one says why.
     pub fn try_next(&self) -> Result<Option<Event>, RecvError> {
-        self.inner.event_rx.try_next()
+        let event = self.inner.event_rx.try_next()?;
+        if event.is_some() {
+            let _ = self.inner.waker.wake();
+        }
+        Ok(event)
     }
 
     /// Waits for the next event. An error means the network thread has stopped, the first one
     /// says why.
     pub fn next(&self) -> Result<Event, RecvError> {
-        self.inner.event_rx.next()
+        let event = self.inner.event_rx.next()?;
+        let _ = self.inner.waker.wake();
+        Ok(event)
     }
 
     /// Queues a message for the server. Messages sent while connecting (`start()`) are sent
     /// once connected.
     pub fn send(&self, channel: Channel, message: Vec<u8>) -> Result<(), SendError> {
+        self.send_with(channel, message, SendOptions::default())
+    }
+
+    /// Queues a message with optional freshness and delivery feedback
+    pub fn send_with(
+        &self,
+        channel: Channel,
+        message: Vec<u8>,
+        options: SendOptions,
+    ) -> Result<(), SendError> {
+        let submitted = Instant::now();
         self.send_limits.check(channel, message.len())?;
+        options.validate(channel)?;
+        let reservation = self.inner.admission.reserve(channel, message.capacity())?;
+        self.command(Cmd::Send(
+            channel,
+            Message {
+                data: Arc::new(message),
+                submitted,
+                options,
+                reservation: Some(reservation),
+            },
+        ))
+    }
+
+    fn command(&self, command: Cmd) -> Result<(), SendError> {
         self.inner
             .cmd_tx
-            .send(Cmd::Send(channel, message))
-            .map_err(|_| SendError::Stopped)?;
+            .try_send(command)
+            .map_err(send::command_error)?;
         let _ = self.inner.waker.wake();
         Ok(())
+    }
+
+    /// Abandons queued transfers on this reliable channel and starts a new generation
+    /// Data received before the reset reaches the peer may still be delivered
+    pub fn reset_channel(&self, channel: u8) -> Result<(), SendError> {
+        self.send_limits.check(Channel::Reliable(channel), 0)?;
+        self.command(Cmd::ResetChannel(channel))
+    }
+
+    /// Changes a channel's priority; larger values run first, with occasional lower-priority service
+    pub fn set_priority(&self, channel: Channel, priority: i8) -> Result<(), SendError> {
+        self.send_limits.check(channel, 0)?;
+        self.command(Cmd::SetPriority(channel, priority))
+    }
+
+    /// Queue state on one channel, unavailable while connecting or when the command queue is full
+    pub fn channel_stats(&self, channel: Channel) -> Option<ChannelStats> {
+        self.inner.server_key.get()?;
+        self.send_limits.check(channel, 0).ok()?;
+        let (tx, rx) = bounded(1);
+        self.command(Cmd::ChannelStats(channel, tx)).ok()?;
+        rx.recv().ok().flatten()
     }
 
     /// Ends a tick: the messages sent since the last flush leave together, as one paced burst.
     /// Optional; once called, sent messages wait for the next flush (at most two tick
     /// intervals, or 100 ms). Without it, messages leave as soon as the send rate allows.
-    pub fn flush(&self) {
-        let _ = self.inner.cmd_tx.send(Cmd::Flush);
-        let _ = self.inner.waker.wake();
+    pub fn flush(&self) -> Result<(), SendError> {
+        self.command(Cmd::Flush)
     }
 
-    /// The bytes the next tick of length `tick` may send without queueing: the congestion
-    /// controller's send rate times the tick. Fill snapshots up to this in priority order.
+    /// Approximate gross packet bytes at the current rate over `tick`, including protocol
+    /// overhead. This is a shared rate hint, not reserved payload credit; queued data and
+    /// retransmissions also consume it.
     /// 0 before the connection is established.
-    pub fn budget_for(&self, tick: Duration) -> usize {
+    pub fn gross_send_budget(&self, tick: Duration) -> usize {
         (self.inner.rate.load(Ordering::Relaxed) as f64 * tick.as_secs_f64()) as usize
     }
 
     /// Closes the connection once queued messages were sent and acknowledged, or after
     /// `close_linger`. Later sends are dropped. The data is sent to the server, at most 1170 bytes.
-    pub fn disconnect(&self, data: Vec<u8>) -> Result<(), TooLarge> {
-        TooLarge::check(data.len(), transport::MAX_REASON_SIZE)?;
-        let _ = self.inner.cmd_tx.send(Cmd::Disconnect(data));
+    pub fn disconnect(&self, data: Vec<u8>) -> Result<(), SendError> {
+        TooLarge::check(data.len(), transport::MAX_REASON_SIZE)
+            .map_err(SendError::MessageTooLarge)?;
+        self.command(Cmd::Disconnect(data))?;
+        self.inner.cancel_connecting.store(true, Ordering::Relaxed);
         let _ = self.inner.waker.wake();
         Ok(())
     }
 
     /// Simulates network conditions for this client's packets, `Simulator::default()` turns it
     /// off. See [`crate::sim`].
-    pub fn set_simulator(&self, simulator: Simulator) {
-        let _ = self.inner.cmd_tx.send(Cmd::SetSimulator(simulator));
-        let _ = self.inner.waker.wake();
+    pub fn set_simulator(&self, simulator: Simulator) -> Result<(), SendError> {
+        self.command(Cmd::SetSimulator(simulator))
     }
 
     /// Asks the network thread for the connection statistics, `None` before it is connected
     /// and once it has stopped.
     pub fn stats(&self) -> Option<Stats> {
+        self.inner.server_key.get()?;
         let (reply_tx, reply_rx) = bounded(1);
-        self.inner.cmd_tx.send(Cmd::Stats(reply_tx)).ok()?;
-        let _ = self.inner.waker.wake();
+        self.command(Cmd::Stats(reply_tx)).ok()?;
         reply_rx.recv().ok()
     }
 
-    /// The address the client's socket is bound to.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+    /// The bound address, unavailable until resolution and socket creation finish
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        *self
+            .inner
+            .local_addr
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The server's public key, `None` until connected.
@@ -280,13 +341,16 @@ impl Client {
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
-            .field("local_addr", &self.local_addr)
+            .field("local_addr", &self.local_addr())
             .field("server_key", &self.get_server_key())
             .finish_non_exhaustive()
     }
 }
 
 struct ClientInner {
+    admission: Arc<Admission>,
+    local_addr: Arc<RwLock<Option<SocketAddr>>>,
+    cancel_connecting: Arc<AtomicBool>,
     server_key: Arc<OnceLock<[u8; 32]>>,
     rate: Arc<AtomicU64>,
     cmd_tx: Sender<Cmd>,
@@ -297,6 +361,8 @@ struct ClientInner {
 
 impl Drop for ClientInner {
     fn drop(&mut self) {
+        self.cancel_connecting.store(true, Ordering::Relaxed);
+        let _ = self.waker.wake();
         let _ = self.cmd_tx.send(Cmd::Disconnect(vec![]));
         let _ = self.waker.wake();
         let _ = self.thread.take().unwrap().join();
@@ -309,11 +375,11 @@ impl Client {
     /// which reports `Event::Connected` or `Event::ConnectFailed`; messages sent before are
     /// queued. `connect()` blocks until the handshake is done instead.
     #[builder(finish_fn = start)]
-    pub fn prepare<A: ToSocketAddrs>(
+    pub fn prepare<A: ToSocketAddrs + Send + 'static>(
         /// Defaults to any address of the server's IP version, with a random port.
         bind_addr: Option<SocketAddr>,
-        /// An address or a host name with port, e.g. `"example.com:44444"`. The first resolved
-        /// address (of `bind_addr`'s IP version, if set) is used.
+        /// An address or host name with port, resolved on a worker thread
+        /// Matching addresses are tried in order after transport failures
         server_socket_addr: A,
         /// How the server's identity is checked, see [`ServerKey`].
         server_key: ServerKey,
@@ -332,10 +398,9 @@ impl Client {
         /// The connection times out when nothing arrives from the server for this long.
         #[builder(default = Duration::from_secs(10))]
         timeout_dur: Duration,
-        /// Limit for queued, undrained events. While reached, or while the queued messages take
-        /// 64 MiB (at least 4 × `max_recv_msg_size`), received unreliable messages are dropped and
-        /// reliable packets are left unacknowledged (the peer resends them later). Connection
-        /// events are always delivered.
+        /// Limit for queued message and receipt events, also bounded by 64 MiB of message data
+        /// (at least 4 × `max_recv_msg_size`); connection events are always delivered
+        /// Reliable receive credit resumes when the app polls; unreliable messages may be dropped
         #[builder(default = 65536)]
         max_events: usize,
         /// The channels, the counts must match the server's.
@@ -343,6 +408,9 @@ impl Client {
         /// Send rate limits.
         #[builder(default)]
         congestion_config: CongestionConfig,
+        /// Outgoing buffer and message limits per connection and channel
+        #[builder(default)]
+        send_queue_limits: SendQueueLimits,
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
@@ -363,6 +431,7 @@ impl Client {
         handshake_tries: u8,
     ) -> Result<Self, ConnectError> {
         channel_config.validate()?;
+        send_queue_limits.validate()?;
         congestion_config.validate()?;
         if !hash_auth_data {
             TooLarge::check(auth_data.len(), login_request::MAX_AUTH_DATA_SIZE)
@@ -370,30 +439,11 @@ impl Client {
         }
         let send_limits = SendLimits::new(&channel_config, max_send_msg_size);
 
-        let server_socket_addr = server_socket_addr
-            .to_socket_addrs()?
-            .find(|addr| bind_addr.is_none_or(|bind_addr| bind_addr.is_ipv4() == addr.is_ipv4()))
-            .ok_or_else(|| {
-                io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "the server address resolved to no address of bind_addr's IP version",
-                )
-            })?;
-        let bind_addr = bind_addr.unwrap_or(match server_socket_addr {
-            SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
-            SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
-        });
-        let mut socket = Socket::builder()
-            .bind_addr(bind_addr)
-            .connected_to(server_socket_addr)
-            .maybe_buffer_size_bytes(socket_buffer_size)
-            .maybe_simulator(simulator)
-            .build()?;
-        let local_addr = socket.local_addr()?;
         let mut poll = Poll::new()?;
-        poll.registry()
-            .register(socket.mio_socket(), RECV_TOKEN, Interest::READABLE)?;
-
+        let local_addr = Arc::new(RwLock::new(None));
+        let thread_local_addr = local_addr.clone();
+        let cancel_connecting = Arc::new(AtomicBool::new(false));
+        let thread_cancelled = cancel_connecting.clone();
         let handshake = Handshake {
             server_key,
             auth_data,
@@ -405,7 +455,7 @@ impl Client {
         };
         let (event_tx, event_rx) = events::channel(max_events, max_recv_msg_size);
         let fail_tx = event_tx.clone();
-        let (cmd_tx, cmd_rx) = unbounded();
+        let (cmd_tx, cmd_rx) = bounded(1024);
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
         let _waker = waker.clone();
         let server_key = Arc::new(OnceLock::new());
@@ -422,13 +472,19 @@ impl Client {
             .name("hexgate-client".into())
             .spawn(move || {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let mut link = Link {
-                        socket: &mut socket,
-                        poll: &mut poll,
-                        cmds: &cmd_rx,
-                        pending: Vec::new(),
-                    };
-                    let (crypto, key) = match handshake.run(&mut link) {
+                    let connected = startup::connect(
+                        server_socket_addr,
+                        bind_addr,
+                        socket_buffer_size,
+                        simulator,
+                        &handshake,
+                        &mut poll,
+                        &cmd_rx,
+                        &thread_cancelled,
+                        &_waker,
+                        &thread_local_addr,
+                    );
+                    let (socket, crypto, key, pending) = match connected {
                         Ok(connected) => connected,
                         Err(e) => {
                             log!(debug, error = %e, "connect failed");
@@ -436,7 +492,6 @@ impl Client {
                             return Ok(());
                         }
                     };
-                    let pending = link.pending;
                     let _ = thread_server_key.set(key.to_bytes());
                     log!(debug, "connected");
                     event_tx.send(Event::Connected);
@@ -451,10 +506,14 @@ impl Client {
                         rate: thread_rate,
                         close_linger,
                         outputs: Vec::new(),
+                        receive_pending: false,
                     };
                     state.run(pending)
                 }))
                 .unwrap_or_else(|payload| Err(RecvError::panicked(payload)));
+                *thread_local_addr
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
                 if let Err(e) = result {
                     log!(error, error = %e, "network thread stopped");
                     fail_tx.fail(e);
@@ -463,8 +522,10 @@ impl Client {
 
         Ok(Client {
             send_limits,
-            local_addr,
             inner: Arc::new(ClientInner {
+                admission: Admission::new(send_queue_limits),
+                local_addr,
+                cancel_connecting,
                 server_key,
                 rate,
                 cmd_tx,
@@ -476,7 +537,9 @@ impl Client {
     }
 }
 
-impl<A: ToSocketAddrs, S: client_prepare_builder::IsComplete> ClientPrepareBuilder<A, S> {
+impl<A: ToSocketAddrs + Send + 'static, S: client_prepare_builder::IsComplete>
+    ClientPrepareBuilder<A, S>
+{
     /// Starts the client and blocks until the handshake is done (this consumes the
     /// `Event::Connected`). Can run on another thread, the client can be sent back afterwards.
     pub fn connect(self) -> Result<Client, ConnectError> {

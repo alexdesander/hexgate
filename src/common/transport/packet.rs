@@ -14,6 +14,7 @@ use crate::common::{
 
 pub const MAX_DATAGRAM: usize = 1200;
 pub const TAG_LEN: usize = 16;
+pub const MAX_PACKET_NUMBER: u64 = (1 << 62) - 1;
 
 pub struct Header {
     pub pn: u64,
@@ -58,6 +59,9 @@ pub fn parse_header(buf: &[u8]) -> Result<Header, PacketError> {
         _ => return Err(PacketError::Identifier),
     };
     let (pn, pn_len) = read_varint(&buf[1..]).ok_or(PacketError::Malformed)?;
+    if pn > MAX_PACKET_NUMBER {
+        return Err(PacketError::Malformed);
+    }
     let len = 1 + pn_len;
     if buf.len() < len + TAG_LEN {
         return Err(PacketError::Size);

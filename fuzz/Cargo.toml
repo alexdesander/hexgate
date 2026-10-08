@@ -28,3 +28,10 @@ path = "fuzz_targets/channels.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "progress"
+path = "fuzz_targets/progress.rs"
+test = false
+doc = false
+bench = false

@@ -48,6 +48,7 @@ pub struct StreamResult {
     pub key: bool,
     pub round_trip: bool,
     pub sent: u64,
+    pub backpressured: u64,
     pub delivered: u64,
     /// Delivered / sent, 0..1.
     pub delivery: f64,
@@ -125,7 +126,6 @@ pub struct StatsSummary {
     pub packet_loss: f32,
     pub send_rate_mbit: f64,
     pub delivery_rate_mbit: f64,
-    pub utilization: f32,
     pub congestion: Option<String>,
     pub queued_bytes: usize,
     pub expired_messages: u64,
@@ -252,10 +252,14 @@ fn stream(
 
     let interval_ms = spec.pattern.interval().map(ms);
     let gaps: Option<Vec<f64>> = interval_ms.map(|_| {
-        let times: Vec<u64> = unique
-            .iter()
-            .filter(in_phase)
-            .map(|arrival| arrival.recv_us)
+        let times: Vec<u64> = std::iter::once(raw.start_us)
+            .chain(
+                unique
+                    .iter()
+                    .filter(in_phase)
+                    .map(|arrival| arrival.recv_us),
+            )
+            .chain(std::iter::once(raw.end_us))
             .collect();
         times
             .windows(2)
@@ -297,6 +301,7 @@ fn stream(
         key: spec.name == key,
         round_trip,
         sent: record.sent,
+        backpressured: record.backpressured,
         delivered: unique.len() as u64,
         delivery: if record.sent == 0 {
             0.0
@@ -379,9 +384,64 @@ fn stats(stats: Stats) -> StatsSummary {
         packet_loss: stats.packet_loss,
         send_rate_mbit: stats.send_rate as f64 * 8.0 / 1e6,
         delivery_rate_mbit: stats.delivery_rate as f64 * 8.0 / 1e6,
-        utilization: stats.utilization,
         congestion: stats.congestion.map(|congestion| format!("{congestion:?}")),
         queued_bytes: stats.queued_bytes,
         expired_messages: stats.expired_messages,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn periodic_gaps_include_both_observation_boundaries() {
+        use super::*;
+        use crate::workloads::Size;
+        let spec = Stream {
+            name: "ticks",
+            dir: Dir::Up,
+            channel: Channel::Unreliable,
+            pattern: Pattern::Periodic {
+                hz: 64.0,
+                size: Size::Fixed(100),
+            },
+        };
+        let raw = RawRun {
+            connect: Ok(Duration::ZERO),
+            ended: None,
+            start_us: 1_000_000,
+            end_us: 11_000_000,
+            streams: Vec::new(),
+            client_stats: None,
+            server_stats: None,
+            up: LinkStats::default(),
+            down: LinkStats::default(),
+        };
+        for (times, expected_gap, expected_stalls) in [
+            (vec![], 10_000.0, 6.0),
+            (vec![1_010_000], 9990.0, 6.0),
+            (vec![10_990_000], 9990.0, 6.0),
+            (vec![6_000_000], 5000.0, 12.0),
+            (vec![11_100_000], 10_000.0, 6.0),
+        ] {
+            let record = StreamRecord {
+                sent: 640,
+                backpressured: 0,
+                sent_bytes: 64_000,
+                corrupt: 0,
+                arrivals: times
+                    .into_iter()
+                    .enumerate()
+                    .map(|(seq, recv_us)| Arrival {
+                        seq: seq as u32,
+                        sent_us: raw.start_us,
+                        recv_us,
+                        len: 100,
+                    })
+                    .collect(),
+            };
+            let result = stream(&spec, spec.name, &Profile::perfect(), &record, &raw, 10.0);
+            assert_eq!(result.max_gap_ms, Some(expected_gap));
+            assert_eq!(result.stalls_per_min, Some(expected_stalls));
+        }
     }
 }

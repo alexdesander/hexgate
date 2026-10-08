@@ -14,12 +14,13 @@ pub mod error;
 pub(crate) mod events;
 pub mod keys;
 pub(crate) mod packets;
+pub(crate) mod send;
 pub mod socket;
 pub mod stats;
 pub(crate) mod timed_event_queue;
 pub(crate) mod transport;
 
-pub(crate) const PROTOCOL_VERSION: u8 = 0;
+pub(crate) const PROTOCOL_VERSION: u8 = 1;
 pub(crate) const RECV_TOKEN: Token = Token(0);
 pub(crate) const WAKE_TOKEN: Token = Token(1);
 

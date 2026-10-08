@@ -26,7 +26,7 @@ impl Authenticator<()> for AcceptAll {
 fn round_trip(client: &Client, channel: Channel, message: &[u8]) {
     client.send(channel, message.to_vec()).unwrap();
     loop {
-        if let client::Event::Received(echo) = client.next().unwrap() {
+        if let client::Event::Received(_, echo) = client.next().unwrap() {
             assert_eq!(echo, message);
             return;
         }
@@ -47,7 +47,7 @@ fn end_to_end(c: &mut Criterion) {
     let echo = server.clone();
     std::thread::spawn(move || {
         while let Ok(event) = echo.next() {
-            if let server::Event::Received(from, message) = event {
+            if let server::Event::Received(from, _, message) = event {
                 let channel = if message[0] == 0 {
                     Channel::Unreliable
                 } else {

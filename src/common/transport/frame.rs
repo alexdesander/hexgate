@@ -30,6 +30,8 @@ use crate::common::{
 const PING: u8 = 0x01;
 const ACK: u8 = 0x02;
 const CLOSE: u8 = 0x03;
+const CREDIT: u8 = 0x04;
+const RESET: u8 = 0x05;
 const UNRELIABLE: u8 = 0x08;
 const RELIABLE: u8 = 0x10;
 const LEN: u8 = 0x01;
@@ -46,6 +48,14 @@ pub struct Fragment {
 
 pub enum Frame<'a> {
     Ping,
+    Credit {
+        channel: u8,
+        limit: u64,
+    },
+    Reset {
+        channel: u8,
+        offset: u64,
+    },
     Ack(AckFrame<'a>),
     Close(&'a [u8]),
     Unreliable {
@@ -146,6 +156,14 @@ pub fn parse<'a>(r: &mut Reader<'a>) -> Result<Option<Frame<'a>>, PacketError> {
     };
     let frame = match kind {
         PING => Frame::Ping,
+        CREDIT => Frame::Credit {
+            channel: malformed(r.u8())?,
+            limit: malformed(r.varint())?,
+        },
+        RESET => Frame::Reset {
+            channel: malformed(r.u8())?,
+            offset: malformed(r.varint())?,
+        },
         ACK => Frame::Ack(parse_ack(r)?),
         CLOSE => Frame::Close(data(r, true)?),
         kind if kind & !(LEN | ORDERED | FRAG) == UNRELIABLE => {
@@ -183,7 +201,10 @@ pub fn parse<'a>(r: &mut Reader<'a>) -> Result<Option<Frame<'a>>, PacketError> {
 
 /// Validates the whole frame, so the iterators of `AckFrame` can't fail.
 fn parse_ack<'a>(r: &mut Reader<'a>) -> Result<AckFrame<'a>, PacketError> {
-    let largest = malformed(r.varint())?;
+    let largest = malformed(
+        r.varint()
+            .filter(|&pn| pn <= super::packet::MAX_PACKET_NUMBER),
+    )?;
     let delay_us = malformed(r.varint())?;
     let range_count = malformed(r.varint().filter(|&count| count <= MAX_RANGES))?;
     let first_range = malformed(r.varint().filter(|&first| first <= largest))?;
@@ -370,6 +391,26 @@ pub fn write_reliable_header(w: &mut Writer, channel: u8, offset: u64, len: usiz
     if with_len {
         w.varint(len as u64);
     }
+}
+
+pub fn write_credit(w: &mut Writer, channel: u8, limit: u64) -> bool {
+    if w.remaining() < 2 + varint_len(limit) {
+        return false;
+    }
+    w.u8(CREDIT);
+    w.u8(channel);
+    w.varint(limit);
+    true
+}
+
+pub fn write_reset(w: &mut Writer, channel: u8, offset: u64) -> bool {
+    if w.remaining() < 2 + varint_len(offset) {
+        return false;
+    }
+    w.u8(RESET);
+    w.u8(channel);
+    w.varint(offset);
+    true
 }
 
 pub fn write_ping(w: &mut Writer) {

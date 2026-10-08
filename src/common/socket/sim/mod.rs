@@ -14,7 +14,7 @@
 //! use hexgate::sim::Profile;
 //!
 //! // Both directions, simulated at the client.
-//! client.set_simulator(Profile::bad().client(1));
+//! let _ = client.set_simulator(Profile::bad().client(1));
 //! # }
 //! ```
 //!

@@ -196,7 +196,7 @@ fn server_times_out_silent_client() {
         Some(hexserver::Event::Connected(..))
     ));
     std::thread::sleep(Duration::from_secs(2));
-    client.set_simulator(Simulator::sending(Blackhole));
+    client.set_simulator(Simulator::sending(Blackhole)).unwrap();
     let start = Instant::now();
     let event = next_event(|| server.try_next(), WAIT);
     let elapsed = start.elapsed();
@@ -215,7 +215,7 @@ fn client_times_out_silent_server() {
     let timeout = Duration::from_secs(1);
     let (server, client) = connected(None, timeout);
     std::thread::sleep(Duration::from_secs(2));
-    server.set_simulator(Simulator::sending(Blackhole));
+    server.set_simulator(Simulator::sending(Blackhole)).unwrap();
     let start = Instant::now();
     let event = next_event(|| client.try_next(), WAIT);
     let elapsed = start.elapsed();
@@ -243,7 +243,7 @@ fn disconnect_flushes_queued_messages() {
     loop {
         match next_event(|| server.try_next(), WAIT) {
             Some(hexserver::Event::Connected(..)) => {}
-            Some(hexserver::Event::Received(_, message)) => {
+            Some(hexserver::Event::Received(_, _, message)) => {
                 assert_eq!(message, vec![received as u8; 1000]);
                 received += 1;
             }
@@ -272,7 +272,9 @@ fn shutdown_flushes_queued_messages() {
     drop(server);
     for i in 0..100u32 {
         match next_event(|| client.try_next(), WAIT) {
-            Some(hexclient::Event::Received(message)) => assert_eq!(message, vec![i as u8; 1000]),
+            Some(hexclient::Event::Received(_, message)) => {
+                assert_eq!(message, vec![i as u8; 1000])
+            }
             event => panic!("{event:?}"),
         }
     }
@@ -287,7 +289,10 @@ fn kick_disconnects_one_client() {
     let server = server(TIMEOUT);
     let kicked = client(server.local_addr(), TIMEOUT);
     let other = client(server.local_addr(), TIMEOUT);
-    let kicked_addr = SocketAddr::new(server.local_addr().ip(), kicked.local_addr().port());
+    let kicked_addr = SocketAddr::new(
+        server.local_addr().ip(),
+        kicked.local_addr().unwrap().port(),
+    );
     server
         .send(kicked_addr, Channel::Reliable(0), b"banned".to_vec())
         .unwrap();
@@ -298,7 +303,7 @@ fn kick_disconnects_one_client() {
     ));
     assert!(matches!(
         next_event(|| kicked.try_next(), WAIT),
-        Some(hexclient::Event::Received(message)) if message == b"banned"
+        Some(hexclient::Event::Received(_, message)) if message == b"banned"
     ));
     assert!(matches!(
         next_event(|| kicked.try_next(), WAIT),
@@ -310,7 +315,7 @@ fn kick_disconnects_one_client() {
     loop {
         match next_event(|| server.try_next(), WAIT) {
             Some(hexserver::Event::Connected(..)) => {}
-            Some(hexserver::Event::Received(from, message)) => {
+            Some(hexserver::Event::Received(from, _, message)) => {
                 assert_ne!(from, kicked_addr);
                 assert_eq!(message, b"hi");
                 break;
@@ -335,7 +340,7 @@ fn many_clients() {
     while echoed < clients.len() {
         match next_event(|| server.try_next(), WAIT) {
             Some(hexserver::Event::Connected(..)) => {}
-            Some(hexserver::Event::Received(from, message)) => {
+            Some(hexserver::Event::Received(from, _, message)) => {
                 server.send(from, Channel::Reliable(0), message).unwrap();
                 echoed += 1;
             }
@@ -345,7 +350,7 @@ fn many_clients() {
     for (i, client) in clients.iter().enumerate() {
         assert!(matches!(
             next_event(|| client.try_next(), WAIT),
-            Some(hexclient::Event::Received(message)) if message == i.to_string().as_bytes()
+            Some(hexclient::Event::Received(_, message)) if message == i.to_string().as_bytes()
         ));
     }
 }
@@ -378,7 +383,7 @@ fn survives_malformed_packets() {
     loop {
         match next_event(|| server.try_next(), WAIT) {
             Some(hexserver::Event::Connected(..)) => {}
-            Some(hexserver::Event::Received(_, message)) => {
+            Some(hexserver::Event::Received(_, _, message)) => {
                 assert_eq!(message, b"still fine");
                 break;
             }
@@ -391,12 +396,15 @@ fn survives_malformed_packets() {
 #[test]
 fn drop_without_draining_events() {
     let (server, client) = connected(None, TIMEOUT);
-    let peer = SocketAddr::new(server.local_addr().ip(), client.local_addr().port());
+    let peer = SocketAddr::new(
+        server.local_addr().ip(),
+        client.local_addr().unwrap().port(),
+    );
     for i in 0..5000u32 {
         let message = i.to_string().into_bytes();
-        client.send(Channel::Unreliable, message.clone()).unwrap();
-        client.send(Channel::Reliable(0), message.clone()).unwrap();
-        server.send(peer, Channel::Reliable(0), message).unwrap();
+        let _ = client.send(Channel::Unreliable, message.clone());
+        let _ = client.send(Channel::Reliable(0), message.clone());
+        let _ = server.send(peer, Channel::Reliable(0), message);
     }
     std::thread::sleep(Duration::from_secs(1));
     let (done_tx, done_rx) = mpsc::channel();

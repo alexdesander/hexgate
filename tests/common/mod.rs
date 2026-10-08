@@ -14,7 +14,8 @@ use hexgate::{
     error::RecvError,
     server,
     sim::{Fate, NetworkSimulator},
-    Authenticator, ChannelConfiguration, Client, ClientVersion, Server, ServerKey, Simulator,
+    Authenticator, ChannelConfiguration, Client, ClientVersion, SendQueueLimits, Server, ServerKey,
+    Simulator,
 };
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -149,6 +150,7 @@ pub fn server(timeout_dur: Duration) -> TestServer {
         .channel_config(channel_config())
         .timeout_dur(timeout_dur)
         .max_events(MAX_EVENTS)
+        .socket_buffer_size(4 << 20)
         .run()
         .unwrap()
 }
@@ -163,6 +165,13 @@ pub fn client(server_addr: SocketAddr, timeout_dur: Duration) -> Client {
         .channel_config(channel_config())
         .timeout_dur(timeout_dur)
         .max_events(MAX_EVENTS)
+        // Transfer tests submit the whole workload before polling; admission has separate tests
+        .send_queue_limits(SendQueueLimits {
+            max_messages: 65_536,
+            max_channel_messages: 65_536,
+            ..SendQueueLimits::default()
+        })
+        .socket_buffer_size(4 << 20)
         .connect()
         .unwrap()
 }
@@ -172,8 +181,26 @@ pub fn connected(network: Option<Network>, timeout_dur: Duration) -> (TestServer
     let server = server(timeout_dur);
     let client = client(server.local_addr(), timeout_dur);
     if let Some(network) = network {
-        server.set_simulator(Simulator::sending(Lossy::new(1, network.clone())));
-        client.set_simulator(Simulator::sending(Lossy::new(2, network)));
+        server
+            .set_simulator(Simulator::sending(Lossy::new(1, network.clone())))
+            .unwrap();
+        client
+            .set_simulator(Simulator::sending(Lossy::new(2, network)))
+            .unwrap();
     }
     (server, client)
+}
+
+/// Retries admission without changing the transfer payload
+pub fn send(client: &Client, channel: hexgate::Channel, message: Vec<u8>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match client.send(channel, message.clone()) {
+            Ok(()) => return,
+            Err(hexgate::error::SendError::Backpressure) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("send failed: {error}"),
+        }
+    }
 }

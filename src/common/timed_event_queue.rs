@@ -2,90 +2,44 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-#![allow(unused)]
-
-use std::time::Instant;
-
-use std::hash::Hash;
+use std::{cmp::Reverse, hash::Hash, time::Instant};
 
 use priority_queue::PriorityQueue;
 
-pub trait EventData: Eq {}
-impl<T> EventData for T where T: Eq {}
-
-#[derive(Debug)]
-pub struct TimedEvent<T: EventData> {
-    pub deadline: Instant,
-    pub event: T,
+pub struct TimedEventQueue<K: Hash + Eq> {
+    events: PriorityQueue<K, Reverse<Instant>>,
 }
 
-impl<T: EventData> PartialEq for TimedEvent<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.deadline == other.deadline && self.event == other.event
-    }
-}
-
-impl<T: EventData> Eq for TimedEvent<T> {}
-
-impl<T: EventData> PartialOrd for TimedEvent<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T: EventData> Ord for TimedEvent<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.deadline.cmp(&self.deadline)
-    }
-}
-
-#[derive(Debug)]
-pub struct TimedEventQueue<K: Hash + Eq, T: EventData> {
-    events: PriorityQueue<K, TimedEvent<T>>,
-}
-
-impl<K: Hash + Eq, T: EventData> TimedEventQueue<K, T> {
+impl<K: Hash + Eq> TimedEventQueue<K> {
     pub fn new() -> Self {
         Self {
             events: PriorityQueue::new(),
         }
     }
 
-    /// Pushes a new event into the queue. If an event with the same key already exists,
-    /// this will modify the deadline and event of the existing event. The deadline
-    /// will be the minimum of the existing deadline and the new deadline.
-    pub fn push(&mut self, key: K, deadline: Instant, event: T) {
+    /// Schedules a key, preserving its earlier deadline if already present
+    pub fn push(&mut self, key: K, deadline: Instant) {
         let deadline = self
             .events
             .get(&key)
-            .map_or(deadline, |(_, e)| e.deadline.min(deadline));
-        self.events.push(key, TimedEvent { deadline, event });
+            .map_or(deadline, |(_, existing)| existing.0.min(deadline));
+        self.events.push(key, Reverse(deadline));
     }
 
-    /// Sets the deadline of `key`, earlier or later than before.
-    pub fn set(&mut self, key: K, deadline: Instant, event: T) {
-        self.events.push(key, TimedEvent { deadline, event });
+    /// Sets a key's deadline, earlier or later than before
+    pub fn set(&mut self, key: K, deadline: Instant) {
+        self.events.push(key, Reverse(deadline));
     }
 
-    pub fn deadline(&self, key: &K) -> Option<Instant> {
-        self.events.get(key).map(|(_, e)| e.deadline)
+    pub fn next(&self) -> Option<Instant> {
+        self.events.peek().map(|(_, deadline)| deadline.0)
     }
 
-    /// Returns the lowest deadline.
-    pub fn next(&mut self) -> Option<Instant> {
-        self.events.peek().map(|(_, e)| e.deadline)
-    }
-
-    /// Pops the event with the lowest deadline.
-    pub fn pop(&mut self) -> Option<(K, T)> {
-        self.events.pop().map(|(k, e)| (k, e.event))
+    pub fn pop(&mut self) -> Option<K> {
+        self.events.pop().map(|(key, _)| key)
     }
 
     pub fn remove(&mut self, key: &K) {
         self.events.remove(key);
-    }
-
-    pub fn len(&self) -> usize {
-        self.events.len()
     }
 }

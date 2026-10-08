@@ -5,16 +5,20 @@
 //! A reliable channel is a byte stream of varint-length-prefixed messages, sent in RELIABLE
 //! frames addressed by stream offset (like QUIC STREAM frames) and acknowledged per packet.
 
+#[cfg(test)]
+use std::rc::Rc;
 use std::{
     collections::{BTreeMap, VecDeque},
     ops::Range,
-    rc::Rc,
+    time::Instant,
 };
 
-use super::ranges::RangeSet;
+use super::{ranges::RangeSet, SendResult};
 use crate::common::{
     codec::{write_varint, Writer},
     error::ProtocolViolation,
+    events::DeliveryBudget,
+    send::{Message, SendOutcome},
     transport::frame,
 };
 
@@ -32,7 +36,7 @@ struct Queued {
     start: u64,
     header: [u8; 10],
     header_len: u8,
-    message: Rc<Vec<u8>>,
+    message: Message,
 }
 
 impl Queued {
@@ -64,26 +68,52 @@ pub struct SendStream {
     end: u64,
     /// Everything below was sent at least once.
     sent: u64,
+    credit: u64,
     /// Everything below was acknowledged.
     acked_until: u64,
     /// Acknowledged ranges above `acked_until`.
     acked: RangeSet,
     /// Ranges to send again.
     lost: RangeSet,
+    reset: Option<(u64, bool)>,
+    results: Vec<SendResult>,
+    exhausted: bool,
 }
 
 impl SendStream {
+    #[cfg(test)]
     pub fn push(&mut self, message: Rc<Vec<u8>>) {
+        self.push_message(Message::untracked(message, Instant::now()));
+    }
+
+    pub fn push_message(&mut self, message: Message) {
         let mut header = [0; 10];
         let header_len = write_varint(&mut header, message.len() as u64) as u8;
+        let next = self
+            .end
+            .checked_add(u64::from(header_len))
+            .and_then(|next| next.checked_add(message.len() as u64))
+            .filter(|&next| next <= crate::common::transport::packet::MAX_PACKET_NUMBER - WINDOW);
+        let Some(next) = next else {
+            self.exhausted = true;
+            if let Some(receipt) = message.options.receipt {
+                self.results
+                    .push((receipt, SendOutcome::Dropped, message.reservation.clone()));
+            }
+            return;
+        };
         let queued = Queued {
             start: self.end,
             header,
             header_len,
             message,
         };
-        self.end = queued.end();
+        self.end = next;
         self.messages.push_back(queued);
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
     }
 
     /// Bytes not acknowledged yet, sent or not.
@@ -92,7 +122,75 @@ impl SendStream {
     }
 
     fn new_data(&self) -> Range<u64> {
-        self.sent..self.end.min(self.acked_until + WINDOW)
+        if self.reset.is_some() {
+            return self.sent..self.sent;
+        }
+        self.sent..self.end.min(self.credit.max(WINDOW))
+    }
+
+    pub fn reset(&mut self) {
+        for queued in self.messages.drain(..) {
+            if let Some(receipt) = queued.message.options.receipt {
+                self.results.push((
+                    receipt,
+                    SendOutcome::Dropped,
+                    queued.message.reservation.clone(),
+                ));
+            }
+        }
+        self.sent = self.end;
+        self.acked_until = self.end;
+        self.acked = RangeSet::default();
+        self.lost = RangeSet::default();
+        self.reset = Some((self.end, false));
+    }
+
+    pub fn reset_pending(&self) -> Option<u64> {
+        self.reset
+            .filter(|(_, sent)| !sent)
+            .map(|(offset, _)| offset)
+    }
+
+    pub fn reset_sent(&mut self) {
+        if let Some((_, sent)) = &mut self.reset {
+            *sent = true;
+        }
+    }
+
+    pub fn reset_acked(&mut self, offset: u64) {
+        if self.reset.is_some_and(|(latest, _)| offset == latest) {
+            self.reset = None;
+            self.grant(offset.saturating_add(WINDOW));
+        }
+    }
+
+    pub fn reset_lost(&mut self, offset: u64) {
+        if let Some((latest, sent)) = &mut self.reset {
+            if *latest == offset {
+                *sent = false;
+            }
+        }
+    }
+
+    pub fn take_results(&mut self, out: &mut Vec<SendResult>) {
+        out.append(&mut self.results);
+    }
+
+    pub fn unsent_bytes(&self) -> usize {
+        (self.end - self.sent) as usize
+    }
+
+    pub fn unacked_bytes(&self) -> usize {
+        let acked: u64 = self.acked.iter().map(|range| range.end - range.start).sum();
+        (self.sent - self.acked_until).saturating_sub(acked) as usize
+    }
+
+    pub fn oldest(&self) -> Option<Instant> {
+        self.messages.front().map(|queued| queued.message.submitted)
+    }
+
+    pub fn grant(&mut self, limit: u64) {
+        self.credit = self.credit.max(limit);
     }
 
     /// Bytes ready to be sent: lost ones and new ones within the window.
@@ -153,7 +251,14 @@ impl SendStream {
                 .front()
                 .is_some_and(|queued| queued.end() <= self.acked_until)
             {
-                self.messages.pop_front();
+                let queued = self.messages.pop_front().unwrap();
+                if let Some(receipt) = queued.message.options.receipt {
+                    self.results.push((
+                        receipt,
+                        SendOutcome::Acked,
+                        queued.message.reservation.clone(),
+                    ));
+                }
             }
         }
     }
@@ -186,20 +291,34 @@ impl Assembler {
     fn feed(
         &mut self,
         mut data: &[u8],
+        budget: &mut DeliveryBudget,
         out: &mut impl FnMut(Vec<u8>),
-    ) -> Result<(), ProtocolViolation> {
-        while !data.is_empty() {
+    ) -> Result<usize, ProtocolViolation> {
+        let original = data.len();
+        loop {
             if let Some((body, len)) = &mut self.body {
-                let take = (*len - body.len()).min(data.len());
+                if body.len() == *len {
+                    if !budget.take(*len) {
+                        break;
+                    }
+                    out(self.body.take().unwrap().0);
+                    continue;
+                }
+                let take = (*len - body.len()).min(data.len()).min(budget.work);
+                if take == 0 || budget.messages == 0 {
+                    break;
+                }
                 body.extend_from_slice(&data[..take]);
                 data = &data[take..];
-                if body.len() == *len {
-                    out(self.body.take().unwrap().0);
-                }
+                budget.work -= take;
                 continue;
+            }
+            if data.is_empty() || budget.messages == 0 || budget.work == 0 {
+                break;
             }
             let byte = data[0];
             data = &data[1..];
+            budget.work -= 1;
             let (value, bytes) = &mut self.prefix;
             if *bytes == 9 {
                 return Err(ProtocolViolation::Malformed);
@@ -214,27 +333,53 @@ impl Assembler {
                 .filter(|&len| len <= self.max_size)
                 .ok_or(ProtocolViolation::MessageTooLarge { max: self.max_size })?;
             self.prefix = (0, 0);
-            if len == 0 {
-                out(Vec::new());
-            } else {
-                self.body = Some((Vec::with_capacity(len.min(1 << 16)), len));
-            }
+            self.body = Some((Vec::with_capacity(len.min(1 << 16)), len));
         }
-        Ok(())
+        Ok(original - data.len())
     }
 }
 
 pub struct RecvStream {
     delivered: u64,
+    credit_sent: u64,
+    credit_acked: u64,
+    credit_pending: bool,
     /// Data beyond `delivered`, merged where adjacent.
-    pending: BTreeMap<u64, Vec<u8>>,
+    pending: BTreeMap<u64, VecDeque<u8>>,
     assembler: Assembler,
 }
 
 impl RecvStream {
+    pub fn reset(&mut self, offset: u64) {
+        if offset < self.delivered {
+            return;
+        }
+        self.delivered = offset;
+        self.pending
+            .retain(|&start, data| start + data.len() as u64 > offset);
+        self.assembler.prefix = (0, 0);
+        self.assembler.body = None;
+        self.credit_sent = self.credit_sent.max(offset.saturating_add(WINDOW));
+        self.credit_pending = true;
+    }
+
+    pub fn has_pending_delivery(&self) -> bool {
+        self.assembler
+            .body
+            .as_ref()
+            .is_some_and(|(body, len)| body.len() == *len)
+            || self
+                .pending
+                .first_key_value()
+                .is_some_and(|(&offset, _)| offset <= self.delivered)
+    }
+
     pub fn new(max_recv_msg_size: usize) -> Self {
         Self {
             delivered: 0,
+            credit_sent: WINDOW,
+            credit_acked: WINDOW,
+            credit_pending: false,
             pending: BTreeMap::new(),
             assembler: Assembler {
                 max_size: max_recv_msg_size,
@@ -244,43 +389,79 @@ impl RecvStream {
         }
     }
 
-    /// Handles a frame's data at `offset`, complete messages go to `out`.
+    pub fn credit_pending(&self) -> Option<u64> {
+        (self.credit_pending || self.delivered + WINDOW > self.credit_sent)
+            .then_some(self.delivered + WINDOW)
+    }
+
+    pub fn credit_sent(&mut self, limit: u64) {
+        self.credit_sent = self.credit_sent.max(limit);
+        self.credit_pending = false;
+    }
+
+    pub fn credit_acked(&mut self, limit: u64) {
+        self.credit_acked = self.credit_acked.max(limit);
+        if self.credit_acked >= self.credit_sent {
+            self.credit_pending = false;
+        }
+    }
+
+    pub fn credit_lost(&mut self) {
+        self.credit_pending = self.credit_acked < self.credit_sent;
+    }
+
+    pub fn receive(&mut self, offset: u64, data: &[u8]) -> Result<(), ProtocolViolation> {
+        let end = offset
+            .checked_add(data.len() as u64)
+            .filter(|&end| end <= self.credit_sent)
+            .ok_or(ProtocolViolation::Malformed)?;
+        if end <= self.delivered {
+            return Ok(());
+        }
+        let skip = self.delivered.saturating_sub(offset) as usize;
+        self.buffer(offset.max(self.delivered), &data[skip..])
+    }
+
+    pub fn drain(
+        &mut self,
+        budget: &mut DeliveryBudget,
+        out: &mut impl FnMut(Vec<u8>),
+    ) -> Result<(), ProtocolViolation> {
+        self.assembler.feed(&[], budget, out)?;
+        while budget.messages > 0 && budget.work > 0 {
+            let Some(entry) = self.pending.first_entry() else {
+                break;
+            };
+            let start = *entry.key();
+            if start > self.delivered {
+                break;
+            }
+            let mut segment = entry.remove();
+            let skip = (self.delivered - start) as usize;
+            segment.drain(..skip);
+            let consumed = self.assembler.feed(segment.as_slices().0, budget, out)?;
+            self.delivered += consumed as u64;
+            segment.drain(..consumed);
+            if !segment.is_empty() {
+                self.pending.insert(self.delivered, segment);
+                if consumed == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn on_frame(
         &mut self,
         offset: u64,
         data: &[u8],
         out: &mut impl FnMut(Vec<u8>),
     ) -> Result<(), ProtocolViolation> {
-        let end = offset
-            .checked_add(data.len() as u64)
-            .filter(|&end| end <= self.delivered + WINDOW)
-            .ok_or(ProtocolViolation::Malformed)?;
-        if end <= self.delivered {
-            return Ok(());
-        }
-        let (offset, data) = if offset < self.delivered {
-            (self.delivered, &data[(self.delivered - offset) as usize..])
-        } else {
-            (offset, data)
-        };
-        if offset > self.delivered {
-            return self.buffer(offset, data);
-        }
-        self.assembler.feed(data, out)?;
-        self.delivered = end;
-        while let Some(entry) = self.pending.first_entry() {
-            let start = *entry.key();
-            if start > self.delivered {
-                break;
-            }
-            let segment = entry.remove();
-            let segment_end = start + segment.len() as u64;
-            if segment_end > self.delivered {
-                self.assembler
-                    .feed(&segment[(self.delivered - start) as usize..], out)?;
-                self.delivered = segment_end;
-            }
-        }
+        self.receive(offset, data)?;
+        self.drain(&mut DeliveryBudget::unlimited(), out)?;
+        self.credit_sent = self.delivered + WINDOW;
         Ok(())
     }
 
@@ -323,16 +504,34 @@ impl RecvStream {
         let following = self.pending.remove(&end);
         if let Some((&start, segment)) = self.pending.range_mut(..offset).next_back() {
             if start + segment.len() as u64 == offset {
-                segment.extend_from_slice(data);
-                segment.extend_from_slice(following.as_deref().unwrap_or_default());
+                // Reuse the larger buffer when merging reordered fragments
+                match following {
+                    Some(mut following) if following.len() > segment.len() => {
+                        for &byte in data.iter().rev() {
+                            following.push_front(byte);
+                        }
+                        for byte in std::mem::take(segment).into_iter().rev() {
+                            following.push_front(byte);
+                        }
+                        *segment = following;
+                    }
+                    following => {
+                        segment.extend(data.iter().copied());
+                        if let Some(mut following) = following {
+                            segment.append(&mut following);
+                        }
+                    }
+                }
                 return Ok(());
             }
         }
         if following.is_none() && self.pending.len() >= MAX_SEGMENTS {
             return Err(ProtocolViolation::Malformed);
         }
-        let mut segment = data.to_vec();
-        segment.extend_from_slice(following.as_deref().unwrap_or_default());
+        let mut segment = following.unwrap_or_default();
+        for &byte in data.iter().rev() {
+            segment.push_front(byte);
+        }
         self.pending.insert(offset, segment);
         Ok(())
     }
@@ -402,5 +601,178 @@ mod tests {
     fn reordered_and_lost() {
         transfer(200, 700, 3, true);
         transfer(200, 50, 7, true);
+    }
+
+    #[test]
+    fn gap_delivery_respects_message_and_work_budgets() {
+        let mut recv = RecvStream::new(1 << 20);
+        recv.receive(1, &vec![0; WINDOW as usize - 1]).unwrap();
+        recv.receive(0, &[0]).unwrap();
+        let mut delivered = 0;
+        let mut budget = DeliveryBudget {
+            messages: 17,
+            bytes: 0,
+            work: 1024,
+        };
+        recv.drain(&mut budget, &mut |message| {
+            assert!(message.is_empty());
+            delivered += 1;
+        })
+        .unwrap();
+        assert_eq!(delivered, 17);
+        assert!(recv.has_pending_delivery());
+        assert!(recv.delivered <= 18);
+        let mut budget = DeliveryBudget {
+            messages: 100,
+            bytes: 0,
+            work: 7,
+        };
+        recv.drain(&mut budget, &mut |_| delivered += 1).unwrap();
+        assert_eq!(delivered, 24);
+        assert_eq!(budget.work, 0);
+    }
+
+    #[test]
+    fn credit_stops_at_application_capacity_and_resumes() {
+        let mut send = SendStream::default();
+        send.push(Rc::new(vec![1; WINDOW as usize]));
+        let mut recv = RecvStream::new(WINDOW as usize);
+        while send.sendable() > 0 {
+            let mut buf = [0; 1200];
+            let mut w = Writer::new(&mut buf);
+            let range = send.write(0, &mut w).unwrap();
+            let len = w.len();
+            let Some(frame::Frame::Reliable { offset, data, .. }) =
+                frame::parse(&mut crate::common::codec::Reader::new(&buf[..len])).unwrap()
+            else {
+                panic!();
+            };
+            recv.receive(offset, data).unwrap();
+            send.on_acked(range);
+        }
+        assert_eq!(send.sent, WINDOW);
+        assert!(send.queued_bytes() > 0);
+        let mut budget = DeliveryBudget {
+            messages: 0,
+            bytes: 0,
+            work: 1 << 20,
+        };
+        recv.drain(&mut budget, &mut |_| panic!("application is full"))
+            .unwrap();
+        assert!(recv.credit_pending().is_none());
+        recv.drain(&mut DeliveryBudget::unlimited(), &mut |_| {
+            panic!("tail not received")
+        })
+        .unwrap();
+        let limit = recv.credit_pending().unwrap();
+        recv.credit_sent(limit);
+        send.grant(limit);
+        assert!(send.sendable() > 0);
+        recv.credit_lost();
+        assert_eq!(recv.credit_pending(), Some(limit));
+        recv.receive(WINDOW, &[1; 3]).unwrap();
+    }
+
+    #[test]
+    fn late_original_ack_cancels_queued_and_sent_retransmissions() {
+        let mut send = SendStream::default();
+        send.push(Rc::new(vec![1; 100]));
+        let mut buf = [0; 1200];
+        let original = send.write(0, &mut Writer::new(&mut buf)).unwrap();
+        send.on_lost(original.clone());
+        let resent = send.write(0, &mut Writer::new(&mut buf)).unwrap();
+        send.on_acked(original);
+        send.on_lost(resent);
+        assert_eq!(send.queued_bytes(), 0);
+        assert_eq!(send.sendable(), 0);
+    }
+
+    #[test]
+    fn reset_retransmits_and_isolates_new_messages_from_delayed_packets() {
+        let mut send = SendStream::default();
+        let mut recv = RecvStream::new(1 << 20);
+        send.push(Rc::new(vec![1; 2000]));
+        let mut old = [0; 1200];
+        let mut w = Writer::new(&mut old);
+        let old_range = send.write(0, &mut w).unwrap();
+        let old_len = w.len();
+        let Some(frame::Frame::Reliable { offset, data, .. }) =
+            frame::parse(&mut crate::common::codec::Reader::new(&old[..old_len])).unwrap()
+        else {
+            panic!()
+        };
+        recv.on_frame(offset, data, &mut |_| panic!("incomplete"))
+            .unwrap();
+        send.reset();
+        let skip = send.reset_pending().unwrap();
+        send.push(Rc::new(vec![9]));
+        send.reset_sent();
+        assert_eq!(send.sendable(), 0);
+        send.reset_lost(skip);
+        assert_eq!(send.reset_pending(), Some(skip));
+        recv.reset(skip);
+        send.reset_sent();
+        send.reset_acked(skip);
+        send.on_acked(old_range.clone());
+        send.on_lost(old_range);
+        assert_eq!(send.sendable(), 2);
+        let mut buf = [0; 1200];
+        let mut w = Writer::new(&mut buf);
+        let range = send.write(0, &mut w).unwrap();
+        let len = w.len();
+        let Some(frame::Frame::Reliable { offset, data, .. }) =
+            frame::parse(&mut crate::common::codec::Reader::new(&buf[..len])).unwrap()
+        else {
+            panic!()
+        };
+        let mut messages = Vec::new();
+        recv.on_frame(offset, data, &mut |message| messages.push(message))
+            .unwrap();
+        recv.reset(skip);
+        let Some(frame::Frame::Reliable { offset, data, .. }) =
+            frame::parse(&mut crate::common::codec::Reader::new(&old[..old_len])).unwrap()
+        else {
+            panic!()
+        };
+        recv.on_frame(offset, data, &mut |_| panic!("obsolete"))
+            .unwrap();
+        send.on_acked(range);
+        assert_eq!(messages, [vec![9]]);
+        assert_eq!(send.queued_bytes(), 0);
+    }
+
+    #[test]
+    fn stream_offsets_stop_before_the_protocol_boundary() {
+        let mut send = SendStream {
+            end: crate::common::transport::packet::MAX_PACKET_NUMBER - WINDOW,
+            ..SendStream::default()
+        };
+        send.push(Rc::new(vec![]));
+        assert!(send.exhausted());
+        assert!(send.messages.is_empty());
+    }
+
+    #[test]
+    fn reversed_small_fragments_and_wrapped_segments_preserve_payloads() {
+        let mut recv = RecvStream::new(1 << 20);
+        let mut data = [0; 10];
+        let len = write_varint(&mut data, 65_536);
+        let mut bytes = data[..len].to_vec();
+        bytes.extend((0..65_536).map(|i| i as u8));
+        for offset in (0..bytes.len()).rev() {
+            recv.receive(offset as u64, &bytes[offset..offset + 1])
+                .unwrap();
+        }
+        let mut messages = Vec::new();
+        while recv.has_pending_delivery() {
+            let mut budget = DeliveryBudget {
+                messages: 1,
+                bytes: 1 << 20,
+                work: 997,
+            };
+            recv.drain(&mut budget, &mut |message| messages.push(message))
+                .unwrap();
+        }
+        assert_eq!(messages, [bytes[len..].to_vec()]);
     }
 }

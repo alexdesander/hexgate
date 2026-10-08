@@ -68,7 +68,8 @@ fn main() -> anyhow::Result<()> {
                     format!("{} timed out", clients.remove(&addr).unwrap()),
                     addr,
                 ),
-                Event::Received(addr, vec) => {
+                Event::SendResult(..) => continue,
+                Event::Received(addr, _, vec) => {
                     let data = String::from_utf8_lossy(&vec);
                     (format!("{}: {}", clients.get(&addr).unwrap(), data), addr)
                 }

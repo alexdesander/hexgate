@@ -490,7 +490,7 @@ fn summary(out: &mut String, report: &Report, workloads: &[Workload]) {
 
 pub fn csv(report: &Report) -> String {
     let mut out = String::from(
-        "workload,profile,stream,dir,channel,key,round_trip,sent,delivered,delivery,offered_mbit,\
+        "workload,profile,stream,dir,channel,key,round_trip,sent,backpressured,delivered,delivery,offered_mbit,\
          goodput_mbit,lat_min_ms,lat_p50_ms,lat_p90_ms,lat_p99_ms,lat_p999_ms,lat_max_ms,\
          lat_mean_ms,added_p50_ms,added_p99_ms,jitter_ms,max_gap_ms,stalls_per_min,\
          burst_p50_ms,burst_p99_ms,duplicates,reordered,corrupt,connected,connect_ms,\
@@ -506,7 +506,7 @@ pub fn csv(report: &Report) -> String {
                 .and_then(|bursts| bursts.completion_ms);
             let _ = writeln!(
                 out,
-                "{},{},{},{},{},{},{},{},{},{:.5},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\"{}\"",
+                "{},{},{},{},{},{},{},{},{},{},{:.5},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},\"{}\"",
                 run.workload,
                 run.profile,
                 stream.name,
@@ -515,6 +515,7 @@ pub fn csv(report: &Report) -> String {
                 stream.key,
                 stream.round_trip,
                 stream.sent,
+                stream.backpressured,
                 stream.delivered,
                 stream.delivery,
                 stream.offered_mbit,

@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-/// The minimum (or maximum) of the samples within a time window, in O(1) per sample: Kathleen
+/// The minimum of the samples within a time window, in O(1) per sample: Kathleen
 /// Nichols' three-sample filter, as in Linux `win_minmax` and BBR.
 #[derive(Debug, Clone)]
 pub struct Windowed<T> {
@@ -18,13 +18,6 @@ impl<T: Copy + PartialOrd> Windowed<T> {
         Self {
             samples: None,
             better: |a, b| a <= b,
-        }
-    }
-
-    pub fn max() -> Self {
-        Self {
-            samples: None,
-            better: |a, b| a >= b,
         }
     }
 

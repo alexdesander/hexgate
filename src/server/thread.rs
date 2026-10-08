@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::{
+    collections::VecDeque,
     io,
     net::SocketAddr,
     rc::Rc,
@@ -13,11 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahash::HashMap;
-use crossbeam::channel::{Receiver, Sender, TryRecvError};
+use ahash::{HashMap, HashSet};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use mio::{Events, Interest, Poll, Waker};
 use rand::thread_rng;
+use sha2::{Digest, Sha256};
 use siphasher::sip::SipHasher;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
@@ -25,7 +27,7 @@ use crate::common::{
     channel::Channel,
     crypto::Crypto,
     error::RecvError,
-    events::EventSender,
+    events::{DeliveryBudget, EventSender},
     packets::{
         client_hello::ClientHello,
         connection_request::ConnectionRequest,
@@ -38,17 +40,18 @@ use crate::common::{
         server_hello::{self, ServerHello},
         PacketIdentifier,
     },
+    send::{Admission, Message, SendQueueLimits},
     socket::sim::Simulator,
-    stats::Stats,
+    stats::{ChannelStats, Stats},
     timed_event_queue::TimedEventQueue,
     transport::{self, Connection, Output},
     AllowedClientVersions, Cipher, ClientVersion, PROTOCOL_VERSION, RECV_TOKEN, WAKE_TOKEN,
 };
 
 use super::{
-    auth::{AuthCmd, AuthResult, LoginAttempt},
+    auth::{AuthCmd, AuthResult, Exchange, LoginAttempt},
     rate_limit::RateLimiter,
-    ConnectedSet, Event, Socket,
+    ConnectedSet, Event, PeerState, Socket,
 };
 
 const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(10);
@@ -58,52 +61,82 @@ const HANDSHAKE_STATE_TTL: Duration = Duration::from_secs(8);
 /// A ConnectionResponse was sent, the LoginRequest is outstanding.
 pub struct PendingLogin {
     crypto: Crypto,
+    generation: u64,
     /// The client's x25519 key and HKDF salt, to recognize a retransmitted request.
-    request: [u8; 64],
+    request: [u8; 116],
+    response: Vec<u8>,
+    login_request: Option<[u8; 32]>,
+}
+
+pub struct AnsweredLogin {
+    exchange: Exchange,
+    request: [u8; 32],
     response: Vec<u8>,
 }
 
 pub enum Cmd<R: AuthResult> {
     SetSimulator(Simulator),
     Shutdown(Vec<u8>),
-    Disconnect(SocketAddr, Vec<u8>),
+    Disconnect(SocketAddr, Arc<PeerState>, Vec<u8>),
     SetInfo(Vec<u8>),
-    AuthSuccess(LoginAttempt, R),
-    AuthFailed(LoginAttempt, Vec<u8>),
-    Send(Recipients, Channel, Vec<u8>),
+    AuthSuccess(Exchange, R),
+    AuthFailed(Exchange, Vec<u8>),
+    Send(Vec<(SocketAddr, Message)>, Channel),
     Flush,
     Stats(SocketAddr, Sender<Option<Stats>>),
+    ChannelStats(SocketAddr, Channel, Sender<Option<ChannelStats>>),
+    ResetChannel(SocketAddr, Arc<PeerState>, u8),
+    SetPriority(SocketAddr, Arc<PeerState>, Channel, i8),
     /// The authenticator panicked, the server shuts down and reports this.
     Failed(RecvError),
 }
 
+pub enum PendingWork {
+    Send(Channel, std::vec::IntoIter<(SocketAddr, Message)>),
+    Flush(std::vec::IntoIter<SocketAddr>),
+    Close(Rc<[u8]>, std::vec::IntoIter<SocketAddr>),
+}
+
 type VersionCheck = Box<dyn Fn(ClientVersion) -> Result<(), AllowedClientVersions> + Send>;
 
-pub enum Recipients {
-    One(SocketAddr),
-    Many(Vec<SocketAddr>),
-    All,
+#[derive(Default)]
+pub struct ReadyQueue {
+    queue: VecDeque<SocketAddr>,
+    queued: HashSet<SocketAddr>,
+}
+
+impl ReadyQueue {
+    fn push(&mut self, addr: SocketAddr) {
+        if self.queued.insert(addr) {
+            self.queue.push_back(addr);
+        }
+    }
+
+    fn pop(&mut self) -> Option<SocketAddr> {
+        let addr = self.queue.pop_front()?;
+        self.queued.remove(&addr);
+        Some(addr)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
 }
 
 /// A connected client.
 pub struct Peer {
     connection: Connection,
-    /// Its send rate, shared with `Server::budget_for`.
-    rate: Arc<AtomicU64>,
+    /// Its send rate, shared with `Server::gross_send_budget`.
+    shared: Arc<PeerState>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub enum TimedEventKey {
-    RemoveExpectingLoginRequest(LoginAttempt),
-    RemoveAnsweredLogin(LoginAttempt),
+    RemoveExpectingLoginRequest(Exchange),
+    RemoveAnsweredLogin(Exchange),
     /// The connection's timers (`Connection::timeout`).
     Connection(SocketAddr),
     PruneRateLimits,
-}
-
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TimedEventData {
-    Nothing,
 }
 
 pub struct ServerThreadState<R: AuthResult> {
@@ -112,7 +145,7 @@ pub struct ServerThreadState<R: AuthResult> {
     pub socket: Socket,
     pub poll: Poll,
     pub _waker: Arc<Waker>,
-    pub timed_events: TimedEventQueue<TimedEventKey, TimedEventData>,
+    pub timed_events: TimedEventQueue<TimedEventKey>,
     pub buf: [u8; 1201],
 
     pub info: Vec<u8>,
@@ -120,7 +153,7 @@ pub struct ServerThreadState<R: AuthResult> {
     pub cipher: Cipher,
     pub auth_salt: [u8; 16],
     pub signing_key: SigningKey,
-    pub veryifying_key: VerifyingKey,
+    pub verifying_key: VerifyingKey,
     pub siphasher: SipHasher,
 
     /// Handshake cookie timestamps are milliseconds since this instant.
@@ -133,16 +166,21 @@ pub struct ServerThreadState<R: AuthResult> {
     pub connection_requests: RateLimiter,
     pub auth_cmd_tx: Sender<AuthCmd>,
     pub expecting_login_requests: HashMap<LoginAttempt, PendingLogin>,
-    pub expecting_auth_result: HashMap<LoginAttempt, Crypto>,
+    pub expecting_auth_result: HashMap<LoginAttempt, PendingLogin>,
+    pub next_generation: u64,
     /// Sent LoginResponses, resent for retransmitted LoginRequests.
-    pub answered_logins: HashMap<LoginAttempt, Vec<u8>>,
+    pub answered_logins: HashMap<LoginAttempt, AnsweredLogin>,
     pub connections: HashMap<SocketAddr, Peer>,
     /// Connected clients that aren't being closed, shared with `Server`.
     pub connected: ConnectedSet,
     pub config: transport::Config,
     /// Connections with something new to send.
-    pub dirty: Vec<SocketAddr>,
+    pub dirty: ReadyQueue,
+    pub delivery_ready: ReadyQueue,
+    pub send_queue_limits: SendQueueLimits,
+    pub pending_work: Option<PendingWork>,
     pub outputs: Vec<Output>,
+    pub receive_pending: bool,
 
     pub close_linger: Duration,
     pub shutting_down: bool,
@@ -161,8 +199,11 @@ impl<R: AuthResult> ServerThreadState<R> {
             if self.handle_all_cmds() {
                 break;
             }
-            self.handle_all_events();
-            self.service_dirty();
+            let mut budget = self.event_tx.budget();
+            let before_delivery = (budget.messages, budget.work);
+            self.handle_all_events(&mut budget);
+            self.drain_received(&mut budget);
+            self.service_dirty(&mut budget);
             if self.shutting_down && self.connections.is_empty() {
                 break;
             }
@@ -172,8 +213,20 @@ impl<R: AuthResult> ServerThreadState<R> {
                 .into_iter()
                 .chain(self.socket.next_deadline())
                 .min();
-            let max_poll_time =
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let delivery_pending = before_delivery != (budget.messages, budget.work)
+                && !self.delivery_ready.is_empty()
+                && self.event_tx.budget().messages > 0
+                && self.event_tx.budget().bytes > 0;
+            let max_poll_time = if self.receive_pending
+                || delivery_pending
+                || !self.dirty.is_empty()
+                || self.pending_work.is_some()
+                || !self.cmds.is_empty()
+            {
+                Some(Duration::ZERO)
+            } else {
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            };
             // A signal handler ran, nothing happened on the socket.
             match self.poll.poll(&mut events, max_poll_time) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -184,43 +237,56 @@ impl<R: AuthResult> ServerThreadState<R> {
             debug_assert!(events
                 .iter()
                 .all(|event| [RECV_TOKEN, WAKE_TOKEN].contains(&event.token())));
-            if readable || self.socket.inbound_due() {
-                self.handle_all_recvs()?;
+            if self.receive_pending || readable || self.socket.inbound_due() {
+                self.handle_all_recvs(&mut budget)?;
             }
         }
         self.failure.take().map_or(Ok(()), Err)
     }
 
     /// Sends what the connections touched since the last call have to send.
-    fn service_dirty(&mut self) {
+    fn service_dirty(&mut self, budget: &mut DeliveryBudget) {
         let now = Instant::now();
-        for addr in std::mem::take(&mut self.dirty) {
-            self.service(addr, now);
+        for _ in 0..128 {
+            let Some(addr) = self.dirty.pop() else { break };
+            self.service(addr, now, budget);
         }
     }
 
     /// Sends what the connection has to send, then removes it if it closed or reschedules
     /// its timers.
-    fn service(&mut self, addr: SocketAddr, now: Instant) {
+    fn service(&mut self, addr: SocketAddr, now: Instant, budget: &mut DeliveryBudget) {
         let Some(peer) = self.connections.get_mut(&addr) else {
             return;
         };
-        while let Some(size) = peer.connection.poll_transmit(now, &mut self.buf) {
+        for _ in 0..64 {
+            let Some(size) = peer.connection.poll_transmit(now, &mut self.buf) else {
+                break;
+            };
             self.socket.send_to(addr, &self.buf[..size]);
         }
-        peer.rate
+        peer.shared
+            .rate
             .store(peer.connection.rate() as u64, Ordering::Relaxed);
-        if peer.connection.is_closed() {
+        peer.connection.take_send_results(budget, &mut self.outputs);
+        if peer.connection.has_pending_delivery() {
+            self.delivery_ready.push(addr);
+        }
+        let closed = peer.connection.is_closed();
+        let closing = peer.connection.is_closing();
+        self.handle_outputs(addr, now, closing, budget);
+        if closed {
             log!(debug, %addr, "closed");
             self.remove(addr);
             return;
         }
+        let Some(peer) = self.connections.get_mut(&addr) else {
+            return;
+        };
         match peer.connection.timeout(now) {
-            Some(deadline) => self.timed_events.set(
-                TimedEventKey::Connection(addr),
-                deadline,
-                TimedEventData::Nothing,
-            ),
+            Some(deadline) => self
+                .timed_events
+                .set(TimedEventKey::Connection(addr), deadline),
             None => self.timed_events.remove(&TimedEventKey::Connection(addr)),
         }
     }
@@ -233,7 +299,11 @@ impl<R: AuthResult> ServerThreadState<R> {
 
     /// Returns true once all `Server` handles are gone.
     fn handle_all_cmds(&mut self) -> bool {
-        loop {
+        for _ in 0..256 {
+            if self.pending_work.is_some() {
+                self.advance_work();
+                continue;
+            }
             let cmd = match self.cmds.try_recv() {
                 Ok(cmd) => cmd,
                 Err(TryRecvError::Empty) => break,
@@ -243,13 +313,18 @@ impl<R: AuthResult> ServerThreadState<R> {
             match cmd {
                 Cmd::Shutdown(reason) => {
                     self.shutting_down = true;
-                    let reason: Rc<[u8]> = reason.into();
-                    let addrs: Vec<SocketAddr> = self.connections.keys().copied().collect();
-                    for addr in addrs {
-                        self.start_close(addr, reason.clone());
+                    let addrs: Vec<_> = self.connections.keys().copied().collect();
+                    self.pending_work = Some(PendingWork::Close(reason.into(), addrs.into_iter()));
+                }
+                Cmd::Disconnect(addr, shared, reason) => {
+                    if self
+                        .connections
+                        .get(&addr)
+                        .is_some_and(|peer| Arc::ptr_eq(&peer.shared, &shared))
+                    {
+                        self.start_close(addr, reason.into());
                     }
                 }
-                Cmd::Disconnect(addr, reason) => self.start_close(addr, reason.into()),
                 Cmd::Failed(error) => self.failure = Some(error),
                 Cmd::SetInfo(info) => {
                     self.info = info;
@@ -260,38 +335,12 @@ impl<R: AuthResult> ServerThreadState<R> {
                 Cmd::AuthFailed(attempt, vec) => {
                     self.handle_cmd_auth_failure(attempt, vec);
                 }
-                Cmd::Send(recipients, channel, message) => {
-                    let message = Rc::new(message);
-                    let now = Instant::now();
-                    let mut queue = |addr: SocketAddr, peer: &mut Peer| {
-                        peer.connection.push(channel, message.clone(), now);
-                        self.dirty.push(addr);
-                    };
-                    match recipients {
-                        Recipients::One(addr) => {
-                            if let Some(peer) = self.connections.get_mut(&addr) {
-                                queue(addr, peer);
-                            }
-                        }
-                        Recipients::Many(addrs) => {
-                            for addr in addrs {
-                                if let Some(peer) = self.connections.get_mut(&addr) {
-                                    queue(addr, peer);
-                                }
-                            }
-                        }
-                        Recipients::All => {
-                            for (addr, peer) in &mut self.connections {
-                                queue(*addr, peer);
-                            }
-                        }
-                    }
+                Cmd::Send(recipients, channel) => {
+                    self.pending_work = Some(PendingWork::Send(channel, recipients.into_iter()));
                 }
                 Cmd::Flush => {
-                    for (addr, peer) in &mut self.connections {
-                        peer.connection.flush();
-                        self.dirty.push(*addr);
-                    }
+                    let addrs: Vec<_> = self.connections.keys().copied().collect();
+                    self.pending_work = Some(PendingWork::Flush(addrs.into_iter()));
                 }
                 Cmd::Stats(addr, reply) => {
                     let _ = reply.send(
@@ -300,27 +349,105 @@ impl<R: AuthResult> ServerThreadState<R> {
                             .map(|peer| peer.connection.stats()),
                     );
                 }
+                Cmd::ChannelStats(addr, channel, reply) => {
+                    let _ =
+                        reply.send(self.connections.get(&addr).and_then(|peer| {
+                            peer.connection.channel_stats(channel, Instant::now())
+                        }));
+                }
+                Cmd::ResetChannel(addr, shared, channel) => {
+                    if let Some(peer) = self
+                        .connections
+                        .get_mut(&addr)
+                        .filter(|peer| Arc::ptr_eq(&peer.shared, &shared))
+                    {
+                        peer.connection.reset_channel(channel);
+                        self.dirty.push(addr);
+                    }
+                }
+                Cmd::SetPriority(addr, shared, channel, priority) => {
+                    if let Some(peer) = self
+                        .connections
+                        .get_mut(&addr)
+                        .filter(|peer| Arc::ptr_eq(&peer.shared, &shared))
+                    {
+                        peer.connection.set_priority(channel, priority);
+                        self.dirty.push(addr);
+                    }
+                }
                 Cmd::SetSimulator(simulator) => self.socket.set_simulator(simulator),
             }
         }
         false
     }
 
-    fn handle_all_events(&mut self) {
-        while self
-            .timed_events
-            .next()
-            .is_some_and(|deadline| deadline <= Instant::now())
-        {
-            let (key, _event) = self.timed_events.pop().unwrap();
+    fn advance_work(&mut self) {
+        let mut work = self.pending_work.take().unwrap();
+        let remaining = match &mut work {
+            PendingWork::Send(channel, recipients) => {
+                if let Some((addr, message)) = recipients.next() {
+                    if let Some(peer) = self.connections.get_mut(&addr) {
+                        if message.reservation.as_ref().is_some_and(|reservation| {
+                            Arc::ptr_eq(reservation.admission(), &peer.shared.admission)
+                        }) {
+                            peer.connection.push_message(*channel, message);
+                            self.dirty.push(addr);
+                        }
+                    }
+                }
+                !recipients.as_slice().is_empty()
+            }
+            PendingWork::Flush(recipients) => {
+                if let Some(addr) = recipients.next() {
+                    if let Some(peer) = self.connections.get_mut(&addr) {
+                        peer.connection.flush();
+                        self.dirty.push(addr);
+                    }
+                }
+                !recipients.as_slice().is_empty()
+            }
+            PendingWork::Close(reason, recipients) => {
+                if let Some(addr) = recipients.next() {
+                    self.start_close(addr, reason.clone());
+                }
+                !recipients.as_slice().is_empty()
+            }
+        };
+        if remaining {
+            self.pending_work = Some(work);
+        }
+    }
+
+    fn handle_all_events(&mut self, budget: &mut DeliveryBudget) {
+        for _ in 0..256 {
+            if !self
+                .timed_events
+                .next()
+                .is_some_and(|deadline| deadline <= Instant::now())
+            {
+                break;
+            }
+            let key = self.timed_events.pop().unwrap();
             match key {
-                TimedEventKey::RemoveExpectingLoginRequest(attempt) => {
-                    self.expecting_login_requests.remove(&attempt);
+                TimedEventKey::RemoveExpectingLoginRequest(exchange) => {
+                    if self
+                        .expecting_login_requests
+                        .get(&exchange.attempt)
+                        .is_some_and(|pending| pending.generation == exchange.generation)
+                    {
+                        self.expecting_login_requests.remove(&exchange.attempt);
+                    }
                 }
-                TimedEventKey::RemoveAnsweredLogin(attempt) => {
-                    self.answered_logins.remove(&attempt);
+                TimedEventKey::RemoveAnsweredLogin(exchange) => {
+                    if self
+                        .answered_logins
+                        .get(&exchange.attempt)
+                        .is_some_and(|answer| answer.exchange == exchange)
+                    {
+                        self.answered_logins.remove(&exchange.attempt);
+                    }
                 }
-                TimedEventKey::Connection(addr) => self.handle_event_connection(addr),
+                TimedEventKey::Connection(addr) => self.handle_event_connection(addr, budget),
                 TimedEventKey::PruneRateLimits => {
                     let now = Instant::now();
                     self.client_hellos.prune(now);
@@ -330,7 +457,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         }
     }
 
-    fn handle_event_connection(&mut self, addr: SocketAddr) {
+    fn handle_event_connection(&mut self, addr: SocketAddr, budget: &mut DeliveryBudget) {
         let now = Instant::now();
         let Some(peer) = self.connections.get_mut(&addr) else {
             return;
@@ -346,11 +473,16 @@ impl<R: AuthResult> ServerThreadState<R> {
             }
             return;
         }
-        self.service(addr, now);
+        self.service(addr, now, budget);
     }
 
-    fn handle_all_recvs(&mut self) -> Result<(), io::Error> {
-        while let Some((size, from)) = self.socket.recv_from(&mut self.buf)? {
+    fn handle_all_recvs(&mut self, budget: &mut DeliveryBudget) -> Result<(), io::Error> {
+        self.receive_pending = true;
+        for _ in 0..128 {
+            let Some((size, from)) = self.socket.recv_from(&mut self.buf)? else {
+                self.receive_pending = false;
+                break;
+            };
             if size == 0 || size > 1200 {
                 log!(trace, %from, size, "dropped datagram of invalid size");
                 continue;
@@ -375,38 +507,58 @@ impl<R: AuthResult> ServerThreadState<R> {
                 }
                 PacketIdentifier::LoginRequest => self.handle_packet_login_request(size, from),
                 PacketIdentifier::Data | PacketIdentifier::DataAckNow => {
-                    self.handle_packet_data(size, from)
+                    self.handle_packet_data(size, from, budget)
                 }
                 _ => continue,
             }
         }
-        self.service_dirty();
+        self.service_dirty(budget);
         Ok(())
     }
 
-    fn handle_packet_data(&mut self, size: usize, from: SocketAddr) {
+    fn handle_packet_data(&mut self, size: usize, from: SocketAddr, budget: &mut DeliveryBudget) {
         let Some(peer) = self.connections.get_mut(&from) else {
             return;
         };
         let now = Instant::now();
-        let accept = self.event_tx.has_room();
         // Closed by us (kicked, shutdown): the app hears nothing more about it.
         let closing = peer.connection.is_closing();
-        let handled = peer
-            .connection
-            .handle(now, &mut self.buf[..size], accept, &mut self.outputs);
+        let handled = peer.connection.handle_with_budget(
+            now,
+            &mut self.buf[..size],
+            budget,
+            &mut self.outputs,
+        );
         if let Err(error) = handled {
             rejected("DATA", from, error);
             return;
         }
+        if peer.connection.has_pending_delivery() {
+            self.delivery_ready.push(from);
+        }
         self.dirty.push(from);
+        self.handle_outputs(from, now, closing, budget);
+    }
+
+    fn handle_outputs(
+        &mut self,
+        from: SocketAddr,
+        now: Instant,
+        closing: bool,
+        budget: &mut DeliveryBudget,
+    ) {
         for output in std::mem::take(&mut self.outputs) {
             match output {
-                Output::Message(message) => self.event_tx.send(Event::Received(from, message)),
+                Output::SendResult(cookie, outcome) => {
+                    self.event_tx.send(Event::SendResult(from, cookie, outcome))
+                }
+                Output::Message(channel, message) => {
+                    self.event_tx.send(Event::Received(from, channel, message))
+                }
                 Output::Closed(reason) => {
                     log!(debug, %from, "disconnected by client");
                     // Acknowledges the CLOSE.
-                    self.service(from, now);
+                    self.service(from, now, budget);
                     self.remove(from);
                     if !closing {
                         self.event_tx.send(Event::Disconnected(from, reason));
@@ -430,9 +582,32 @@ impl<R: AuthResult> ServerThreadState<R> {
         }
     }
 
+    fn drain_received(&mut self, budget: &mut DeliveryBudget) -> bool {
+        let before = (budget.messages, budget.work);
+        let count = self.delivery_ready.queue.len().min(128);
+        for _ in 0..count {
+            if budget.messages == 0 || budget.work == 0 {
+                break;
+            }
+            let addr = self.delivery_ready.pop().unwrap();
+            let Some(peer) = self.connections.get_mut(&addr) else {
+                continue;
+            };
+            peer.connection.drain_received(budget, &mut self.outputs);
+            peer.connection.take_send_results(budget, &mut self.outputs);
+            if peer.connection.has_pending_delivery() {
+                self.delivery_ready.push(addr);
+            }
+            let closing = peer.connection.is_closing();
+            self.handle_outputs(addr, Instant::now(), closing, budget);
+            self.dirty.push(addr);
+        }
+        before != (budget.messages, budget.work)
+    }
+
     /// Updates the clients the app can send to (`Server::connections`), before the event that
     /// tells it.
-    fn set_connected(&self, addr: SocketAddr, rate: Option<Arc<AtomicU64>>) {
+    fn set_connected(&self, addr: SocketAddr, rate: Option<Arc<PeerState>>) {
         let mut set = self
             .connected
             .write()
@@ -447,7 +622,6 @@ impl<R: AuthResult> ServerThreadState<R> {
         self.timed_events.push(
             TimedEventKey::PruneRateLimits,
             now + RATE_LIMIT_PRUNE_INTERVAL,
-            TimedEventData::Nothing,
         );
     }
 
@@ -473,13 +647,24 @@ impl<R: AuthResult> ServerThreadState<R> {
         self.dirty.push(addr);
     }
 
-    fn handle_cmd_auth_success(&mut self, attempt: LoginAttempt, auth_result: R) {
-        let Some(crypto) = self.expecting_auth_result.remove(&attempt) else {
+    fn take_auth(&mut self, exchange: Exchange) -> Option<PendingLogin> {
+        let pending = self.expecting_auth_result.get(&exchange.attempt)?;
+        if pending.generation != exchange.generation {
+            return None;
+        }
+        self.expecting_auth_result.remove(&exchange.attempt)
+    }
+
+    fn handle_cmd_auth_success(&mut self, exchange: Exchange, auth_result: R) {
+        let attempt = exchange.attempt;
+        let Some(pending) = self.take_auth(exchange) else {
             return;
         };
         if self.shutting_down {
             return;
         }
+        let crypto = pending.crypto;
+        let request = pending.login_request.unwrap();
         // The server filled up while authenticating.
         if self.is_full_for(attempt.0) {
             log!(debug, from = %attempt.0, "server full after login");
@@ -487,19 +672,22 @@ impl<R: AuthResult> ServerThreadState<R> {
                 failure_data: b"Server full",
             };
             let size = login_response.serialize(&crypto, &mut self.buf);
-            self.answer_login(attempt, size);
+            self.answer_login(exchange, request, size);
             return;
         }
         let from = attempt.0;
         let size = LoginResponse::Success.serialize(&crypto, &mut self.buf);
-        let rate = Arc::new(AtomicU64::new(0));
+        let shared = Arc::new(PeerState {
+            rate: AtomicU64::new(0),
+            admission: Admission::new(self.send_queue_limits),
+        });
         // The connection is inserted before the next command, so sends can go to it as soon as
         // the client is connected.
-        self.set_connected(from, Some(rate.clone()));
-        self.answer_login(attempt, size);
+        self.set_connected(from, Some(shared.clone()));
+        self.answer_login(exchange, request, size);
         let peer = Peer {
             connection: Connection::new(crypto, &self.config, Instant::now()),
-            rate,
+            shared,
         };
         // A new handshake from a connected address means the client lost its old session
         // (e.g. our LoginSuccess got lost and it started over).
@@ -511,27 +699,37 @@ impl<R: AuthResult> ServerThreadState<R> {
         self.dirty.push(from);
     }
 
-    fn handle_cmd_auth_failure(&mut self, attempt: LoginAttempt, failure_data: Vec<u8>) {
-        let Some(crypto) = self.expecting_auth_result.remove(&attempt) else {
+    fn handle_cmd_auth_failure(&mut self, exchange: Exchange, failure_data: Vec<u8>) {
+        let Some(pending) = self.take_auth(exchange) else {
             return;
         };
-        log!(debug, from = %attempt.0, "login denied");
+        if self.shutting_down {
+            return;
+        }
+        let crypto = pending.crypto;
+        let request = pending.login_request.unwrap();
+        log!(debug, from = %exchange.attempt.0, "login denied");
         let login_response = LoginResponse::Failure {
             failure_data: &failure_data,
         };
         let size = login_response.serialize(&crypto, &mut self.buf);
-        self.answer_login(attempt, size);
+        self.answer_login(exchange, request, size);
     }
 
     /// Sends the LoginResponse in `buf` and keeps it for retransmitted LoginRequests.
-    fn answer_login(&mut self, attempt: LoginAttempt, size: usize) {
-        self.socket.send_to(attempt.0, &self.buf[..size]);
-        self.answered_logins
-            .insert(attempt, self.buf[..size].to_vec());
+    fn answer_login(&mut self, exchange: Exchange, request: [u8; 32], size: usize) {
+        self.socket.send_to(exchange.attempt.0, &self.buf[..size]);
+        self.answered_logins.insert(
+            exchange.attempt,
+            AnsweredLogin {
+                exchange,
+                request,
+                response: self.buf[..size].to_vec(),
+            },
+        );
         self.timed_events.push(
-            TimedEventKey::RemoveAnsweredLogin(attempt),
+            TimedEventKey::RemoveAnsweredLogin(exchange),
             Instant::now() + HANDSHAKE_STATE_TTL,
-            TimedEventData::Nothing,
         );
     }
 
@@ -589,7 +787,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                     salt: client_hello.salt,
                     timestamp: timestamp.to_le_bytes(),
                     cipher: self.cipher,
-                    server_ed25519_pubkey: self.veryifying_key,
+                    server_ed25519_pubkey: self.verifying_key,
                     siphash: None,
                     channel_counts: self.config.channels.counts(),
                 }
@@ -629,8 +827,15 @@ impl<R: AuthResult> ServerThreadState<R> {
         let signed_request: [u8; 116] = self.buf[connection_response::SIGNED_REQUEST]
             .try_into()
             .unwrap();
-        let request: [u8; 64] = signed_request[52..].try_into().unwrap();
-        if let Some(pending) = self.expecting_login_requests.get(&attempt) {
+        let request = signed_request;
+        if self.answered_logins.contains_key(&attempt) {
+            return;
+        }
+        if let Some(pending) = self
+            .expecting_login_requests
+            .get(&attempt)
+            .or_else(|| self.expecting_auth_result.get(&attempt))
+        {
             // A retransmission must get the same keys, a different request is ignored.
             if pending.request == request {
                 self.socket.send_to(from, &pending.response);
@@ -669,18 +874,27 @@ impl<R: AuthResult> ServerThreadState<R> {
         let size =
             connection_response.serialize(&crypto, &self.signing_key, &transcript, &mut self.buf);
         self.socket.send_to(from, &self.buf[..size]);
+        let generation = self.next_generation;
+        let Some(next) = generation.checked_add(1) else {
+            return;
+        };
+        self.next_generation = next;
         self.expecting_login_requests.insert(
             attempt,
             PendingLogin {
                 crypto,
+                generation,
                 request,
                 response: self.buf[..size].to_vec(),
+                login_request: None,
             },
         );
         self.timed_events.push(
-            TimedEventKey::RemoveExpectingLoginRequest(attempt),
+            TimedEventKey::RemoveExpectingLoginRequest(Exchange {
+                attempt,
+                generation,
+            }),
             Instant::now() + HANDSHAKE_STATE_TTL,
-            TimedEventData::Nothing,
         );
     }
 
@@ -689,8 +903,11 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         let attempt = (from, salt);
-        if let Some(response) = self.answered_logins.get(&attempt) {
-            self.socket.send_to(from, response);
+        let request: [u8; 32] = Sha256::digest(&self.buf[..size]).into();
+        if let Some(answer) = self.answered_logins.get(&attempt) {
+            if answer.request == request {
+                self.socket.send_to(from, &answer.response);
+            }
             return;
         }
         let Some(pending) = self.expecting_login_requests.get(&attempt) else {
@@ -701,22 +918,219 @@ impl<R: AuthResult> ServerThreadState<R> {
         else {
             return;
         };
-        let auth_cmd = AuthCmd::Authenticate(attempt, login_request.auth_data.to_vec());
-        let crypto = self
-            .expecting_login_requests
-            .remove(&attempt)
-            .unwrap()
-            .crypto;
+        let exchange = Exchange {
+            attempt,
+            generation: pending.generation,
+        };
+        let auth_cmd = AuthCmd::Authenticate(exchange, login_request.auth_data.to_vec());
+        let mut pending = self.expecting_login_requests.remove(&attempt).unwrap();
+        pending.login_request = Some(request);
+        self.timed_events
+            .remove(&TimedEventKey::RemoveExpectingLoginRequest(exchange));
         if self.auth_cmd_tx.try_send(auth_cmd).is_err() {
             log!(warn, %from, "authenticator busy, login refused");
             let login_response = LoginResponse::Failure {
                 failure_data: b"Server busy",
             };
-            let size = login_response.serialize(&crypto, &mut self.buf);
-            self.answer_login(attempt, size);
+            let size = login_response.serialize(&pending.crypto, &mut self.buf);
+            self.answer_login(exchange, request, size);
             return;
         }
         log!(debug, %from, "authenticating");
-        self.expecting_auth_result.insert(attempt, crypto);
+        self.expecting_auth_result.insert(attempt, pending);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::UdpSocket, sync::mpsc};
+
+    use x25519_dalek::ReusableSecret;
+
+    use super::*;
+    use crate::{Authenticator, ChannelConfiguration, Server};
+
+    struct PausedAuth {
+        entered: mpsc::Sender<Vec<u8>>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Authenticator<Vec<u8>> for PausedAuth {
+        fn authenticate(&mut self, _: SocketAddr, data: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+            self.entered.send(data.clone()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(3)).unwrap();
+            Ok(data)
+        }
+    }
+
+    fn receive(socket: &UdpSocket) -> Vec<u8> {
+        let mut buffer = [0; 1201];
+        let size = socket.recv(&mut buffer).unwrap();
+        buffer[..size].to_vec()
+    }
+
+    fn assert_no_reply(socket: &UdpSocket) {
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let error = socket.recv(&mut [0; 1201]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+    }
+
+    #[test]
+    fn delayed_authentication_keeps_its_original_exchange_and_cached_reply() {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let channels = ChannelConfiguration::default();
+        let server = Server::prepare()
+            .bind_addr("127.0.0.1:0".parse().unwrap())
+            .info(vec![])
+            .allowed_client_versions(|_| Ok(()))
+            .secret_key([7; 32])
+            .auth_salt([0; 16])
+            .authenticator(PausedAuth {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .channel_config(channels.clone())
+            .close_linger(Duration::ZERO)
+            .run()
+            .unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect(server.local_addr()).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let salt = [3, 4, 5, 6];
+        let mut buffer = [0; 1200];
+        let size = ClientHello {
+            salt,
+            client_version: ClientVersion::ZERO,
+        }
+        .serialize(&mut buffer);
+        socket.send(&buffer[..size]).unwrap();
+        let ServerHello::VersionSupported {
+            timestamp,
+            cipher,
+            server_ed25519_pubkey,
+            siphash,
+            channel_counts,
+            ..
+        } = ServerHello::deserialize(&receive(&socket)).unwrap()
+        else {
+            panic!("hello refused")
+        };
+        let secret = ReusableSecret::random_from_rng(thread_rng());
+        let hkdf_salt = [8; 32];
+        let mut request = ConnectionRequest {
+            salt,
+            timestamp,
+            server_ed25519_pubkey,
+            siphash: siphash.unwrap().to_le_bytes(),
+            client_x25519_pubkey: PublicKey::from(&secret),
+            hkdf_salt,
+        };
+        let size = request.serialize(&mut buffer);
+        let request_bytes = buffer[..size].to_vec();
+        socket.send(&request_bytes).unwrap();
+        let response = receive(&socket);
+        let (_, crypto) = ConnectionResponse::deserialize(
+            &response,
+            server_ed25519_pubkey,
+            &secret,
+            hkdf_salt,
+            &Transcript {
+                request: &request_bytes[connection_response::SIGNED_REQUEST],
+                cipher,
+                channel_counts,
+            },
+        )
+        .unwrap();
+        let size = LoginRequest {
+            salt,
+            auth_data: b"account",
+        }
+        .serialize(&crypto, &mut buffer);
+        let login = buffer[..size].to_vec();
+        socket.send(&login).unwrap();
+        assert_eq!(
+            entered.recv_timeout(Duration::from_secs(3)).unwrap(),
+            b"account"
+        );
+
+        socket.send(&request_bytes).unwrap();
+        assert_eq!(receive(&socket), response);
+        request.hkdf_salt = [9; 32];
+        let size = request.serialize(&mut buffer);
+        socket.send(&buffer[..size]).unwrap();
+        assert_no_reply(&socket);
+        request.client_x25519_pubkey =
+            PublicKey::from(&ReusableSecret::random_from_rng(thread_rng()));
+        let size = request.serialize(&mut buffer);
+        socket.send(&buffer[..size]).unwrap();
+        assert_no_reply(&socket);
+        socket.send(&login).unwrap();
+        assert_no_reply(&socket);
+        assert!(entered.try_recv().is_err());
+
+        release.send(()).unwrap();
+        let success = receive(&socket);
+        assert!(matches!(
+            LoginResponse::deserialize(&crypto, &mut success.clone()),
+            Ok(LoginResponse::Success)
+        ));
+        assert!(matches!(server.next().unwrap(), Event::Connected(_, data) if data == b"account"));
+        socket.send(&login).unwrap();
+        assert_eq!(receive(&socket), success);
+        let mut changed_login = login;
+        changed_login[7] ^= 1;
+        socket.send(&changed_login).unwrap();
+        assert_no_reply(&socket);
+
+        let mut connection = Connection::new(
+            crypto,
+            &transport::Config {
+                channels,
+                congestion: Default::default(),
+                max_recv_msg_size: 1 << 20,
+                timeout: Duration::from_secs(10),
+            },
+            Instant::now(),
+        );
+        connection.push(
+            Channel::Reliable(0),
+            Rc::new(b"bound session".to_vec()),
+            Instant::now(),
+        );
+        let size = connection
+            .poll_transmit(Instant::now(), &mut buffer)
+            .unwrap();
+        socket.send(&buffer[..size]).unwrap();
+        assert!(
+            matches!(server.next().unwrap(), Event::Received(_, Channel::Reliable(0), data) if data == b"bound session")
+        );
+    }
+
+    #[test]
+    fn ready_connections_are_unique_and_keep_fifo_continuation() {
+        let first = "127.0.0.1:1".parse().unwrap();
+        let second = "127.0.0.1:2".parse().unwrap();
+        let mut queue = ReadyQueue::default();
+        for _ in 0..1024 {
+            queue.push(first);
+            queue.push(second);
+        }
+        assert_eq!(queue.queue.len(), 2);
+        assert_eq!(queue.pop(), Some(first));
+        queue.push(first);
+        assert_eq!(queue.pop(), Some(second));
+        assert_eq!(queue.pop(), Some(first));
+        assert!(queue.is_empty());
     }
 }

@@ -16,16 +16,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use auth::AuthThreadState;
 pub use auth::{AuthResult, Authenticator};
 use bon::bon;
-use crossbeam::channel::{bounded, unbounded};
+use crossbeam_channel::bounded;
 use ed25519_dalek::SigningKey;
 use mio::{Poll, Waker};
 use rate_limit::RateLimiter;
 use siphasher::sip::SipHasher;
-use thread::{Cmd, Recipients, ServerThreadState};
+use thread::{Cmd, ServerThreadState};
 
 use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, SendLimits},
@@ -34,8 +34,9 @@ use crate::common::{
     error::{ConfigError, ProtocolViolation, RecvError, SendError, TooLarge},
     events::{self, EventReceiver, Payload},
     packets::info_response::MAX_INFO_SIZE,
+    send::{self, Admission, Message, SendOptions, SendOutcome, SendQueueLimits},
     socket::{sim::Simulator, Socket},
-    stats::Stats,
+    stats::{ChannelStats, Stats},
     timed_event_queue::TimedEventQueue,
     transport, AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
 };
@@ -53,7 +54,12 @@ const CLIENT_HELLO_BURST: f64 = 40.0;
 
 /// Connected clients that aren't being closed and their send rates, kept up to date by the
 /// network thread.
-type ConnectedSet = Arc<RwLock<HashMap<SocketAddr, Arc<AtomicU64>>>>;
+type ConnectedSet = Arc<RwLock<HashMap<SocketAddr, Arc<PeerState>>>>;
+
+struct PeerState {
+    rate: AtomicU64,
+    admission: Arc<Admission>,
+}
 
 /// The public key clients pin (`client::ServerKey::Pinned`) for a server's `secret_key`.
 pub fn public_key(secret_key: &[u8; 32]) -> [u8; 32] {
@@ -84,7 +90,9 @@ pub enum Event<R: AuthResult> {
     /// Nothing was received from the client for `timeout_dur`.
     TimedOut(SocketAddr),
     /// A message from the client.
-    Received(SocketAddr, Vec<u8>),
+    Received(SocketAddr, Channel, Vec<u8>),
+    /// Feedback for an optional send receipt, independent of application processing
+    SendResult(SocketAddr, u64, SendOutcome),
     /// The client violated the protocol and was disconnected.
     Violation(SocketAddr, ProtocolViolation),
 }
@@ -92,7 +100,7 @@ pub enum Event<R: AuthResult> {
 impl<R: AuthResult> Payload for Event<R> {
     fn payload_len(&self) -> usize {
         match self {
-            Event::Received(_, message) => message.len(),
+            Event::Received(_, _, message) => message.len(),
             _ => 0,
         }
     }
@@ -129,7 +137,7 @@ impl<R: AuthResult> fmt::Debug for Server<R> {
 struct ServerInner<R: AuthResult> {
     connected: ConnectedSet,
     event_rx: EventReceiver<Event<R>>,
-    cmd_tx: crossbeam::channel::Sender<thread::Cmd<R>>,
+    cmd_tx: crossbeam_channel::Sender<thread::Cmd<R>>,
     waker: Arc<Waker>,
     thread: Option<JoinHandle<()>>,
     auth_thread: Option<JoinHandle<()>>,
@@ -152,23 +160,22 @@ impl<R: AuthResult> Server<R> {
         self.connected().contains_key(&client)
     }
 
-    /// The bytes the next tick of length `tick` may send to `client` without queueing: the
-    /// congestion controller's send rate times the tick. Fill each client's snapshot up to
-    /// this in priority order. `None` if the client isn't connected.
-    pub fn budget_for(&self, client: SocketAddr, tick: Duration) -> Option<usize> {
-        let rate = self.connected().get(&client)?.load(Ordering::Relaxed);
+    /// Approximate gross packet bytes at the current rate over `tick`, including protocol
+    /// overhead. This is a shared rate hint, not reserved payload credit; queued data and
+    /// retransmissions also consume it. `None` if the client is not connected.
+    pub fn gross_send_budget(&self, client: SocketAddr, tick: Duration) -> Option<usize> {
+        let rate = self.connected().get(&client)?.rate.load(Ordering::Relaxed);
         Some((rate as f64 * tick.as_secs_f64()) as usize)
     }
 
     /// Ends a server tick: the messages sent to each client since the last flush leave
     /// together, as one paced burst. Optional; once called, sent messages wait for the next
     /// flush (at most two tick intervals, or 100 ms).
-    pub fn flush(&self) {
-        let _ = self.inner.cmd_tx.send(Cmd::Flush);
-        let _ = self.inner.waker.wake();
+    pub fn flush(&self) -> Result<(), SendError> {
+        self.command(Cmd::Flush)
     }
 
-    fn connected(&self) -> RwLockReadGuard<'_, HashMap<SocketAddr, Arc<AtomicU64>>> {
+    fn connected(&self) -> RwLockReadGuard<'_, HashMap<SocketAddr, Arc<PeerState>>> {
         self.inner
             .connected
             .read()
@@ -176,7 +183,7 @@ impl<R: AuthResult> Server<R> {
     }
 
     /// `disconnect` and `shutdown` take effect for sends right away.
-    fn connected_mut(&self) -> RwLockWriteGuard<'_, HashMap<SocketAddr, Arc<AtomicU64>>> {
+    fn connected_mut(&self) -> RwLockWriteGuard<'_, HashMap<SocketAddr, Arc<PeerState>>> {
         self.inner
             .connected
             .write()
@@ -187,30 +194,33 @@ impl<R: AuthResult> Server<R> {
     /// connected.
     pub fn stats(&self, client: SocketAddr) -> Option<Stats> {
         let (reply_tx, reply_rx) = bounded(1);
-        self.inner.cmd_tx.send(Cmd::Stats(client, reply_tx)).ok()?;
-        let _ = self.inner.waker.wake();
+        self.command(Cmd::Stats(client, reply_tx)).ok()?;
         reply_rx.recv().ok().flatten()
     }
 
     /// Sets the info that will be sent to clients on info requests (for server list pings etc).
     /// Info can be at most 256 bytes.
-    pub fn set_info(&self, info: Vec<u8>) -> Result<(), TooLarge> {
-        TooLarge::check(info.len(), MAX_INFO_SIZE)?;
-        let _ = self.inner.cmd_tx.send(Cmd::SetInfo(info));
-        let _ = self.inner.waker.wake();
-        Ok(())
+    pub fn set_info(&self, info: Vec<u8>) -> Result<(), SendError> {
+        TooLarge::check(info.len(), MAX_INFO_SIZE).map_err(SendError::MessageTooLarge)?;
+        self.command(Cmd::SetInfo(info))
     }
 
     /// The next event if there is one. An error means the network thread has stopped, the
     /// first one says why.
     pub fn try_next(&self) -> Result<Option<Event<R>>, RecvError> {
-        self.inner.event_rx.try_next()
+        let event = self.inner.event_rx.try_next()?;
+        if event.is_some() {
+            let _ = self.inner.waker.wake();
+        }
+        Ok(event)
     }
 
     /// Waits for the next event. An error means the network thread has stopped, the first one
     /// says why.
     pub fn next(&self) -> Result<Event<R>, RecvError> {
-        self.inner.event_rx.next()
+        let event = self.inner.event_rx.next()?;
+        let _ = self.inner.waker.wake();
+        Ok(event)
     }
 
     /// Queues a message for a connected client.
@@ -220,72 +230,172 @@ impl<R: AuthResult> Server<R> {
         channel: Channel,
         message: Vec<u8>,
     ) -> Result<(), SendError> {
-        self.send_limits.check(channel, message.len())?;
-        if !self.is_connected(to) {
-            return Err(SendError::NotConnected(to));
-        }
-        self.send_cmd(Recipients::One(to), channel, message)
+        self.send_with(to, channel, message, SendOptions::default())
     }
 
-    /// Sends one message to every connected client, sharing one buffer.
+    /// Queues a message with optional freshness and delivery feedback
+    pub fn send_with(
+        &self,
+        to: SocketAddr,
+        channel: Channel,
+        message: Vec<u8>,
+        options: SendOptions,
+    ) -> Result<(), SendError> {
+        let submitted = Instant::now();
+        self.send_limits.check(channel, message.len())?;
+        options.validate(channel)?;
+        let connected = self.connected();
+        let peer = connected.get(&to).ok_or(SendError::NotConnected(to))?;
+        let reservation = peer.admission.reserve(channel, message.capacity())?;
+        self.command(Cmd::Send(
+            vec![(
+                to,
+                Message {
+                    data: Arc::new(message),
+                    submitted,
+                    options,
+                    reservation: Some(reservation),
+                },
+            )],
+            channel,
+        ))
+    }
+
+    /// Shares one buffer among connected clients; admission succeeds for all or none
     pub fn broadcast(&self, channel: Channel, message: Vec<u8>) -> Result<(), SendError> {
-        self.send_limits.check(channel, message.len())?;
-        self.send_cmd(Recipients::All, channel, message)
+        let connected = self.connected();
+        self.send_shared(
+            connected.iter().map(|(&addr, peer)| (addr, peer)),
+            channel,
+            message,
+        )
     }
 
-    /// Sends one message to several clients, sharing one buffer. Clients that aren't connected
-    /// are skipped.
+    /// Shares one buffer among the connected recipients; admission succeeds for all or none
     pub fn send_many(
         &self,
         clients: impl IntoIterator<Item = SocketAddr>,
         channel: Channel,
         message: Vec<u8>,
     ) -> Result<(), SendError> {
-        self.send_limits.check(channel, message.len())?;
-        let clients = clients.into_iter().collect();
-        self.send_cmd(Recipients::Many(clients), channel, message)
+        let connected = self.connected();
+        let mut seen = HashSet::default();
+        self.send_shared(
+            clients.into_iter().filter_map(|addr| {
+                connected
+                    .get(&addr)
+                    .filter(|_| seen.insert(addr))
+                    .map(|peer| (addr, peer))
+            }),
+            channel,
+            message,
+        )
     }
 
-    fn send_cmd(
+    fn send_shared<'a>(
         &self,
-        recipients: Recipients,
+        peers: impl Iterator<Item = (SocketAddr, &'a Arc<PeerState>)>,
         channel: Channel,
         message: Vec<u8>,
     ) -> Result<(), SendError> {
+        self.send_limits.check(channel, message.len())?;
+        let data = Arc::new(message);
+        let submitted = Instant::now();
+        let mut targets = Vec::new();
+        for (addr, peer) in peers {
+            let reservation = peer.admission.reserve(channel, data.capacity())?;
+            targets.push((
+                addr,
+                Message {
+                    data: data.clone(),
+                    submitted,
+                    options: SendOptions::default(),
+                    reservation: Some(reservation),
+                },
+            ));
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        self.command(Cmd::Send(targets, channel))
+    }
+
+    fn command(&self, command: Cmd<R>) -> Result<(), SendError> {
         self.inner
             .cmd_tx
-            .send(Cmd::Send(recipients, channel, message))
-            .map_err(|_| SendError::Stopped)?;
+            .try_send(command)
+            .map_err(send::command_error)?;
         let _ = self.inner.waker.wake();
         Ok(())
+    }
+
+    /// Abandons queued transfers on this reliable channel and starts a new generation
+    /// Data received before the reset reaches the peer may still be delivered
+    pub fn reset_channel(&self, client: SocketAddr, channel: u8) -> Result<(), SendError> {
+        self.send_limits.check(Channel::Reliable(channel), 0)?;
+        let peer = self
+            .connected()
+            .get(&client)
+            .cloned()
+            .ok_or(SendError::NotConnected(client))?;
+        self.command(Cmd::ResetChannel(client, peer, channel))
+    }
+
+    /// Changes a channel's priority; larger values run first, with occasional lower-priority service
+    pub fn set_priority(
+        &self,
+        client: SocketAddr,
+        channel: Channel,
+        priority: i8,
+    ) -> Result<(), SendError> {
+        self.send_limits.check(channel, 0)?;
+        let peer = self
+            .connected()
+            .get(&client)
+            .cloned()
+            .ok_or(SendError::NotConnected(client))?;
+        self.command(Cmd::SetPriority(client, peer, channel, priority))
+    }
+
+    /// Queue state on one channel, unavailable when disconnected or the command queue is full
+    pub fn channel_stats(&self, client: SocketAddr, channel: Channel) -> Option<ChannelStats> {
+        self.send_limits.check(channel, 0).ok()?;
+        let (tx, rx) = bounded(1);
+        self.command(Cmd::ChannelStats(client, channel, tx)).ok()?;
+        rx.recv().ok().flatten()
     }
 
     /// Closes every connection once its queued messages were sent and acknowledged, or after
     /// `close_linger`, then stops. Later sends are dropped and no new clients are accepted.
     /// The reason is sent to every client, at most 1170 bytes.
-    pub fn shutdown(&self, reason: Vec<u8>) -> Result<(), TooLarge> {
-        TooLarge::check(reason.len(), transport::MAX_REASON_SIZE)?;
-        self.connected_mut().clear();
-        let _ = self.inner.cmd_tx.send(Cmd::Shutdown(reason));
-        let _ = self.inner.waker.wake();
+    pub fn shutdown(&self, reason: Vec<u8>) -> Result<(), SendError> {
+        TooLarge::check(reason.len(), transport::MAX_REASON_SIZE)
+            .map_err(SendError::MessageTooLarge)?;
+        let mut connected = self.connected_mut();
+        self.command(Cmd::Shutdown(reason))?;
+        connected.clear();
         Ok(())
     }
 
     /// Disconnects one client like `shutdown` does, without an event for it.
     /// The reason is sent to the client, at most 1170 bytes.
-    pub fn disconnect(&self, client: SocketAddr, reason: Vec<u8>) -> Result<(), TooLarge> {
-        TooLarge::check(reason.len(), transport::MAX_REASON_SIZE)?;
-        self.connected_mut().remove(&client);
-        let _ = self.inner.cmd_tx.send(Cmd::Disconnect(client, reason));
-        let _ = self.inner.waker.wake();
+    pub fn disconnect(&self, client: SocketAddr, reason: Vec<u8>) -> Result<(), SendError> {
+        TooLarge::check(reason.len(), transport::MAX_REASON_SIZE)
+            .map_err(SendError::MessageTooLarge)?;
+        let mut connected = self.connected_mut();
+        let peer = connected
+            .get(&client)
+            .cloned()
+            .ok_or(SendError::NotConnected(client))?;
+        self.command(Cmd::Disconnect(client, peer, reason))?;
+        connected.remove(&client);
         Ok(())
     }
 
     /// Simulates network conditions for the server's packets (of all clients),
     /// `Simulator::default()` turns it off. See [`crate::sim`].
-    pub fn set_simulator(&self, simulator: Simulator) {
-        let _ = self.inner.cmd_tx.send(Cmd::SetSimulator(simulator));
-        let _ = self.inner.waker.wake();
+    pub fn set_simulator(&self, simulator: Simulator) -> Result<(), SendError> {
+        self.command(Cmd::SetSimulator(simulator))
     }
 }
 
@@ -294,7 +404,10 @@ impl<R: AuthResult> Drop for ServerInner<R> {
         let _ = self.cmd_tx.send(Cmd::Shutdown(vec![]));
         let _ = self.waker.wake();
         let _ = self.thread.take().unwrap().join();
-        let _ = self.auth_thread.take().unwrap().join();
+        let auth_thread = self.auth_thread.take().unwrap();
+        if auth_thread.is_finished() {
+            let _ = auth_thread.join();
+        }
     }
 }
 
@@ -331,10 +444,9 @@ impl<R: AuthResult> Server<R> {
         timeout_dur: Duration,
         /// Further clients are turned away (`ConnectError::ServerFull`). Unlimited by default.
         max_connections: Option<usize>,
-        /// Limit for queued, undrained events. While reached, or while the queued messages take
-        /// 64 MiB (at least 4 × `max_recv_msg_size`), received unreliable messages are dropped and
-        /// reliable packets are left unacknowledged (the peer resends them later). Connection
-        /// events are always delivered.
+        /// Limit for queued message and receipt events, also bounded by 64 MiB of message data
+        /// (at least 4 × `max_recv_msg_size`); connection events are always delivered
+        /// Reliable receive credit resumes when the app polls; unreliable messages may be dropped
         #[builder(default = 65536)]
         max_events: usize,
         /// The channels, clients need the same counts.
@@ -342,6 +454,9 @@ impl<R: AuthResult> Server<R> {
         /// Send rate limits per connection.
         #[builder(default)]
         congestion_config: CongestionConfig,
+        /// Outgoing buffer and message limits per connection and channel
+        #[builder(default)]
+        send_queue_limits: SendQueueLimits,
         /// Maximum size of a message that can be sent.
         #[builder(default = 1048576)]
         max_send_msg_size: usize,
@@ -363,6 +478,7 @@ impl<R: AuthResult> Server<R> {
     {
         TooLarge::check(info.len(), MAX_INFO_SIZE).map_err(ConfigError::InfoTooLarge)?;
         channel_config.validate()?;
+        send_queue_limits.validate()?;
         congestion_config.validate()?;
         let send_limits = SendLimits::new(&channel_config, max_send_msg_size);
         let socket = Socket::builder()
@@ -377,8 +493,7 @@ impl<R: AuthResult> Server<R> {
 
         let cipher = cipher.unwrap_or_else(SymCipher::better);
 
-        // Has to be unbounded to prevent deadlocks
-        let (cmd_tx, cmd_rx) = unbounded();
+        let (cmd_tx, cmd_rx) = bounded(1024);
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
 
@@ -412,13 +527,14 @@ impl<R: AuthResult> Server<R> {
                     info,
                     allowed_client_versions: Box::new(allowed_client_versions),
                     cipher,
-                    veryifying_key: signing_key.verifying_key(),
+                    verifying_key: signing_key.verifying_key(),
                     signing_key,
                     auth_salt,
 
                     cookie_epoch: Instant::now(),
                     connection_request_max_timestamp_age,
                     max_connections,
+                    send_queue_limits,
 
                     siphasher: SipHasher::new_with_key(&rand::random()),
                     client_hellos: RateLimiter::new(CLIENT_HELLOS_PER_SECOND, CLIENT_HELLO_BURST),
@@ -429,6 +545,7 @@ impl<R: AuthResult> Server<R> {
                     expecting_login_requests: Default::default(),
                     auth_cmd_tx,
                     expecting_auth_result: Default::default(),
+                    next_generation: 0,
                     answered_logins: Default::default(),
                     connections: Default::default(),
                     connected: thread_connected,
@@ -438,8 +555,11 @@ impl<R: AuthResult> Server<R> {
                         max_recv_msg_size,
                         timeout: timeout_dur,
                     },
-                    dirty: Vec::new(),
+                    dirty: Default::default(),
+                    delivery_ready: Default::default(),
+                    pending_work: None,
                     outputs: Vec::new(),
+                    receive_pending: false,
 
                     close_linger,
                     shutting_down: false,

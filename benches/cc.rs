@@ -7,24 +7,30 @@
 //! `benches/network` measures the real thing.
 //!
 //! ```text
-//! cargo bench --features bench --bench cc -- [--seconds N] [--seed N] [--seeds N] [--trace]
+//! cargo bench --features bench --bench cc -- [--seconds N] [--drain N] [--seed N] [--seeds N] [--trace]
 //!     [--scenario NAME,..] [--profile NAME,..]
 //! ```
 //!
-//! `--seeds N` runs seeds `seed..seed + N` and prints the means. `--trace` prints the server's
+//! `--seeds N` reports each seed, means and worst tails. `--trace` prints the server's
 //! (`TRACE_SIDE=client`: the client's) statistics of every pair every 250 ms (`TRACE_MS`).
 
-use std::time::Duration;
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use hexgate::{
     bench::{Delivery, Pairs, Side},
-    sim::{Bottleneck, Jitter, JitterDistribution, Link, LinkConfig, LinkStats, Profile},
+    sim::{
+        Bottleneck, Fate, Jitter, JitterDistribution, Link, LinkConfig, LinkStats,
+        NetworkSimulator, Profile,
+    },
     Channel, ChannelConfiguration, CongestionConfig,
 };
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 
-const HEADER: usize = 13;
+const HEADER: usize = 14;
 const KIB: usize = 1024;
 
 #[derive(Clone, Copy)]
@@ -137,6 +143,27 @@ const DOWNLOAD: StreamSpec = StreamSpec {
     },
 };
 
+const MOBA: [StreamSpec; 2] = [
+    StreamSpec {
+        name: "updates",
+        kind: Kind::Periodic {
+            hz: 30.0,
+            min: 200,
+            max: 800,
+        },
+        ..SNAPSHOTS
+    },
+    StreamSpec {
+        name: "events",
+        kind: Kind::Burst {
+            every: Duration::from_millis(250),
+            count: 1,
+            size: 100,
+        },
+        ..DOWNLOAD
+    },
+];
+
 fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
@@ -202,6 +229,48 @@ fn scenarios() -> Vec<Scenario> {
             stagger: Duration::ZERO,
             streams: &[SNAPSHOTS, INPUTS],
         },
+        Scenario {
+            name: "fair-rtt",
+            about: "3 downloads with 0/40/100 ms added RTT sharing the bottleneck",
+            flows: 3,
+            stagger: Duration::from_secs(5),
+            streams: &[DOWNLOAD],
+        },
+        Scenario {
+            name: "scale",
+            about: "32 clients sending snapshots and inputs through a shared bottleneck",
+            flows: 32,
+            stagger: Duration::ZERO,
+            streams: &[SNAPSHOTS, INPUTS],
+        },
+        Scenario {
+            name: "channels",
+            about: "513 channels, each sending one 100-byte message at 10 Hz",
+            flows: 1,
+            stagger: Duration::ZERO,
+            streams: &[],
+        },
+        Scenario {
+            name: "moba",
+            about: "30 Hz updates and reliable events every 250 ms",
+            flows: 1,
+            stagger: Duration::ZERO,
+            streams: &MOBA,
+        },
+        Scenario {
+            name: "mild",
+            about: "64 Hz single-packet snapshots (use narrow profile and --seconds 120)",
+            flows: 1,
+            stagger: Duration::ZERO,
+            streams: &[StreamSpec {
+                kind: Kind::Periodic {
+                    hz: 64.0,
+                    min: 700,
+                    max: 700,
+                },
+                ..SNAPSHOTS
+            }],
+        },
     ]
 }
 
@@ -258,35 +327,53 @@ fn profiles() -> Vec<(&'static str, Profile)> {
                 down: jitter,
             },
         ),
+        (
+            "reverse",
+            Profile {
+                up: clean(0.1, 200),
+                down: clean(10.0, 200),
+            },
+        ),
+        (
+            "narrow",
+            Profile {
+                up: clean(1.0, 500),
+                down: clean(0.384, 500),
+            },
+        ),
     ]
 }
 
 struct Stream {
     spec: StreamSpec,
     pair: usize,
-    id: u8,
+    id: u16,
     next: Duration,
+    start: Duration,
     rng: Xoshiro256PlusPlus,
     sent: u64,
-    sent_bytes: u64,
-    queued: usize,
     /// A ping is in flight since then.
     ping: Option<Duration>,
     /// Latencies in ms of the arrivals, arrival bytes during the run.
     latencies: Vec<f64>,
-    received_bytes: u64,
+    active_bytes: u64,
+    common_bytes: [u64; 2],
+    pending_at_end: u64,
+    last_arrival: Duration,
+    max_gap: Duration,
 }
 
-fn message(id: u8, seq: u64, sent_us: u64, size: usize) -> Vec<u8> {
+fn message(id: u16, seq: u64, sent_us: u64, size: usize) -> Vec<u8> {
     let mut message = vec![0u8; size.max(HEADER)];
-    message[0] = id;
-    message[1..5].copy_from_slice(&(seq as u32).to_le_bytes());
-    message[5..13].copy_from_slice(&sent_us.to_le_bytes());
+    message[..2].copy_from_slice(&id.to_le_bytes());
+    message[2..6].copy_from_slice(&(seq as u32).to_le_bytes());
+    message[6..14].copy_from_slice(&sent_us.to_le_bytes());
     message
 }
 
 struct Args {
     seconds: u64,
+    drain: u64,
     seed: u64,
     seeds: u64,
     trace: bool,
@@ -297,6 +384,7 @@ struct Args {
 fn args() -> Args {
     let mut args = Args {
         seconds: 30,
+        drain: 5,
         seed: 1,
         seeds: 1,
         trace: false,
@@ -308,6 +396,7 @@ fn args() -> Args {
         let mut value = || iter.next().expect("value expected");
         match arg.as_str() {
             "--seconds" => args.seconds = value().parse().expect("seconds"),
+            "--drain" => args.drain = value().parse().expect("drain seconds"),
             "--seed" => args.seed = value().parse().expect("seed"),
             "--seeds" => args.seeds = value().parse().expect("seeds"),
             "--trace" => args.trace = true,
@@ -317,6 +406,10 @@ fn args() -> Args {
             other => panic!("unknown argument {other}"),
         }
     }
+    assert!(
+        args.seconds > 0 && args.seeds > 0,
+        "seconds and seeds must be positive"
+    );
     args
 }
 
@@ -330,58 +423,137 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 /// Per stream: name, pair, delivery, goodput, p50, p95, p99, max; per link: mean and max
 /// queue delay.
 struct Outcome {
-    streams: Vec<(&'static str, usize, [f64; 6])>,
+    streams: Vec<StreamOutcome>,
     links: [[f64; 2]; 2],
+    common_start: f64,
+}
+
+struct StreamOutcome {
+    name: &'static str,
+    pair: usize,
+    reliable: bool,
+    metrics: [f64; 6],
+    common_rates: [f64; 2],
+    pending_at_end: u64,
+    pending_after_drain: u64,
+    max_gap: f64,
+}
+
+struct Path {
+    link: Link,
+    extra_delay: Duration,
+}
+
+impl NetworkSimulator for Path {
+    fn simulate(&mut self, now: Instant, peer: SocketAddr, packet: &mut [u8]) -> Fate {
+        match self.link.simulate(now, peer, packet) {
+            Fate::Drop => Fate::Drop,
+            Fate::Deliver(at) => Fate::Deliver(at + self.extra_delay),
+            Fate::Duplicate(first, second) => {
+                Fate::Duplicate(first + self.extra_delay, second + self.extra_delay)
+            }
+        }
+    }
 }
 
 fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcome {
     let mut pairs = Pairs::new();
-    let channels = ChannelConfiguration::default();
+    let channels = if scenario.name == "channels" {
+        ChannelConfiguration {
+            weights_reliable: vec![1; 256],
+            weights_unreliable_ordered: vec![1; 256],
+            ..ChannelConfiguration::default()
+        }
+    } else {
+        ChannelConfiguration::default()
+    };
     let (shared_up, shared_down) = profile.links(seed);
-    let mut links: Vec<(Link, Link)> = Vec::new();
     let mut streams: Vec<Stream> = Vec::new();
     for flow in 0..scenario.flows {
         // Flows share the bottleneck; the crowd's last flow is a download.
         let (up, down) = (shared_up.clone(), shared_down.clone());
-        links.push((up.clone(), down.clone()));
+        let extra_delay = if scenario.name == "fair-rtt" {
+            ms([0, 20, 50][flow])
+        } else {
+            Duration::ZERO
+        };
         let pair = pairs.add(
             channels.clone(),
             CongestionConfig::default(),
-            Some(Box::new(up)),
-            Some(Box::new(down)),
+            Some(Box::new(Path {
+                link: up,
+                extra_delay,
+            })),
+            Some(Box::new(Path {
+                link: down,
+                extra_delay,
+            })),
         );
-        let specs: Vec<StreamSpec> = if scenario.name == "crowd" && flow == scenario.flows - 1 {
+        let specs: Vec<StreamSpec> = if scenario.name == "channels" {
+            std::iter::once(Channel::Unreliable)
+                .chain((0..=255).map(Channel::UnreliableOrdered))
+                .chain((0..=255).map(Channel::Reliable))
+                .map(|channel| StreamSpec {
+                    name: "lane",
+                    from: Side::Server,
+                    channel,
+                    kind: Kind::Periodic {
+                        hz: 10.0,
+                        min: 100,
+                        max: 100,
+                    },
+                })
+                .collect()
+        } else if scenario.name == "crowd" && flow == scenario.flows - 1 {
             vec![DOWNLOAD]
         } else {
             scenario.streams.to_vec()
         };
         for spec in specs {
-            let id = streams.len() as u8;
+            let id = u16::try_from(streams.len()).expect("too many benchmark streams");
             let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed ^ u64::from(id) << 32);
             let phase = Duration::from_secs_f64(rng.gen::<f64>() / 64.0);
+            let start = scenario.stagger * flow as u32 + phase;
             streams.push(Stream {
                 spec,
                 pair,
                 id,
-                next: scenario.stagger * flow as u32 + phase,
+                next: start,
+                start,
                 rng,
                 sent: 0,
-                sent_bytes: 0,
-                queued: 0,
                 ping: None,
                 latencies: Vec::new(),
-                received_bytes: 0,
+                active_bytes: 0,
+                common_bytes: [0; 2],
+                pending_at_end: 0,
+                last_arrival: start,
+                max_gap: Duration::ZERO,
             });
         }
     }
     let end = Duration::from_secs(args.seconds);
+    let observation_end = end + Duration::from_secs(args.drain);
+    let common_start = streams
+        .iter()
+        .map(|stream| stream.start)
+        .max()
+        .unwrap_or_default();
+    let common_middle = common_start + end.saturating_sub(common_start) / 2;
     let epoch = pairs.now() - pairs.elapsed();
     let tick = Duration::from_millis(1);
     let mut trace_at = Duration::ZERO;
-    while pairs.elapsed() < end {
+    let mut draining = false;
+    while pairs.elapsed() < observation_end {
         let now = pairs.elapsed();
+        if now >= end && !draining {
+            draining = true;
+            for stream in &mut streams {
+                stream.pending_at_end = stream.sent - stream.latencies.len() as u64;
+            }
+        }
         for stream in &mut streams {
-            if stream.next > now {
+            if draining || stream.next > now {
                 continue;
             }
             let now_us = now.as_micros() as u64;
@@ -393,10 +565,8 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
                         let msg = message(stream.id, stream.sent, now_us, size);
                         pairs.send(stream.pair, stream.spec.from, stream.spec.channel, msg);
                         stream.sent += 1;
-                        stream.sent_bytes += size as u64;
                         waiting += size;
                     }
-                    stream.queued = waiting;
                     stream.next = now + tick;
                 }
                 Kind::Periodic { hz, min, max } => {
@@ -404,7 +574,6 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
                     let msg = message(stream.id, stream.sent, now_us, size);
                     pairs.send(stream.pair, stream.spec.from, stream.spec.channel, msg);
                     stream.sent += 1;
-                    stream.sent_bytes += size as u64;
                     stream.next += Duration::from_secs_f64(1.0 / hz);
                 }
                 Kind::Tick { hz, sizes } => {
@@ -413,7 +582,6 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
                         let msg = message(stream.id, stream.sent, now_us, size);
                         pairs.send(stream.pair, stream.spec.from, stream.spec.channel, msg);
                         stream.sent += 1;
-                        stream.sent_bytes += size as u64;
                     }
                     pairs.flush(stream.pair, stream.spec.from);
                     stream.next += Duration::from_secs_f64(1.0 / hz);
@@ -423,7 +591,6 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
                         let msg = message(stream.id, stream.sent, now_us, size);
                         pairs.send(stream.pair, stream.spec.from, stream.spec.channel, msg);
                         stream.sent += 1;
-                        stream.sent_bytes += size as u64;
                     }
                     stream.next += every;
                 }
@@ -435,7 +602,6 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
                         let msg = message(stream.id, stream.sent, now_us, size);
                         pairs.send(stream.pair, stream.spec.from, stream.spec.channel, msg);
                         stream.sent += 1;
-                        stream.sent_bytes += size as u64;
                         stream.ping = Some(now);
                     }
                     stream.next = now + Duration::from_millis(1);
@@ -457,10 +623,9 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
             for pair in 0..scenario.flows {
                 let s = pairs.stats(pair, side);
                 line += &format!(
-                    " | {:6.2} Mbit/s dlv {:6.2} U {:4.2} qd {:5.1} rtt {:5.1} {:?}",
+                    " | {:6.2} Mbit/s dlv {:6.2} qd {:5.1} rtt {:5.1} {:?}",
                     s.send_rate as f64 * 8e-6,
                     s.delivery_rate as f64 * 8e-6,
-                    s.utilization,
                     s.queue_delay.as_secs_f64() * 1e3,
                     s.rtt.map_or(0.0, |rtt| rtt.as_secs_f64() * 1e3),
                     s.congestion,
@@ -468,19 +633,23 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
             }
             println!("{line}");
         }
-        let next = streams
-            .iter()
-            .map(|stream| stream.next)
-            .min()
-            .unwrap_or(end)
-            .min(end)
-            .max(now + Duration::from_micros(100));
+        let next = if draining {
+            observation_end.min(now + tick)
+        } else {
+            streams
+                .iter()
+                .map(|stream| stream.next)
+                .min()
+                .unwrap_or(end)
+                .min(end)
+                .max(now + Duration::from_micros(100))
+        };
         let until = pairs.now() + (next - now);
         let by_id = &mut streams;
         let mut echoes = Vec::new();
         pairs.run(until, &mut |pair, side, at, delivery| {
             if let Delivery::Message(message) = delivery {
-                let id = message[0] as usize;
+                let id = u16::from_le_bytes(message[..2].try_into().unwrap()) as usize;
                 let stream = &mut by_id[id];
                 if matches!(stream.spec.kind, Kind::PingPong { .. }) {
                     if side == Side::Server {
@@ -490,19 +659,29 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
                     stream.ping = None;
                     stream.next = (at - epoch).min(stream.next);
                 }
-                let sent_us = u64::from_le_bytes(message[5..13].try_into().unwrap());
+                let sent_us = u64::from_le_bytes(message[6..14].try_into().unwrap());
                 let at_us = (at - epoch).as_micros() as i64;
                 stream
                     .latencies
                     .push((at_us - sent_us as i64) as f64 / 1000.0);
-                stream.received_bytes += message.len() as u64;
+                let elapsed = at - epoch;
+                if elapsed <= end {
+                    stream.active_bytes += message.len() as u64;
+                    stream.max_gap = stream
+                        .max_gap
+                        .max(elapsed.saturating_sub(stream.last_arrival));
+                    stream.last_arrival = elapsed;
+                    if elapsed >= common_start {
+                        stream.common_bytes[usize::from(elapsed >= common_middle)] +=
+                            message.len() as u64;
+                    }
+                }
             }
         });
         for (pair, channel, message) in echoes {
             pairs.send(pair, Side::Server, channel, message);
         }
     }
-    let seconds = args.seconds as f64;
     let link = |stats: LinkStats| {
         [
             stats.mean_queue_delay().as_secs_f64() * 1e3,
@@ -515,48 +694,110 @@ fn run(scenario: &Scenario, profile: &Profile, args: &Args, seed: u64) -> Outcom
             .map(|stream| {
                 stream.latencies.sort_by(f64::total_cmp);
                 let l = &stream.latencies;
-                (
-                    stream.spec.name,
-                    stream.pair,
-                    [
+                if !draining {
+                    stream.pending_at_end = stream.sent - stream.latencies.len() as u64;
+                }
+                StreamOutcome {
+                    name: stream.spec.name,
+                    pair: stream.pair,
+                    reliable: matches!(stream.spec.channel, Channel::Reliable(_)),
+                    metrics: [
                         100.0 * l.len() as f64 / stream.sent.max(1) as f64,
-                        stream.received_bytes as f64 * 8e-6 / seconds,
+                        stream.active_bytes as f64 * 8e-6
+                            / end.saturating_sub(stream.start).as_secs_f64(),
                         percentile(l, 0.5),
                         percentile(l, 0.95),
                         percentile(l, 0.99),
                         l.last().copied().unwrap_or(f64::NAN),
                     ],
-                )
+                    common_rates: stream.common_bytes.map(|bytes| {
+                        bytes as f64 * 8e-6 / (end.saturating_sub(common_start).as_secs_f64() / 2.0)
+                    }),
+                    pending_at_end: stream.pending_at_end,
+                    pending_after_drain: stream.sent - l.len() as u64,
+                    max_gap: stream
+                        .max_gap
+                        .max(end.saturating_sub(stream.last_arrival))
+                        .as_secs_f64()
+                        * 1e3,
+                }
             })
             .collect(),
         links: [link(shared_down.stats()), link(shared_up.stats())],
+        common_start: common_start.as_secs_f64(),
     }
 }
 
-/// Runs `args.seeds` seeds and prints the means.
 fn report(scenario: &Scenario, profile: &Profile, args: &Args) {
     let outcomes: Vec<Outcome> = (0..args.seeds)
         .map(|i| run(scenario, profile, args, args.seed + i))
         .collect();
     let n = outcomes.len() as f64;
-    for (i, &(name, pair, _)) in outcomes[0].streams.iter().enumerate() {
-        let mean = |k: usize| outcomes.iter().map(|o| o.streams[i].2[k]).sum::<f64>() / n;
+    for (seed, outcome) in outcomes.iter().enumerate() {
         println!(
-            "  {pair:<2} {name:<10} {:>6.1}% {:>7.2} Mbit/s  p50 {:>7.1}  p95 {:>7.1}  p99 {:>7.1}  max {:>7.1} ms",
+            "  seed {}: active {} s, drain {} s, common {:.3}..{} s (first/second half)",
+            args.seed + seed as u64,
+            args.seconds,
+            args.drain,
+            outcome.common_start,
+            args.seconds
+        );
+        for stream in &outcome.streams {
+            println!("    {} {:<10} active {:.3} Mbit/s, common {:.3}/{:.3}, p99 {:.1} max {:.1} gap {:.1} ms, {} {} -> {}",
+                stream.pair, stream.name, stream.metrics[1], stream.common_rates[0], stream.common_rates[1],
+                stream.metrics[4], stream.metrics[5], stream.max_gap,
+                if stream.reliable { "pending" } else { "unobserved" },
+                stream.pending_at_end, stream.pending_after_drain);
+        }
+        if matches!(scenario.name, "fair" | "fair-rtt") {
+            let fairness = |half: usize| {
+                let rates: Vec<_> = outcome
+                    .streams
+                    .iter()
+                    .map(|s| s.common_rates[half])
+                    .collect();
+                rates.iter().sum::<f64>().powi(2)
+                    / (rates.len() as f64 * rates.iter().map(|x| x * x).sum::<f64>())
+            };
+            println!(
+                "    common Jain fairness {:.3} -> {:.3}",
+                fairness(0),
+                fairness(1)
+            );
+        }
+    }
+    for (i, stream) in outcomes[0].streams.iter().enumerate() {
+        let (name, pair) = (stream.name, stream.pair);
+        let mean = |k: usize| {
+            outcomes
+                .iter()
+                .map(|o| o.streams[i].metrics[k])
+                .sum::<f64>()
+                / n
+        };
+        let worst = |k: usize| {
+            outcomes
+                .iter()
+                .map(|o| o.streams[i].metrics[k])
+                .fold(f64::NAN, f64::max)
+        };
+        println!(
+            "  mean {pair:<2} {name:<10} {:>6.1}% {:>7.2} Mbit/s  p50 {:>7.1}  p95 {:>7.1}  p99 {:>7.1}; worst-seed p99 {:>7.1} max {:>7.1} ms",
             mean(0),
             mean(1),
             mean(2),
             mean(3),
             mean(4),
-            mean(5),
+            worst(4),
+            worst(5),
         );
     }
     for (j, name) in ["down", "up"].iter().enumerate() {
         let mean = |k: usize| outcomes.iter().map(|o| o.links[j][k]).sum::<f64>() / n;
         println!(
-            "  {name:<4} link: queue mean {:6.1} max {:6.1} ms",
+            "  {name:<4} link including drain: queue mean {:6.1} worst-seed max {:6.1} ms",
             mean(0),
-            mean(1)
+            outcomes.iter().map(|o| o.links[j][1]).fold(0.0, f64::max)
         );
     }
 }

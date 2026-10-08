@@ -21,7 +21,9 @@ Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
     - Unreliable
     - UnreliableOrdered (sequenced, up to 256 channels)
     - Reliable (ordered, up to 256 channels)
-- Weighted fair queueing between channels, so a busy channel doesn't block the others
+- Channel priorities with weighted byte fairness and periodic service for lower priorities
+- Bounded send admission, receiver flow control, reliable channel reset, per-channel queue statistics
+- Unreliable deadlines and replacement; optional transport acknowledgments through send receipts
 - Runs on its own network thread; non-blocking connect (`start()`) or blocking (`connect()`)
 - Server: per-client kick, broadcast, connection limit, connection queries
 - Security:
@@ -31,9 +33,9 @@ Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
     - DoS hardening: stateless handshake cookies bound to the client address, per-IP rate limits, requests padded
       so the server never amplifies traffic
     - Key file helpers (`hexgate::keys`)
-- Latency-first congestion control: paced bursts, utilization measured from receive timestamps, queues drained
-  within a few bursts; realtime messages first, stale unreliable messages dropped instead of sent late
-- Per-tick API for games: `flush()` sends a tick as one burst, `budget_for(tick)` tells how much it may send
+- Paced congestion window controlled by standing RTT and loss; all channels share the same network budget
+- Freshness measured from application submission, including connection startup
+- Per-tick API for games: `flush()` sends a tick as one burst, `gross_send_budget(tick)` gives an approximate gross packet budget
 - Timeouts, keepalives and connection statistics (RTT, queueing delay, send and delivery rate, loss, queued bytes)
 - Network simulation (`hexgate::sim`), both directions, on the network thread: presets from perfect to terrible,
   bottleneck with buffer and cross traffic, jitter distributions, bursty loss, spikes, stalls, outages, reordering,
@@ -89,9 +91,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(event) = server.try_next()? {
             match event {
                 Event::Connected(addr, name) => println!("{name} joined from {addr}"),
-                Event::Received(_, message) => server.broadcast(Channel::Reliable(0), message)?,
+                Event::Received(_, _, message) => server.broadcast(Channel::Reliable(0), message)?,
                 Event::Disconnected(addr, _) | Event::TimedOut(addr) => println!("{addr} left"),
                 Event::Violation(addr, violation) => println!("{addr} was kicked: {violation}"),
+                Event::SendResult(..) => {}
             }
         }
         // Simulate the world, then send state updates on Channel::Unreliable...
@@ -130,8 +133,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(event) = client.try_next()? {
             match event {
                 Event::Connected => println!("connected"),
+                Event::SendResult(..) => {}
                 Event::ConnectFailed(e) => return Err(e.into()),
-                Event::Received(message) => println!("{}", String::from_utf8_lossy(&message)),
+                Event::Received(_, message) => println!("{}", String::from_utf8_lossy(&message)),
                 Event::Disconnected(_) | Event::TimedOut | Event::Violation(_) => return Ok(()),
             }
         }
@@ -140,7 +144,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See `examples/` for a complete chat and a server browser query.
+See `examples/game_loop.rs` for tick flushing, fresh snapshots and cancellable bulk transfers.
+Send receipts acknowledge transport packets; they do not guarantee application delivery or processing.
 
 ## Inspiration
 

@@ -13,15 +13,13 @@ use hexgate::{server::Event, Channel};
 fn reliable_transfer(network: Option<Network>, amount: u32, timeout_dur: Duration) {
     let (server, client) = connected(network, timeout_dur);
     for i in 0..amount {
-        client
-            .send(Channel::Reliable(0), i.to_string().into_bytes())
-            .unwrap();
+        common::send(&client, Channel::Reliable(0), i.to_string().into_bytes());
     }
     let mut next = 0;
     while next < amount {
         match server.next().unwrap() {
             Event::Connected(..) => {}
-            Event::Received(_, message) => {
+            Event::Received(_, _, message) => {
                 assert_eq!(message, next.to_string().as_bytes());
                 next += 1;
             }
@@ -32,21 +30,31 @@ fn reliable_transfer(network: Option<Network>, amount: u32, timeout_dur: Duratio
 
 /// Messages arrive in order, late ones are dropped, the newest state gets through: one of
 /// the last `newest` messages. Returns how many arrived.
-fn unreliable_ordered_transfer(network: Option<Network>, amount: u32, newest: u32) -> u32 {
+fn unreliable_ordered_transfer(
+    network: Option<Network>,
+    amount: u32,
+    newest: u32,
+    timeout_dur: Duration,
+) -> u32 {
     const QUIET: Duration = Duration::from_secs(2);
-    let (server, client) = connected(network, TIMEOUT);
+    let (server, client) = connected(network, timeout_dur);
     for i in 0..amount {
-        client
-            .send(Channel::UnreliableOrdered(0), i.to_string().into_bytes())
-            .unwrap();
+        common::send(
+            &client,
+            Channel::UnreliableOrdered(0),
+            i.to_string().into_bytes(),
+        );
     }
     let mut last = None;
     let mut received = 0;
     let mut last_received = Instant::now();
-    while last != Some(amount - 1) && last_received.elapsed() < QUIET {
+    while last != Some(amount - 1)
+        && (last_received.elapsed() < QUIET
+            || client.stats().is_some_and(|stats| stats.queued_bytes > 0))
+    {
         match server.try_next().unwrap() {
             Some(Event::Connected(..)) => {}
-            Some(Event::Received(_, message)) => {
+            Some(Event::Received(_, _, message)) => {
                 let id: u32 = String::from_utf8(message).unwrap().parse().unwrap();
                 assert!(last.is_none_or(|last| id > last), "{id} after {last:?}");
                 last = Some(id);
@@ -71,14 +79,14 @@ fn fragmented_transfer(channel: Channel, network: Network) -> Vec<u32> {
     let size = |i: u32| 3000 + 7 * i as usize;
     let (server, client) = connected(Some(network), TIMEOUT);
     for i in 0..200 {
-        client.send(channel, vec![i as u8; size(i)]).unwrap();
+        common::send(&client, channel, vec![i as u8; size(i)]);
     }
     let mut received = Vec::new();
     let mut last_received = Instant::now();
     while last_received.elapsed() < QUIET {
         match server.try_next().unwrap() {
             Some(Event::Connected(..)) => {}
-            Some(Event::Received(_, message)) => {
+            Some(Event::Received(_, _, message)) => {
                 let i = ((message.len() - 3000) / 7) as u32;
                 assert_eq!(message, vec![i as u8; size(i)]);
                 received.push(i);
@@ -133,22 +141,22 @@ fn reliable_terrible_network() {
 #[test]
 fn unreliable_ordered_no_simulator() {
     let amount = 50_000;
-    let received = unreliable_ordered_transfer(None, amount, 50);
+    let received = unreliable_ordered_transfer(None, amount, 50, TIMEOUT);
     assert!(received >= amount * 9 / 10, "{received}/{amount}");
 }
 
 #[test]
 fn unreliable_ordered_okay_network() {
-    unreliable_ordered_transfer(Some(OKAY), 50_000, 50);
+    unreliable_ordered_transfer(Some(OKAY), 50_000, 50, TIMEOUT);
 }
 
 #[test]
 fn unreliable_ordered_bad_network() {
-    unreliable_ordered_transfer(Some(BAD), 50_000, 50);
+    unreliable_ordered_transfer(Some(BAD), 50_000, 50, TIMEOUT);
 }
 
 #[test]
 fn unreliable_ordered_terrible_network() {
-    // About 150 of these small messages share a packet, and 70 % of the packets are lost.
-    unreliable_ordered_transfer(Some(TERRIBLE), 50_000, 5_000);
+    // Both directions lose 70% of packets, so the default timeout can expire between ACKs
+    unreliable_ordered_transfer(Some(TERRIBLE), 50_000, 5_000, Duration::from_secs(60));
 }

@@ -37,6 +37,9 @@ impl Received {
 
     /// Whether `pn` is new: neither seen nor too old.
     pub fn is_new(&self, pn: u64) -> bool {
+        if pn > super::packet::MAX_PACKET_NUMBER {
+            return false;
+        }
         match self.largest {
             None => true,
             Some(largest) if pn > largest => true,
@@ -46,6 +49,9 @@ impl Received {
 
     /// Records a new `pn` (see `is_new`).
     pub fn insert(&mut self, pn: u64) {
+        if !self.is_new(pn) {
+            return;
+        }
         match self.largest {
             Some(largest) if pn <= largest => {
                 let offset = largest - pn;
@@ -103,7 +109,7 @@ impl Received {
             if offset >= WINDOW || offset > largest {
                 return None;
             }
-            let end = self.next(offset, false).min(largest + 1);
+            let end = self.next(offset, false).min(largest.saturating_add(1));
             let range = largest - (end - 1)..=largest - offset;
             offset = self.next(end, true);
             Some(range)
@@ -137,7 +143,7 @@ impl AckState {
         let in_order = self
             .received
             .largest()
-            .is_none_or(|largest| pn == largest + 1);
+            .is_none_or(|largest| Some(pn) == largest.checked_add(1));
         if self.received.largest().is_none_or(|largest| pn > largest) {
             self.largest_received_at = Some(now);
         }
@@ -195,5 +201,38 @@ impl AckState {
         self.pending = false;
         self.deadline = None;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_number_domain_and_ack_ranges_are_bounded() {
+        let mut received = Received::default();
+        assert!(!received.is_new(u64::MAX));
+        received.insert(u64::MAX);
+        assert!(received.ranges().next().is_none());
+        let max = super::super::packet::MAX_PACKET_NUMBER;
+        received.insert(max - 2);
+        received.insert(max);
+        assert_eq!(
+            received.ranges().collect::<Vec<_>>(),
+            [max..=max, max - 2..=max - 2]
+        );
+        let mut bytes = [0; 1200];
+        let mut w = Writer::new(&mut bytes);
+        assert!(frame::write_ack(
+            &mut w,
+            0,
+            &[(max, max), (max - 2, max - 2)],
+            &[]
+        ));
+        let len = w.len();
+        assert!(matches!(
+            frame::parse(&mut crate::common::codec::Reader::new(&bytes[..len])).unwrap(),
+            Some(frame::Frame::Ack(_))
+        ));
     }
 }

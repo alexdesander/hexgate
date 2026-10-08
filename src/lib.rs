@@ -52,12 +52,12 @@
 //! while let Some(event) = server.try_next()? {
 //!     match event {
 //!         server::Event::Connected(addr, name) => println!("{name} joined from {addr}"),
-//!         server::Event::Received(addr, message) => server.send(addr, Channel::Reliable(0), message)?,
+//!         server::Event::Received(addr, _, message) => server.send(addr, Channel::Reliable(0), message)?,
 //!         _ => {}
 //!     }
 //! }
 //! while let Some(event) = client.try_next()? {
-//!     if let client::Event::Received(message) = event {
+//!     if let client::Event::Received(_, message) = event {
 //!         println!("echo: {message:?}");
 //!     }
 //! }
@@ -73,30 +73,33 @@
 //! thread. `Server` and `Client` are cheap handles (`Clone`, `Send`, `Sync`)
 //! that talk to the network thread through channels, so they can be used from any thread.
 //! Dropping the last handle closes the connections gracefully (see `close_linger`) and joins the
-//! threads.
+//! network threads. A blocked authenticator or resolver can outlive the handle; late results
+//! are discarded.
 //!
 //! # Congestion control
 //!
-//! Each connection sends at the rate its congestion controller allows (see
-//! [`CongestionConfig`]). The controller keeps the queues in the network near empty: it sends
-//! in short paced bursts, measures from the acknowledgements' receive timestamps how fast the
-//! bottleneck delivered them, and backs off within a few bursts when it overloads the path.
-//! Unreliable messages go first and are dropped when they waited longer than
-//! `unreliable_max_age`, instead of arriving late.
+//! All channels share a paced congestion window (see [`CongestionConfig`]). The controller
+//! adjusts the window using standing round-trip delay and loss. Channel priorities control
+//! which messages use that shared budget; equal priorities receive weighted byte service.
+//! Unreliable freshness starts at application submission, including time spent connecting.
 //!
 //! Games that call `flush()` at the end of every tick send each tick's messages as one burst,
-//! and can ask `budget_for(tick)` how many bytes the next tick may send without queueing.
+//! and can ask `gross_send_budget(tick)` for an approximate gross packet budget for the next tick.
 //! `stats()` tells the round-trip time, queueing delay, send rate and whether the connection
 //! is congested.
 //!
 //! # Backpressure
 //!
-//! Events are queued for the app. Connection events are always delivered; received messages
-//! only while fewer than `max_events` (65536 by default) events and 64 MiB of messages (at least
-//! 4 × `max_recv_msg_size`) are queued. Above that, unreliable messages are dropped and reliable
-//! packets stay unacknowledged until the app catches up, so the peer resends them. Sent reliable
-//! messages are queued without a limit and leave at the congestion controller's rate;
-//! [`Stats::queued_bytes`] tells how much is waiting.
+//! Message and send-receipt events share the `max_events` limit (65536 by default) and a
+//! 64 MiB payload limit (at least 4 × `max_recv_msg_size`). Reliable channels advertise receive
+//! credit and pause independently when delivery is blocked; polling resumes their progress.
+//! Unreliable messages may be dropped when the app queue is full. Connection events are always
+//! delivered.
+//!
+//! [`SendQueueLimits`] bounds outgoing buffers and message counts before worker submission.
+//! Full command or message queues return [`error::SendError::Backpressure`]. Broadcast admission
+//! succeeds for all selected connections or none. [`Stats::queued_bytes`] is an observation;
+//! `gross_send_budget` is a shared rate hint, neither reserves payload credit.
 //!
 //! # Size limits
 //!
@@ -123,7 +126,8 @@
 //!   storing it. Limit failed attempts per account in the authenticator.
 //! - **Traffic.** After the handshake, every packet is encrypted and authenticated with
 //!   AES-256-GCM or ChaCha20-Poly1305 ([`Cipher`]), with one key per direction and the packet
-//!   number as nonce. Replayed and duplicated packets are dropped. There is no rekeying.
+//!   number as nonce. Replayed and duplicated packets are dropped. Sessions close after at most
+//!   2²² encrypted packets per direction or failed authentication attempts; reconnect for fresh keys.
 //! - Keep the server's `secret_key` and `auth_salt` secret and stable, see [`keys`].
 
 #![warn(missing_docs)]
@@ -141,7 +145,7 @@ macro_rules! log {
 pub mod bench;
 pub mod client;
 mod common;
-#[cfg(fuzzing)]
+#[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod fuzz;
 pub mod server;
@@ -151,8 +155,9 @@ pub use common::{
     channel::{Channel, ChannelConfiguration},
     congestion::{Congestion, CongestionConfig},
     error, fingerprint, keys,
+    send::{SendOptions, SendOutcome, SendQueueLimits},
     socket::sim::{self, NetworkSimulator, Simulator},
-    stats::Stats,
+    stats::{ChannelStats, Stats},
     AllowedClientVersions, Cipher, ClientVersion,
 };
 pub use server::{Authenticator, Server};

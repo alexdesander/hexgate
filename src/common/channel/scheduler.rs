@@ -16,8 +16,7 @@ pub struct ChannelConfiguration {
     /// One weight per `Channel::Reliable` channel (at most 256).
     pub weights_reliable: Vec<u16>,
     /// Unreliable messages that waited this long for the send rate are dropped instead of
-    /// sent late (100 ms by default), except the newest one of each channel. A message that
-    /// started to go out as fragments is finished.
+    /// sent late (100 ms by default). A message that started to go out as fragments is finished
     pub unreliable_max_age: Duration,
 }
 
@@ -60,14 +59,13 @@ impl ChannelConfiguration {
     }
 }
 
-/// Self-clocked fair queueing over channel slots (0: unreliable, then unreliable ordered, then
-/// reliable). The next frame of a sendable slot gets the finish tag
-/// `virtual_time + size / weight` once; the smallest tag is sent next and advances the virtual
-/// time.
+/// Weighted service accounting in bytes actually written
 pub(crate) struct Scheduler {
     weights: Vec<u16>,
     tags: Vec<Option<u64>>,
     virtual_time: u64,
+    priorities: Vec<i8>,
+    priority_bytes: usize,
 }
 
 impl Scheduler {
@@ -78,6 +76,8 @@ impl Scheduler {
             .collect();
         Self {
             tags: vec![None; weights.len()],
+            priorities: vec![0; weights.len()],
+            priority_bytes: 0,
             weights,
             virtual_time: 0,
         }
@@ -87,9 +87,20 @@ impl Scheduler {
         self.weights.len()
     }
 
-    pub fn tag(&mut self, slot: usize, size: usize) -> u64 {
-        let finish = self.virtual_time + ((size as u64) << 16) / self.weights[slot] as u64;
-        *self.tags[slot].get_or_insert(finish)
+    pub fn tag(&mut self, slot: usize) -> u64 {
+        *self.tags[slot].get_or_insert(self.virtual_time)
+    }
+
+    pub fn set_priority(&mut self, slot: usize, priority: i8) {
+        self.priorities[slot] = priority;
+    }
+
+    pub fn priority(&self, slot: usize) -> i8 {
+        if self.priority_bytes >= 16 << 10 {
+            0
+        } else {
+            self.priorities[slot]
+        }
     }
 
     /// The slot has nothing to send right now.
@@ -97,14 +108,20 @@ impl Scheduler {
         self.tags[slot] = None;
     }
 
-    pub fn served(&mut self, slot: usize) {
-        if let Some(tag) = self.tags[slot].take() {
-            self.virtual_time = tag;
+    pub fn served(&mut self, slot: usize, bytes: usize) {
+        if self.priority_bytes >= 16 << 10 {
+            self.priority_bytes = 0;
+        } else {
+            self.priority_bytes += bytes;
         }
+        let start = self.tags[slot].unwrap_or(self.virtual_time);
+        self.virtual_time = self.virtual_time.max(start);
+        self.tags[slot] = Some(start + ((bytes as u64) << 16) / u64::from(self.weights[slot]));
     }
 
     /// No slot is backlogged, so the virtual time can restart (keeps it from overflowing).
     pub fn reset(&mut self) {
         self.virtual_time = 0;
+        self.priority_bytes = 0;
     }
 }

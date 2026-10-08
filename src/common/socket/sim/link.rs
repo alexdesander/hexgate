@@ -66,9 +66,9 @@ pub struct Jitter {
     pub distribution: JitterDistribution,
     /// The mean extra delay.
     pub mean: Duration,
-    /// How long the path's delay stays similar: the previous jitter is weighted with
-    /// `exp(-elapsed / correlation)`. Zero draws every packet's jitter independently, which
-    /// makes packets sent close together queue behind the slowest of them.
+    /// Retain the previous jitter with probability `exp(-elapsed / correlation)`, otherwise
+    /// draw from the configured distribution, preserving its variance at every packet rate
+    /// Zero draws independently; the default ordering still holds back overtaking packets
     pub correlation: Duration,
 }
 
@@ -238,7 +238,7 @@ impl Link {
             epoch: now,
             last_now: now,
             bad_state: false,
-            jitter: (0.0, now),
+            jitter: None,
             queue,
             spikes,
             stalls,
@@ -282,7 +282,7 @@ struct LinkState {
     last_now: Instant,
     bad_state: bool,
     /// The previous jitter in seconds and when it was drawn, for the correlation.
-    jitter: (f64, Instant),
+    jitter: Option<(f64, Instant)>,
     queue: Option<Queue>,
     spikes: Option<Schedule>,
     stalls: Option<Schedule>,
@@ -416,14 +416,18 @@ impl LinkState {
                 0.25 * normal + 0.75 * pareto(&mut self.rng)
             }
         };
-        let (previous, at) = self.jitter;
+        let (previous, at) = self.jitter.unwrap_or((sample, now));
         let elapsed = now.saturating_duration_since(at).as_secs_f64();
         let weight = match jitter.correlation.as_secs_f64() {
             0.0 => 0.0,
             correlation => (-elapsed / correlation).exp(),
         };
-        let value = weight * previous + (1.0 - weight) * sample;
-        self.jitter = (value, now);
+        let value = if self.rng.gen::<f64>() < weight {
+            previous
+        } else {
+            sample
+        };
+        self.jitter = Some((value, now));
         Duration::from_secs_f64(value.clamp(0.0, FAR_FUTURE.as_secs_f64()))
     }
 }
@@ -465,4 +469,70 @@ impl Schedule {
 fn exponential(mean: Duration, rng: &mut Xoshiro256PlusPlus) -> Duration {
     let sample: f64 = Exp1.sample(rng);
     mean.mul_f64(sample).min(FAR_FUTURE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_preserves_moments_at_different_packet_rates() {
+        let mean = 0.01;
+        for (distribution, variance) in [
+            (JitterDistribution::Uniform, mean * mean / 3.0),
+            (
+                JitterDistribution::Normal,
+                mean * mean * (std::f64::consts::PI / 2.0 - 1.0),
+            ),
+            (JitterDistribution::Exponential, mean * mean),
+        ] {
+            for cadence_us in [100, 1000, 20_000] {
+                let (mut sum, mut squares, mut covariance, mut count) = (0.0, 0.0, 0.0, 0);
+                let lag = 20_000 / cadence_us;
+                for seed in 1..=4 {
+                    let link = Link::new(
+                        LinkConfig {
+                            jitter: Some(Jitter {
+                                distribution,
+                                mean: Duration::from_secs_f64(mean),
+                                correlation: Duration::from_millis(20),
+                            }),
+                            ..LinkConfig::default()
+                        },
+                        seed,
+                    );
+                    let mut state = link.state();
+                    let epoch = state.epoch;
+                    let mut samples = Vec::new();
+                    for i in 0..100_000 {
+                        let value = state
+                            .jitter(epoch + Duration::from_micros(i * cadence_us))
+                            .as_secs_f64();
+                        sum += value;
+                        squares += (value - mean).powi(2);
+                        if i >= lag {
+                            covariance += (value - mean) * (samples[(i - lag) as usize] - mean);
+                            count += 1;
+                        }
+                        samples.push(value);
+                    }
+                }
+                let observed_mean = sum / 400_000.0;
+                let observed_variance = squares / 400_000.0;
+                let correlation = covariance / f64::from(count) / observed_variance;
+                assert!(
+                    (observed_mean / mean - 1.0).abs() < 0.1,
+                    "{distribution:?}, {cadence_us} us: mean {observed_mean}"
+                );
+                assert!(
+                    (observed_variance.sqrt() / variance.sqrt() - 1.0).abs() < 0.12,
+                    "{distribution:?}, {cadence_us} us: variance {observed_variance}"
+                );
+                assert!(
+                    (correlation - (-1.0_f64).exp()).abs() < 0.08,
+                    "{distribution:?}, {cadence_us} us: correlation {correlation}"
+                );
+            }
+        }
+    }
 }

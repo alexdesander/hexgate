@@ -74,6 +74,12 @@ impl TooLarge {
 /// Why a message couldn't be queued.
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
+    /// The command queue or outgoing connection/channel limit is full
+    #[error("the outgoing queue is full")]
+    Backpressure,
+    /// Deadlines and replacement apply only to unreliable messages
+    #[error("deadlines and replacement require an unreliable channel")]
+    InvalidOptions,
     /// The message exceeds `max_send_msg_size`.
     #[error("message too large: {0}")]
     MessageTooLarge(TooLarge),
@@ -92,6 +98,9 @@ pub enum SendError {
 /// An invalid builder setting.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// Every send queue limit must be positive
+    #[error("send queue limits must be greater than zero")]
+    InvalidQueueLimits,
     /// A `ChannelConfiguration` weight is 0.
     #[error("channel weights must be greater than zero")]
     ZeroChannelWeight,

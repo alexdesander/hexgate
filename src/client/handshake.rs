@@ -4,11 +4,12 @@
 
 use std::{
     io::{self, ErrorKind},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
 use argon2::{Argon2, Params};
-use crossbeam::channel::Receiver;
+use crossbeam_channel::Receiver;
 use ed25519_dalek::VerifyingKey;
 use mio::{Events, Poll};
 use rand::thread_rng;
@@ -51,6 +52,7 @@ pub(super) struct Link<'a> {
     pub cmds: &'a Receiver<Cmd>,
     /// Run once connected.
     pub pending: Vec<Cmd>,
+    pub cancelled: &'a AtomicBool,
 }
 
 impl Handshake {
@@ -217,6 +219,7 @@ impl Link<'_> {
         let deadline = Instant::now() + timeout;
         let mut resend_interval = HANDSHAKE_RESEND_INTERVAL;
         let mut resend_at = Instant::now();
+        let mut receive_pending = false;
         loop {
             self.take_cmds()?;
             self.socket.flush();
@@ -230,7 +233,12 @@ impl Link<'_> {
                 resend_at = now + resend_interval;
                 resend_interval = (resend_interval * 2).min(MAX_HANDSHAKE_RESEND_INTERVAL);
             }
-            while let Some((size, _)) = self.socket.recv_from(&mut buf)? {
+            for _ in 0..128 {
+                let Some((size, _)) = self.socket.recv_from(&mut buf)? else {
+                    receive_pending = false;
+                    break;
+                };
+                receive_pending = true;
                 if (1..=1200).contains(&size) {
                     if let Some(result) = parse(&mut buf[..size]) {
                         return result.map(Some);
@@ -241,6 +249,11 @@ impl Link<'_> {
                 .min(deadline)
                 .min(self.socket.next_deadline().unwrap_or(deadline))
                 .saturating_duration_since(Instant::now());
+            let wait = if receive_pending || !self.cmds.is_empty() {
+                Duration::ZERO
+            } else {
+                wait
+            };
             match self.poll.poll(&mut events, Some(wait)) {
                 Err(e) if e.kind() != ErrorKind::Interrupted => return Err(e.into()),
                 _ => {}
@@ -251,10 +264,34 @@ impl Link<'_> {
     /// A disconnect cancels the handshake, stats aren't available yet (`Client::stats` returns
     /// `None`), everything else waits for the connection.
     fn take_cmds(&mut self) -> Result<(), ConnectError> {
-        for cmd in self.cmds.try_iter() {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(ConnectError::Cancelled);
+        }
+        for cmd in self.cmds.try_iter().take(256) {
             match cmd {
                 Cmd::Disconnect(_) => return Err(ConnectError::Cancelled),
-                Cmd::Stats(_) => {}
+                Cmd::Stats(_) | Cmd::ChannelStats(_, _) => {}
+                Cmd::SetSimulator(simulator) => {
+                    self.pending.retain(|cmd| !matches!(cmd, Cmd::SetSimulator(_)));
+                    self.pending.push(Cmd::SetSimulator(simulator));
+                }
+                Cmd::Flush => {
+                    if !self.pending.iter().rev().take_while(|cmd| !matches!(cmd, Cmd::Send(..)))
+                        .any(|cmd| matches!(cmd, Cmd::Flush)) {
+                        self.pending.push(Cmd::Flush);
+                    }
+                }
+                Cmd::SetPriority(channel, priority) => {
+                    self.pending.retain(|cmd| !matches!(cmd, Cmd::SetPriority(previous, _) if *previous == channel));
+                    self.pending.push(Cmd::SetPriority(channel, priority));
+                }
+                Cmd::ResetChannel(channel) => {
+                    if !self.pending.iter().rev()
+                        .take_while(|cmd| !matches!(cmd, Cmd::Send(crate::common::channel::Channel::Reliable(previous), _) if *previous == channel))
+                        .any(|cmd| matches!(cmd, Cmd::ResetChannel(previous) if *previous == channel)) {
+                        self.pending.push(Cmd::ResetChannel(channel));
+                    }
+                }
                 cmd => self.pending.push(cmd),
             }
         }

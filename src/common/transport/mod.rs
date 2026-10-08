@@ -16,13 +16,15 @@ use frame::Frame;
 use recovery::{History, Rtt, SentPacket, State};
 
 use super::{
-    channel::{Channel, ChannelConfiguration, Channels, StreamFrames},
+    channel::{Channel, ChannelConfiguration, Channels, SendResult, StreamFrames},
     codec::{Reader, Writer},
     congestion::{CongestionConfig, Controller, SendPermit, SentInfo},
     crypto::Crypto,
     error::ProtocolViolation,
+    events::DeliveryBudget,
     packets::PacketError,
-    stats::Stats,
+    send::{Message, SendOutcome},
+    stats::{ChannelStats, Stats},
 };
 
 pub mod ack;
@@ -41,6 +43,11 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 /// With `flush()`, queued messages wait for the next flush at most this many tick intervals.
 const CORK_TICKS: u32 = 2;
 const MAX_CORK: Duration = Duration::from_millis(100);
+// Below RFC 9001 section 6.6 limits for every supported cipher
+const MAX_KEY_PACKETS: u64 = 1 << 22;
+const MAX_AUTH_FAILURES: u64 = 1 << 22;
+const KEY_LIMIT_REASON: &[u8] = b"Session key limit; reconnect";
+const HISTORY_LIMIT_REASON: &[u8] = b"Recovery history limit; reconnect";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -53,7 +60,8 @@ pub(crate) struct Config {
 /// What a received packet produced.
 #[derive(Debug)]
 pub(crate) enum Output {
-    Message(Vec<u8>),
+    Message(Channel, Vec<u8>),
+    SendResult(u64, SendOutcome),
     /// The peer closed the connection.
     Closed(Vec<u8>),
     Violation(ProtocolViolation),
@@ -92,11 +100,16 @@ pub(crate) struct Connection {
     ping: bool,
     /// `flush()` was used: new messages wait for the next flush.
     corked: bool,
+    staged: Vec<(Channel, Message)>,
+    send_results: Vec<SendResult>,
     /// When the oldest message waiting for a flush was queued, `None` once flushed.
     cork_since: Option<Instant>,
     close: Option<Close>,
     /// The peer closed: acknowledge its CLOSE once.
     final_ack: bool,
+    auth_failures: u64,
+    key_exhausted: bool,
+    limit_closed: Option<&'static [u8]>,
 }
 
 impl Connection {
@@ -116,9 +129,14 @@ impl Connection {
             timeout: config.timeout,
             ping: false,
             corked: false,
+            staged: Vec::new(),
+            send_results: Vec::new(),
             cork_since: None,
             close: None,
             final_ack: false,
+            auth_failures: 0,
+            key_exhausted: false,
+            limit_closed: None,
         }
     }
 
@@ -135,13 +153,89 @@ impl Connection {
     }
 
     /// Queues a message (dropped while closing).
+    #[cfg(any(test, feature = "bench", fuzzing))]
     pub fn push(&mut self, channel: Channel, message: Rc<Vec<u8>>, now: Instant) {
+        self.push_message(channel, Message::untracked(message, now));
+    }
+
+    pub fn push_message(&mut self, channel: Channel, message: Message) {
         if self.close.is_some() {
+            if let Some(receipt) = message.options.receipt {
+                self.send_results.push((
+                    receipt,
+                    SendOutcome::Dropped,
+                    message.reservation.clone(),
+                ));
+            }
             return;
         }
-        self.channels.push(channel, message, now);
         if self.corked {
-            self.cork_since.get_or_insert(now);
+            self.cork_since.get_or_insert(message.submitted);
+            if message.options.replace {
+                self.staged.retain(|(queued_channel, queued)| {
+                    if *queued_channel != channel {
+                        return true;
+                    }
+                    if let Some(receipt) = queued.options.receipt {
+                        self.send_results.push((
+                            receipt,
+                            SendOutcome::Dropped,
+                            queued.reservation.clone(),
+                        ));
+                    }
+                    false
+                });
+            }
+            self.staged.push((channel, message));
+        } else {
+            self.channels.push_message(channel, message);
+        }
+    }
+
+    pub fn reset_channel(&mut self, channel: u8) {
+        self.staged.retain(|(queued_channel, message)| {
+            if *queued_channel != Channel::Reliable(channel) {
+                return true;
+            }
+            if let Some(receipt) = message.options.receipt {
+                self.send_results.push((
+                    receipt,
+                    SendOutcome::Dropped,
+                    message.reservation.clone(),
+                ));
+            }
+            false
+        });
+        self.channels.reset_channel(channel);
+    }
+
+    pub fn set_priority(&mut self, channel: Channel, priority: i8) {
+        self.channels.set_priority(channel, priority);
+    }
+
+    pub fn channel_stats(&self, channel: Channel, now: Instant) -> Option<ChannelStats> {
+        let mut stats = self.channels.stats(channel, now, self.rate())?;
+        for (_, message) in self.staged.iter().filter(|(queued, _)| *queued == channel) {
+            stats.unsent_bytes += message.len();
+            let age = now.saturating_duration_since(message.submitted);
+            stats.oldest_queued = Some(stats.oldest_queued.map_or(age, |oldest| oldest.max(age)));
+        }
+        stats.send_delay = (self.rate() > 0.0)
+            .then(|| Duration::from_secs_f64(stats.unsent_bytes as f64 / self.rate()));
+        Some(stats)
+    }
+
+    pub fn take_send_results(&mut self, budget: &mut DeliveryBudget, out: &mut Vec<Output>) {
+        self.channels.take_results(&mut self.send_results);
+        let take = budget.messages.min(self.send_results.len());
+        budget.messages -= take;
+        out.extend(
+            self.send_results
+                .drain(..take)
+                .map(|(cookie, outcome, _)| Output::SendResult(cookie, outcome)),
+        );
+        if let Some(reason) = self.limit_closed.take() {
+            out.push(Output::Closed(reason.to_vec()));
         }
     }
 
@@ -149,6 +243,13 @@ impl Connection {
     /// wait for the next flush.
     pub fn flush(&mut self) {
         self.corked = true;
+        self.release_staged();
+    }
+
+    fn release_staged(&mut self) {
+        for (channel, message) in self.staged.drain(..) {
+            self.channels.push_message(channel, message);
+        }
         self.cork_since = None;
     }
 
@@ -171,13 +272,17 @@ impl Connection {
                 reason,
                 deadline: now + linger,
             });
-            self.cork_since = None;
+            self.release_staged();
         }
     }
 
     /// A packet with only a CLOSE frame, for closing without waiting (timeouts, violations).
     pub fn close_now(&mut self, reason: &[u8], now: Instant, buf: &mut [u8]) -> usize {
         let pn = self.history.next_pn();
+        if pn >= MAX_KEY_PACKETS || self.history.is_full() {
+            self.close = Some(Close::Closed);
+            return 0;
+        }
         let header = packet::write_header(buf, pn, true);
         let mut w = Writer::new(&mut buf[header..packet::MAX_DATAGRAM - packet::TAG_LEN]);
         frame::write_close(&mut w, &reason[..reason.len().min(MAX_REASON_SIZE)]);
@@ -199,18 +304,34 @@ impl Connection {
 
     /// Handles a datagram. `accept_data`: whether messages can be taken (else data packets
     /// are left unacknowledged, so the peer resends their reliable data).
-    pub fn handle(
+    pub fn handle_with_budget(
         &mut self,
         now: Instant,
         datagram: &mut [u8],
-        accept_data: bool,
+        budget: &mut DeliveryBudget,
         out: &mut Vec<Output>,
     ) -> Result<(), PacketError> {
         let header = packet::parse_header(datagram)?;
         if !self.acks.received.is_new(header.pn) {
             return Err(PacketError::Replay);
         }
-        let payload = packet::open(&self.crypto, &header, datagram)?;
+        if self.key_exhausted {
+            return Err(PacketError::Tag);
+        }
+        let payload = match packet::open(&self.crypto, &header, datagram) {
+            Ok(payload) => payload,
+            Err(error) => {
+                if error == PacketError::Tag {
+                    self.auth_failures += 1;
+                    self.key_exhausted = self.auth_failures >= MAX_AUTH_FAILURES;
+                }
+                return Err(error);
+            }
+        };
+        if header.pn >= MAX_KEY_PACKETS {
+            self.key_exhausted = true;
+            return Err(PacketError::Malformed);
+        }
         let (mut eliciting, mut data, mut close) = (false, false, false);
         let mut r = Reader::new(payload);
         while let Some(frame) = frame::parse(&mut r)? {
@@ -218,7 +339,7 @@ impl Connection {
             data |= matches!(frame, Frame::Unreliable { .. } | Frame::Reliable { .. });
             close |= matches!(frame, Frame::Close(_));
         }
-        let accept = accept_data && self.close.is_none();
+        let accept = self.close.is_none();
         let record = accept || !data || close;
         if record {
             self.acks.on_packet(
@@ -234,9 +355,15 @@ impl Connection {
         while let Some(frame) = frame::parse(&mut r)? {
             let result = match frame {
                 Frame::Ping => Ok(()),
+                Frame::Credit { channel, limit } => self.channels.on_credit(channel, limit),
+                Frame::Reset { channel, offset } => self.channels.on_reset(channel, offset),
                 Frame::Ack(ack) => {
-                    self.on_ack(now, &ack);
-                    Ok(())
+                    if ack.largest >= self.history.next_pn() {
+                        Err(ProtocolViolation::Malformed)
+                    } else {
+                        self.on_ack(now, &ack);
+                        Ok(())
+                    }
                 }
                 Frame::Close(reason) => {
                     out.push(Output::Closed(reason.to_vec()));
@@ -252,29 +379,69 @@ impl Connection {
                     data,
                 } => self
                     .channels
-                    .on_unreliable(channel, msg_id, fragment, data)
-                    .map(|message| out.extend(message.map(Output::Message))),
+                    .on_unreliable(now, channel, msg_id, fragment, data)
+                    .map(|message| {
+                        if let Some(message) = message {
+                            if budget.take(message.len()) {
+                                out.push(Output::Message(
+                                    channel.map_or(Channel::Unreliable, Channel::UnreliableOrdered),
+                                    message,
+                                ));
+                            }
+                        }
+                    }),
                 Frame::Reliable {
                     channel,
                     offset,
                     data,
-                } => self
-                    .channels
-                    .on_reliable(channel, offset, data, &mut |message| {
-                        out.push(Output::Message(message))
-                    }),
+                } => self.channels.on_reliable(channel, offset, data),
             };
             if let Err(violation) = result {
                 out.push(Output::Violation(violation));
                 return Ok(());
             }
         }
+        self.drain_received(budget, out);
         Ok(())
+    }
+
+    pub fn drain_received(&mut self, budget: &mut DeliveryBudget, out: &mut Vec<Output>) {
+        if self.close.is_some() {
+            return;
+        }
+        if let Err(error) = self
+            .channels
+            .drain_received(budget, &mut |channel, message| {
+                out.push(Output::Message(channel, message))
+            })
+        {
+            out.push(Output::Violation(error));
+        }
+    }
+
+    pub fn has_pending_delivery(&self) -> bool {
+        !self.send_results.is_empty()
+            || (self.close.is_none() && self.channels.has_pending_delivery())
+    }
+
+    #[cfg(any(test, feature = "bench"))]
+    pub fn handle(
+        &mut self,
+        now: Instant,
+        datagram: &mut [u8],
+        accept: bool,
+        out: &mut Vec<Output>,
+    ) -> Result<(), PacketError> {
+        let mut budget = DeliveryBudget::unlimited();
+        if !accept {
+            budget.messages = 0;
+        }
+        self.handle_with_budget(now, datagram, &mut budget, out)
     }
 
     fn on_ack(&mut self, now: Instant, ack: &frame::AckFrame) {
         for (pn, recv_us) in ack.timestamps() {
-            if let Some(packet) = self.history.get(pn).filter(|p| p.state != State::Control) {
+            if let Some(packet) = self.history.get(pn).filter(|p| p.state == State::InFlight) {
                 self.controller.on_timestamp(
                     (pn, packet.cc),
                     packet.time,
@@ -297,15 +464,19 @@ impl Connection {
             self.history
                 .on_ack_range(low, high, &mut acked, ack.largest, now, |pn, packet| {
                     channels.on_acked(&packet.frames);
-                    controller.on_acked(packet.cc, pn);
+                    if packet.state == State::InFlight {
+                        controller.on_acked(packet.cc, pn);
+                    }
                 });
         }
         if close_acked {
             self.close = Some(Close::Closed);
         }
         if let Some(sample) = acked.rtt_sample {
-            self.rtt.update(sample, Duration::from_micros(ack.delay_us));
-            self.controller.on_rtt(now, self.rtt.latest);
+            let adjusted = self
+                .rtt
+                .update(now, sample, Duration::from_micros(ack.delay_us));
+            self.controller.on_rtt(now, adjusted);
         }
         if acked.newly_acked > 0 {
             self.pto_count = 0;
@@ -335,6 +506,9 @@ impl Connection {
         if self.is_closed() {
             return None;
         }
+        if self.key_exhausted || self.channels.exhausted() || self.history.at_capacity() {
+            return Some(now);
+        }
         let mut next = self.last_received + self.timeout;
         let mut at = |deadline: Option<Instant>| {
             if let Some(deadline) = deadline {
@@ -343,6 +517,7 @@ impl Connection {
         };
         at(self.history.timeout(&self.rtt, self.pto_count));
         at(self.acks.deadline());
+        at(self.channels.deadline());
         at(Some(self.last_eliciting + self.keepalive()));
         match &self.close {
             Some(Close::Flushing { deadline, .. }) => at(Some(*deadline)),
@@ -358,14 +533,13 @@ impl Connection {
                         .map_or(MAX_CORK, |t| (t * CORK_TICKS).min(MAX_CORK)),
             ));
         }
-        if !self.corked(now) && self.channels.has_data(now) {
+        if self.channels.has_data(now) {
             match self
                 .controller
                 .permit(now, self.history.in_flight, &self.rtt)
             {
                 SendPermit::Now => at(Some(now)),
-                SendPermit::Realtime(_) if self.channels.has_realtime(now) => at(Some(now)),
-                SendPermit::Realtime(when) | SendPermit::At(when) => at(Some(when)),
+                SendPermit::At(when) => at(Some(when)),
                 SendPermit::Blocked => {}
             }
         }
@@ -374,6 +548,7 @@ impl Connection {
 
     /// Runs the timers. Returns true if the connection timed out.
     pub fn on_timeout(&mut self, now: Instant) -> bool {
+        self.channels.maintain(now);
         if now >= self.last_received + self.timeout {
             return true;
         }
@@ -404,12 +579,30 @@ impl Connection {
                 self.close = Some(Close::Closed);
             }
         }
-        self.controller.check_stall(now, &self.rtt);
+        self.controller
+            .maintain(now, self.history.in_flight, &self.rtt);
         false
     }
 
     /// The next packet to send, written to `buf` (at least `MAX_DATAGRAM` bytes).
     pub fn poll_transmit(&mut self, now: Instant, buf: &mut [u8]) -> Option<usize> {
+        if !self.is_closed() && self.history.at_capacity() {
+            self.limit_closed = Some(HISTORY_LIMIT_REASON);
+            self.key_exhausted = true;
+            return Some(self.close_now(HISTORY_LIMIT_REASON, now, buf));
+        }
+        if !self.is_closed()
+            && (self.key_exhausted
+                || self.channels.exhausted()
+                || self.history.next_pn() >= MAX_KEY_PACKETS - 1)
+        {
+            self.limit_closed = Some(KEY_LIMIT_REASON);
+            self.key_exhausted = true;
+            return Some(self.close_now(KEY_LIMIT_REASON, now, buf));
+        }
+        if !self.corked(now) {
+            self.release_staged();
+        }
         match &mut self.close {
             Some(Close::Closed) if self.final_ack => {
                 self.final_ack = false;
@@ -460,9 +653,7 @@ impl Connection {
 
         let probe = self.probes > 0;
         let ack_due = self.acks.deadline().is_some_and(|at| at <= now);
-        let (data, realtime) = if self.corked(now) {
-            (false, false)
-        } else if probe {
+        let (data, realtime) = if probe {
             (self.channels.has_data(now), false)
         } else {
             match self
@@ -470,7 +661,6 @@ impl Connection {
                 .permit(now, self.history.in_flight, &self.rtt)
             {
                 SendPermit::Now => (self.channels.has_data(now), false),
-                SendPermit::Realtime(_) => (self.channels.has_realtime(now), true),
                 SendPermit::At(_) | SendPermit::Blocked => (false, false),
             }
         };
@@ -512,9 +702,6 @@ impl Connection {
             self.last_eliciting = now;
             self.ping = false;
             self.probes = self.probes.saturating_sub(1);
-        }
-        if !self.channels.has_data(now) {
-            self.cork_since = None;
         }
         self.record(now, size, eliciting, frames, cc);
         Some(packet::seal(&self.crypto, pn, buf, header, end))
@@ -580,11 +767,163 @@ impl Connection {
             queue_delay: self.controller.queue_delay(),
             send_rate: self.controller.rate() as u64,
             delivery_rate: self.controller.delivery_rate() as u64,
-            utilization: self.controller.utilization() as f32,
             packet_loss: self.controller.loss() as f32,
             congestion: self.controller.congestion(),
-            queued_bytes: self.channels.queued_bytes(),
+            queued_bytes: self.channels.queued_bytes()
+                + self.staged.iter().map(|(_, m)| m.len()).sum::<usize>(),
             expired_messages: self.channels.expired(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{
+        send::{Admission, SendOptions, SendQueueLimits},
+        Cipher,
+    };
+    use std::sync::Arc;
+    use x25519_dalek::{PublicKey, ReusableSecret};
+
+    fn pair(now: Instant) -> (Connection, Connection) {
+        let client = ReusableSecret::random_from_rng(rand::thread_rng());
+        let server = ReusableSecret::random_from_rng(rand::thread_rng());
+        let config = Config {
+            channels: ChannelConfiguration::default(),
+            congestion: CongestionConfig::default(),
+            max_recv_msg_size: 1 << 20,
+            timeout: Duration::from_secs(10),
+        };
+        let make = |secret: &ReusableSecret, peer: &ReusableSecret, is_server| {
+            Connection::new(
+                Crypto::new(
+                    secret.diffie_hellman(&PublicKey::from(peer)),
+                    [0; 32],
+                    is_server,
+                    Cipher::AES256GCM,
+                ),
+                &config,
+                now,
+            )
+        };
+        (make(&client, &server, false), make(&server, &client, true))
+    }
+
+    #[test]
+    fn key_limit_reserves_one_close_and_stops_encryption() {
+        let now = Instant::now();
+        let (mut client, mut server) = pair(now);
+        client.history.set_next_pn_for_test(MAX_KEY_PACKETS - 1);
+        let mut packet = [0; 1200];
+        let len = client.poll_transmit(now, &mut packet).unwrap();
+        assert!(client.is_closed());
+        assert!(client.poll_transmit(now, &mut packet).is_none());
+        let mut output = Vec::new();
+        server
+            .handle(now, &mut packet[..len], true, &mut output)
+            .unwrap();
+        assert!(matches!(&output[..], [Output::Closed(reason)] if reason == KEY_LIMIT_REASON));
+        output.clear();
+        client.take_send_results(&mut DeliveryBudget::unlimited(), &mut output);
+        assert!(matches!(&output[..], [Output::Closed(reason)] if reason == KEY_LIMIT_REASON));
+    }
+
+    #[test]
+    fn pinned_recovery_history_closes_with_a_bounded_local_resource_reason() {
+        let now = Instant::now();
+        let (mut client, _) = pair(now);
+        client.history.on_sent(SentPacket {
+            time: now,
+            size: 100,
+            state: State::InFlight,
+            frames: StreamFrames::default(),
+            cc: SentInfo::default(),
+        });
+        while !client.history.at_capacity() {
+            client.history.on_sent(SentPacket {
+                time: now,
+                size: 30,
+                state: State::Control,
+                frames: StreamFrames::default(),
+                cc: SentInfo::default(),
+            });
+        }
+        let mut packet = [0; 1200];
+        assert!(client.poll_transmit(now, &mut packet).is_some());
+        assert!(client.history.is_full());
+        assert!(client.poll_transmit(now, &mut packet).is_none());
+        let mut output = Vec::new();
+        client.take_send_results(&mut DeliveryBudget::unlimited(), &mut output);
+        assert!(matches!(&output[..], [Output::Closed(reason)] if reason == HISTORY_LIMIT_REASON));
+    }
+
+    #[test]
+    fn receipt_backpressure_remains_until_budgeted_feedback_is_taken() {
+        let now = Instant::now();
+        let (mut client, _) = pair(now);
+        let admission = Admission::new(SendQueueLimits {
+            max_messages: 1,
+            ..SendQueueLimits::default()
+        });
+        let reservation = admission.reserve(Channel::Unreliable, 10).unwrap();
+        client.push_message(
+            Channel::Unreliable,
+            Message {
+                data: Arc::new(vec![1; 10]),
+                submitted: now,
+                options: SendOptions {
+                    deadline: Some(now),
+                    receipt: Some(7),
+                    ..SendOptions::default()
+                },
+                reservation: Some(reservation),
+            },
+        );
+        let mut packet = [0; 1200];
+        assert!(client.poll_transmit(now, &mut packet).is_none());
+        let mut output = Vec::new();
+        client.take_send_results(
+            &mut DeliveryBudget {
+                messages: 0,
+                bytes: 0,
+                work: 0,
+            },
+            &mut output,
+        );
+        assert!(output.is_empty());
+        assert!(client.has_pending_delivery());
+        assert!(admission.reserve(Channel::Unreliable, 10).is_err());
+        client.take_send_results(&mut DeliveryBudget::unlimited(), &mut output);
+        assert!(matches!(
+            &output[..],
+            [Output::SendResult(7, SendOutcome::Dropped)]
+        ));
+        assert!(admission.reserve(Channel::Unreliable, 10).is_ok());
+    }
+
+    #[test]
+    fn future_ack_is_a_violation_without_acknowledging_payload() {
+        let now = Instant::now();
+        let (mut client, server) = pair(now);
+        client.push(Channel::Reliable(0), Rc::new(vec![1; 100]), now);
+        let mut packet = [0; 1200];
+        client.poll_transmit(now, &mut packet).unwrap();
+        let before = client.stats().queued_bytes;
+        let pn = 0;
+        let header = packet::write_header(&mut packet, pn, false);
+        let mut w = Writer::new(&mut packet[header..header + packet::capacity(pn)]);
+        assert!(frame::write_ack(&mut w, 0, &[(0, 1_000_000)], &[]));
+        let end = header + w.len();
+        let len = packet::seal(&server.crypto, pn, &mut packet, header, end);
+        let mut output = Vec::new();
+        client
+            .handle(now, &mut packet[..len], true, &mut output)
+            .unwrap();
+        assert!(matches!(
+            &output[..],
+            [Output::Violation(ProtocolViolation::Malformed)]
+        ));
+        assert_eq!(client.stats().queued_bytes, before);
     }
 }

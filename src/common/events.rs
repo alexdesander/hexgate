@@ -7,11 +7,37 @@ use std::sync::{
     Arc,
 };
 
-use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 
 use super::error::RecvError;
 
 const MAX_QUEUED_BYTES: usize = 64 << 20;
+
+pub(crate) struct DeliveryBudget {
+    pub messages: usize,
+    pub bytes: usize,
+    pub work: usize,
+}
+
+impl DeliveryBudget {
+    #[cfg(any(test, feature = "bench"))]
+    pub fn unlimited() -> Self {
+        Self {
+            messages: usize::MAX,
+            bytes: usize::MAX,
+            work: usize::MAX,
+        }
+    }
+
+    pub fn take(&mut self, bytes: usize) -> bool {
+        if self.messages == 0 || bytes > self.bytes {
+            return false;
+        }
+        self.messages -= 1;
+        self.bytes -= bytes;
+        true
+    }
+}
 
 pub(crate) trait Payload {
     fn payload_len(&self) -> usize;
@@ -59,10 +85,14 @@ impl<E: Payload> EventSender<E> {
         let _ = self.tx.send(Ok(event));
     }
 
-    /// When false, incoming payload packets are dropped: unreliable messages are lost, reliable
-    /// packets stay unacknowledged and are retransmitted by the peer.
-    pub fn has_room(&self) -> bool {
-        self.tx.len() < self.max_events && self.bytes.load(Ordering::Relaxed) < self.max_bytes
+    pub fn budget(&self) -> DeliveryBudget {
+        DeliveryBudget {
+            messages: self.max_events.saturating_sub(self.tx.len()).min(256),
+            bytes: self
+                .max_bytes
+                .saturating_sub(self.bytes.load(Ordering::Relaxed)),
+            work: 64 << 10,
+        }
     }
 
     /// Reports why the network thread stopped.

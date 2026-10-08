@@ -9,6 +9,7 @@ use std::{
     collections::BinaryHeap,
     net::SocketAddr,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -21,6 +22,8 @@ use crate::common::{
     codec::Writer,
     congestion::CongestionConfig,
     crypto::Crypto,
+    events::DeliveryBudget,
+    send::{Message, SendOptions, SendOutcome},
     socket::sim::{Fate, NetworkSimulator},
     stats::Stats,
     transport::{self, frame, packet, Connection, Output},
@@ -152,6 +155,7 @@ pub enum Side {
 #[derive(Debug)]
 pub enum Delivery {
     Message(Vec<u8>),
+    SendResult(u64, SendOutcome),
     Closed(Vec<u8>),
     TimedOut,
 }
@@ -225,6 +229,36 @@ impl Pairs {
         self.end(pair, side).connection.flush();
     }
 
+    pub fn send_with(
+        &mut self,
+        pair: usize,
+        from: Side,
+        channel: Channel,
+        message: Vec<u8>,
+        options: SendOptions,
+    ) {
+        let submitted = self.now;
+        self.end(pair, from).connection.push_message(
+            channel,
+            Message {
+                data: Arc::new(message),
+                submitted,
+                options,
+                reservation: None,
+            },
+        );
+    }
+
+    pub fn reset_channel(&mut self, pair: usize, side: Side, channel: u8) {
+        self.end(pair, side).connection.reset_channel(channel);
+    }
+
+    pub fn set_priority(&mut self, pair: usize, side: Side, channel: Channel, priority: i8) {
+        self.end(pair, side)
+            .connection
+            .set_priority(channel, priority);
+    }
+
     pub fn stats(&mut self, pair: usize, side: Side) -> Stats {
         self.end(pair, side).connection.stats()
     }
@@ -282,7 +316,10 @@ impl Pairs {
                 };
                 for output in self.outputs.drain(..) {
                     let delivery = match output {
-                        Output::Message(message) => Delivery::Message(message),
+                        Output::Message(_, message) => Delivery::Message(message),
+                        Output::SendResult(cookie, outcome) => {
+                            Delivery::SendResult(cookie, outcome)
+                        }
                         Output::Closed(reason) => Delivery::Closed(reason),
                         Output::Violation(violation) => panic!("{violation}"),
                     };
@@ -324,6 +361,24 @@ impl Pairs {
                             deliver(second, packet);
                         }
                     }
+                }
+                end.connection
+                    .take_send_results(&mut DeliveryBudget::unlimited(), &mut self.outputs);
+                for output in self.outputs.drain(..) {
+                    let side = if index % 2 == 0 {
+                        Side::Client
+                    } else {
+                        Side::Server
+                    };
+                    let delivery = match output {
+                        Output::Message(_, message) => Delivery::Message(message),
+                        Output::SendResult(cookie, outcome) => {
+                            Delivery::SendResult(cookie, outcome)
+                        }
+                        Output::Closed(reason) => Delivery::Closed(reason),
+                        Output::Violation(violation) => panic!("{violation}"),
+                    };
+                    on_delivery(index / 2, side, self.now, delivery);
                 }
             }
             if self.now >= until {

@@ -6,28 +6,31 @@
 //! packet arrives at most once (the transport's replay window), so unordered messages need no
 //! id unless they are fragmented.
 
+#[cfg(test)]
+use std::rc::Rc;
 use std::{
-    collections::VecDeque,
-    rc::Rc,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use super::SendResult;
 use crate::common::{
     codec::Writer,
     error::ProtocolViolation,
+    send::{Message, Reservation, SendOutcome},
     transport::frame::{self, Fragment},
 };
 
 /// Incomplete fragmented messages kept per channel; a newer one evicts the oldest.
 const MAX_ASSEMBLIES: usize = 4;
-/// Fragments of one message that may arrive out of order.
-const MAX_FRAGMENT_RANGES: usize = 64;
 /// A fragment is only started with at least this many bytes of room.
 const MIN_FRAGMENT: usize = 64;
+const ASSEMBLY_IDLE: Duration = Duration::from_secs(2);
+const ASSEMBLY_LIFETIME: Duration = Duration::from_secs(30);
 
 struct Queued {
-    message: Rc<Vec<u8>>,
-    queued_at: Instant,
+    message: Message,
     msg_id: u64,
     /// Bytes already sent as fragments.
     sent: usize,
@@ -40,6 +43,13 @@ pub enum Write {
     Idle,
 }
 
+struct Receipt {
+    cookie: u64,
+    remaining: usize,
+    complete: bool,
+    reservation: Option<Arc<Reservation>>,
+}
+
 pub struct UnreliableSend {
     channel: Option<u8>,
     queue: VecDeque<Queued>,
@@ -48,6 +58,8 @@ pub struct UnreliableSend {
     queued_bytes: usize,
     /// Messages dropped because they waited longer than `max_age`.
     pub expired: u64,
+    receipts: HashMap<u64, Receipt>,
+    results: Vec<SendResult>,
 }
 
 impl UnreliableSend {
@@ -59,14 +71,42 @@ impl UnreliableSend {
             max_age,
             queued_bytes: 0,
             expired: 0,
+            receipts: HashMap::new(),
+            results: Vec::new(),
         }
     }
 
+    #[cfg(test)]
     pub fn push(&mut self, message: Rc<Vec<u8>>, now: Instant) {
+        self.push_message(Message::untracked(message, now));
+    }
+
+    pub fn push_message(&mut self, message: Message) {
+        if message.options.replace {
+            let obsolete: Vec<_> = self
+                .queue
+                .iter()
+                .filter(|queued| queued.sent == 0)
+                .map(|queued| queued.msg_id)
+                .collect();
+            for id in obsolete {
+                self.drop_message(id);
+            }
+        }
+        if let Some(cookie) = message.options.receipt {
+            self.receipts.insert(
+                self.next_id,
+                Receipt {
+                    cookie,
+                    remaining: 0,
+                    complete: false,
+                    reservation: message.reservation.clone(),
+                },
+            );
+        }
         self.queued_bytes += message.len();
         self.queue.push_back(Queued {
             message,
-            queued_at: now,
             msg_id: self.next_id,
             sent: 0,
         });
@@ -77,18 +117,89 @@ impl UnreliableSend {
         self.queued_bytes
     }
 
-    /// Drops messages that waited too long to be started, except the newest one (the latest
-    /// state is worth sending late). Returns whether one is left.
+    pub fn unsent_bytes(&self) -> usize {
+        self.queue
+            .iter()
+            .map(|queued| queued.message.len() - queued.sent)
+            .sum()
+    }
+
+    pub fn oldest(&self) -> Option<Instant> {
+        self.queue.front().map(|queued| queued.message.submitted)
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        let queued = self.queue.front()?;
+        let age = (queued.sent == 0)
+            .then(|| queued.message.submitted.checked_add(self.max_age))
+            .flatten();
+        age.into_iter().chain(queued.message.options.deadline).min()
+    }
+
+    pub fn receipt(&self) -> Option<u64> {
+        self.queue
+            .front()
+            .filter(|queued| queued.message.options.receipt.is_some())
+            .map(|queued| queued.msg_id)
+    }
+
+    pub fn on_acked(&mut self, id: u64) {
+        if let Some(receipt) = self.receipts.get_mut(&id) {
+            receipt.remaining = receipt.remaining.saturating_sub(1);
+            if receipt.remaining == 0 && receipt.complete {
+                let receipt = self.receipts.remove(&id).unwrap();
+                self.results
+                    .push((receipt.cookie, SendOutcome::Acked, receipt.reservation));
+            }
+        }
+    }
+
+    pub fn on_lost(&mut self, id: u64) {
+        self.drop_message(id);
+    }
+
+    pub fn take_results(&mut self, out: &mut Vec<SendResult>) {
+        out.append(&mut self.results);
+    }
+
+    fn drop_message(&mut self, id: u64) {
+        if let Some(receipt) = self.receipts.remove(&id) {
+            self.results
+                .push((receipt.cookie, SendOutcome::Dropped, receipt.reservation));
+        }
+        self.queue.retain(|queued| {
+            if queued.msg_id == id {
+                self.queued_bytes -= queued.message.len();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn written(&mut self, id: u64, complete: bool) {
+        if let Some(receipt) = self.receipts.get_mut(&id) {
+            receipt.remaining += 1;
+            receipt.complete = complete;
+        }
+    }
+
+    /// Drops messages that expired before starting, and any past an explicit deadline
     pub fn ready(&mut self, now: Instant) -> bool {
         while let Some(queued) = self.queue.front() {
-            if queued.sent > 0
-                || self.queue.len() == 1
-                || now.saturating_duration_since(queued.queued_at) <= self.max_age
+            let deadline = queued
+                .message
+                .options
+                .deadline
+                .is_some_and(|deadline| now >= deadline);
+            if !deadline
+                && (queued.sent > 0
+                    || now.saturating_duration_since(queued.message.submitted) < self.max_age)
             {
                 return true;
             }
-            self.queued_bytes -= queued.message.len();
-            self.queue.pop_front();
+            let id = queued.msg_id;
+            self.drop_message(id);
             self.expired += 1;
         }
         false
@@ -97,7 +208,7 @@ impl UnreliableSend {
     /// Bytes the next frame would carry into an empty packet of `capacity`.
     pub fn next_size(&self, capacity: usize) -> usize {
         self.queue.front().map_or(0, |queued| {
-            (queued.message.len() - queued.sent).min(capacity)
+            (queued.message.len() - queued.sent).max(1).min(capacity)
         })
     }
 
@@ -110,8 +221,10 @@ impl UnreliableSend {
         let len = queued.message.len();
         if queued.sent == 0 {
             let header = frame::unreliable_header(self.channel, queued.msg_id, None);
-            if frame::fit(header, len, w.remaining()) == len {
+            if w.remaining() > header && frame::fit(header, len, w.remaining()) == len {
                 frame::write_unreliable(w, self.channel, queued.msg_id, None, &queued.message);
+                let id = queued.msg_id;
+                self.written(id, true);
                 self.pop();
                 return Write::Wrote;
             }
@@ -132,7 +245,10 @@ impl UnreliableSend {
         let data = &queued.message[queued.sent..queued.sent + take];
         frame::write_unreliable(w, self.channel, queued.msg_id, fragment, data);
         queued.sent += take;
-        if queued.sent == len {
+        let complete = queued.sent == len;
+        let id = queued.msg_id;
+        self.written(id, complete);
+        if complete {
             self.pop();
         }
         Write::Wrote
@@ -150,8 +266,19 @@ struct Assembly {
     total: usize,
     received: usize,
     buf: Vec<u8>,
-    /// Received byte ranges, to reject overlapping fragments.
-    ranges: Vec<(usize, usize)>,
+    coverage: Vec<u64>,
+    created: Instant,
+    updated: Instant,
+}
+
+impl Assembly {
+    fn allocated(&self) -> usize {
+        self.total + self.coverage.len() * 8
+    }
+
+    fn deadline(&self) -> Instant {
+        (self.created + ASSEMBLY_LIFETIME).min(self.updated + ASSEMBLY_IDLE)
+    }
 }
 
 pub struct UnreliableRecv {
@@ -179,13 +306,53 @@ impl UnreliableRecv {
         !self.ordered || self.last_delivered.is_none_or(|last| msg_id > last)
     }
 
+    pub fn expire(&mut self, now: Instant, budget: &mut AssemblyBudget) {
+        self.assemblies.retain(|assembly| {
+            let keep = now < assembly.deadline();
+            if !keep {
+                budget.left += assembly.allocated();
+            }
+            keep
+        });
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.assemblies.iter().map(Assembly::deadline).min()
+    }
+
+    pub fn oldest(&self) -> Option<Instant> {
+        self.assemblies
+            .iter()
+            .map(|assembly| assembly.created)
+            .min()
+    }
+
+    pub fn allocated(&self) -> usize {
+        self.assemblies.iter().map(Assembly::allocated).sum()
+    }
+
+    pub fn reclaim(&mut self, budget: &mut AssemblyBudget) {
+        if let Some(index) = (0..self.assemblies.len()).min_by_key(|&i| self.assemblies[i].created)
+        {
+            budget.left += self.assemblies.swap_remove(index).allocated();
+        }
+    }
+
+    pub fn needs(&self, msg_id: u64, total: usize) -> usize {
+        if !self.deliverable(msg_id) || self.assemblies.iter().any(|a| a.msg_id == msg_id) {
+            0
+        } else {
+            total.saturating_add(total.div_ceil(64).saturating_mul(8))
+        }
+    }
+
     fn delivered(&mut self, msg_id: u64, budget: &mut AssemblyBudget) {
         if self.ordered {
             self.last_delivered = Some(msg_id);
             self.assemblies.retain(|assembly| {
                 let keep = assembly.msg_id > msg_id;
                 if !keep {
-                    budget.left += assembly.buf.capacity();
+                    budget.left += assembly.allocated();
                 }
                 keep
             });
@@ -199,6 +366,7 @@ impl UnreliableRecv {
         data: &[u8],
         max_size: usize,
         budget: &mut AssemblyBudget,
+        now: Instant,
     ) -> Result<Option<Vec<u8>>, ProtocolViolation> {
         let too_large = ProtocolViolation::MessageTooLarge { max: max_size };
         if !self.deliverable(msg_id) {
@@ -230,14 +398,23 @@ impl UnreliableRecv {
                     if self.assemblies[oldest].msg_id > msg_id {
                         return Ok(None);
                     }
-                    budget.left += self.assemblies.swap_remove(oldest).buf.capacity();
+                    budget.left += self.assemblies.swap_remove(oldest).allocated();
                 }
+                let needed = total
+                    .checked_add(total.div_ceil(64).saturating_mul(8))
+                    .ok_or(ProtocolViolation::Malformed)?;
+                if needed > budget.left {
+                    return Ok(None);
+                }
+                budget.left -= needed;
                 self.assemblies.push(Assembly {
                     msg_id,
                     total,
                     received: 0,
-                    buf: Vec::new(),
-                    ranges: Vec::new(),
+                    buf: vec![0; total],
+                    coverage: vec![0; total.div_ceil(64)],
+                    created: now,
+                    updated: now,
                 });
                 self.assemblies.len() - 1
             }
@@ -246,30 +423,23 @@ impl UnreliableRecv {
         if assembly.total != total {
             return Err(ProtocolViolation::Malformed);
         }
-        if assembly.ranges.len() == MAX_FRAGMENT_RANGES
-            || assembly.ranges.iter().any(|&(s, e)| start < e && s < end)
-        {
-            return Ok(None);
-        }
-        if end > assembly.buf.len() {
-            let grow = end.max(assembly.buf.capacity()) - assembly.buf.capacity();
-            if grow > budget.left {
-                budget.left += self.assemblies.swap_remove(index).buf.capacity();
-                return Ok(None);
+        assembly.updated = now;
+        for (offset, byte) in (start..end).zip(data) {
+            let bit = 1 << (offset % 64);
+            let word = &mut assembly.coverage[offset / 64];
+            if *word & bit == 0 {
+                *word |= bit;
+                assembly.received += 1;
+                assembly.buf[offset] = *byte;
+            } else if assembly.buf[offset] != *byte {
+                return Err(ProtocolViolation::Malformed);
             }
-            let before = assembly.buf.capacity();
-            assembly.buf.reserve_exact(end - assembly.buf.len());
-            budget.left -= assembly.buf.capacity() - before;
-            assembly.buf.resize(end, 0);
         }
-        assembly.buf[start..end].copy_from_slice(data);
-        assembly.ranges.push((start, end));
-        assembly.received += data.len();
         if assembly.received < total {
             return Ok(None);
         }
         let assembly = self.assemblies.swap_remove(index);
-        budget.left += assembly.buf.capacity();
+        budget.left += assembly.allocated();
         self.delivered(msg_id, budget);
         Ok(Some(assembly.buf))
     }
@@ -313,7 +483,7 @@ mod tests {
                 panic!("unexpected frame");
             };
             messages.extend(
-                recv.on_frame(msg_id, fragment, data, 1 << 20, budget)
+                recv.on_frame(msg_id, fragment, data, 1 << 20, budget, Instant::now())
                     .unwrap(),
             );
         }
@@ -375,8 +545,75 @@ mod tests {
         send.push(Rc::new(vec![0; 10]), now + Duration::from_millis(60));
         assert!(send.ready(now + Duration::from_millis(120)));
         assert_eq!(send.expired, 1);
-        assert!(send.ready(now + Duration::from_millis(500)));
-        assert_eq!(send.expired, 2);
-        assert_eq!(send.queued_bytes(), 10);
+        assert!(!send.ready(now + Duration::from_millis(500)));
+        assert_eq!(send.expired, 3);
+        assert_eq!(send.queued_bytes(), 0);
+    }
+
+    #[test]
+    fn maximum_messages_complete_with_reordering_and_duplicate_fragments() {
+        for ordered in [false, true] {
+            let now = Instant::now();
+            let mut send = UnreliableSend::new(ordered.then_some(0), Duration::from_millis(100));
+            let message: Vec<_> = (0..1 << 20).map(|i| (i * 13) as u8).collect();
+            send.push(Rc::new(message.clone()), now);
+            let packets = frames(&mut send, 1200);
+            let mut recv = UnreliableRecv::new(ordered);
+            let mut budget = AssemblyBudget { left: 4 << 20 };
+            let mut received = Vec::new();
+            for packet in packets.iter().rev() {
+                received.extend(receive(&mut recv, packet, &mut budget));
+                if received.is_empty() {
+                    assert!(receive(&mut recv, packet, &mut budget).is_empty());
+                }
+            }
+            assert_eq!(received, [message]);
+            assert_eq!(budget.left, 4 << 20);
+        }
+    }
+
+    #[test]
+    fn active_assemblies_survive_idle_limit_but_not_absolute_lifetime() {
+        let now = Instant::now();
+        let mut recv = UnreliableRecv::new(false);
+        let mut budget = AssemblyBudget { left: 4096 };
+        for offset in 0..5 {
+            let at = now + Duration::from_secs(offset);
+            recv.expire(at, &mut budget);
+            let message = recv
+                .on_frame(
+                    0,
+                    Some(Fragment { offset, total: 5 }),
+                    &[7],
+                    1024,
+                    &mut budget,
+                    at,
+                )
+                .unwrap();
+            if offset == 4 {
+                assert_eq!(message, Some(vec![7; 5]));
+            } else {
+                assert!(message.is_none());
+            }
+        }
+        for second in 0..30 {
+            let at = now + Duration::from_secs(second);
+            recv.expire(at, &mut budget);
+            recv.on_frame(
+                1,
+                Some(Fragment {
+                    offset: 0,
+                    total: 100,
+                }),
+                &[1],
+                1024,
+                &mut budget,
+                at,
+            )
+            .unwrap();
+        }
+        recv.expire(now + Duration::from_secs(30), &mut budget);
+        assert!(recv.assemblies.is_empty());
+        assert_eq!(budget.left, 4096);
     }
 }

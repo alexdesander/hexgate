@@ -20,6 +20,7 @@ struct SocketInner {
     simulator: Simulator,
     outbound: DelayQueue,
     inbound: DelayQueue,
+    receive_pending: bool,
 }
 
 #[bon]
@@ -51,6 +52,7 @@ impl Socket {
                 simulator: simulator.unwrap_or_default(),
                 outbound: DelayQueue::default(),
                 inbound: DelayQueue::default(),
+                receive_pending: false,
             },
         })
     }
@@ -68,6 +70,16 @@ impl Socket {
     /// Packets already delayed keep their delivery time.
     pub fn set_simulator(&mut self, simulator: Simulator) {
         self.inner.simulator = simulator;
+    }
+
+    pub fn discard_pending(&mut self) {
+        self.inner.inbound = DelayQueue::default();
+        self.inner.outbound = DelayQueue::default();
+        self.inner.receive_pending = false;
+    }
+
+    pub fn take_simulator(&mut self) -> Simulator {
+        std::mem::take(&mut self.inner.simulator)
     }
 
     /// Send errors are treated like lost packets: transient conditions (full buffers, ICMP
@@ -114,15 +126,21 @@ impl Socket {
     pub fn next_deadline(&self) -> Option<Instant> {
         let outbound = self.inner.outbound.next_deadline();
         let inbound = self.inner.inbound.next_deadline();
-        outbound.into_iter().chain(inbound).min()
+        outbound
+            .into_iter()
+            .chain(inbound)
+            .chain(self.inner.receive_pending.then(Instant::now))
+            .min()
     }
 
     /// Whether a delayed received packet is due, `recv_from` returns it.
     pub fn inbound_due(&self) -> bool {
-        self.inner
-            .inbound
-            .next_deadline()
-            .is_some_and(|at| at <= Instant::now())
+        self.inner.receive_pending
+            || self
+                .inner
+                .inbound
+                .next_deadline()
+                .is_some_and(|at| at <= Instant::now())
     }
 
     /// Receives the next datagram, `None` means there is none right now. Errors caused by a
@@ -134,7 +152,10 @@ impl Socket {
         }
         let now = Instant::now();
         if inner.inbound.next_deadline().is_none_or(|at| at > now) {
-            while let Some((size, from)) = inner.recv_now(buf)? {
+            for _ in 0..128 {
+                let Some((size, from)) = inner.recv_now(buf)? else {
+                    break;
+                };
                 let Some(simulator) = &mut inner.simulator.recv else {
                     return Ok(Some((size, from)));
                 };
@@ -166,23 +187,30 @@ impl SocketInner {
     }
 
     fn flush(&mut self, now: Instant) {
-        while let Some(pending) = self.outbound.pop_due(now) {
+        for _ in 0..128 {
+            let Some(pending) = self.outbound.pop_due(now) else {
+                break;
+            };
             self.send_now(pending.peer, &pending.data);
             self.outbound.recycle(pending.data);
         }
     }
 
     fn recv_now(&mut self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddr)>, io::Error> {
-        loop {
+        for _ in 0..32 {
             match self.mio_socket.recv_from(buf) {
-                Ok(received) => return Ok(Some(received)),
+                Ok(received) => {
+                    self.receive_pending = true;
+                    return Ok(Some(received));
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    return Ok(None)
+                    self.receive_pending = false;
+                    return Ok(None);
                 }
                 Err(e) if is_transient(&e) => {
                     log!(trace, error = %e, "transient socket error");
@@ -191,6 +219,8 @@ impl SocketInner {
                 Err(e) => return Err(e),
             }
         }
+        self.receive_pending = true;
+        Ok(None)
     }
 }
 

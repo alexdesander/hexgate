@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use crossbeam::channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use mio::Waker;
 
 use super::thread::Cmd;
@@ -23,6 +23,9 @@ impl<T> AuthResult for T where T: Send + 'static {}
 /// Every login attempt needs a key exchange, and the server allows at most 10 per second (burst
 /// 20) per IPv4 address or IPv6 /64. Limit failed attempts per account here when `auth_data` is
 /// a password.
+///
+/// Shutdown does not wait for a running callback. It may finish after the server is dropped;
+/// its result is then discarded. Callbacks should apply their own I/O timeouts.
 pub trait Authenticator<R: AuthResult>: Send + 'static {
     /// Authenticate the client with the given authentication data.
     /// The error value is sent to the client if the authentication fails.
@@ -33,8 +36,14 @@ pub trait Authenticator<R: AuthResult>: Send + 'static {
 /// Login attempts are identified by the client address and the handshake salt.
 pub(crate) type LoginAttempt = (SocketAddr, [u8; 4]);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Exchange {
+    pub attempt: LoginAttempt,
+    pub generation: u64,
+}
+
 pub(crate) enum AuthCmd {
-    Authenticate(LoginAttempt, Vec<u8>),
+    Authenticate(Exchange, Vec<u8>),
 }
 
 pub(crate) struct AuthThreadState<A: Authenticator<R>, R: AuthResult> {
@@ -65,7 +74,10 @@ fn serve<R: AuthResult, A: Authenticator<R>>(state: &mut AuthThreadState<A, R>) 
     while let Ok(cmd) = state.cmds.recv() {
         match cmd {
             AuthCmd::Authenticate(attempt, auth_data) => {
-                match state.authenticator.authenticate(attempt.0, auth_data) {
+                match state
+                    .authenticator
+                    .authenticate(attempt.attempt.0, auth_data)
+                {
                     Ok(auth_result) => {
                         if state
                             .main_cmds
