@@ -36,6 +36,9 @@ mod thread;
 /// New key exchanges allowed per client IP (IPv6: per /64): sustained rate and burst.
 const CONNECTION_REQUESTS_PER_SECOND: f64 = 10.0;
 const CONNECTION_REQUEST_BURST: f64 = 20.0;
+/// ClientHellos answered per client IP (IPv6: per /64), including retransmissions.
+const CLIENT_HELLOS_PER_SECOND: f64 = 20.0;
+const CLIENT_HELLO_BURST: f64 = 40.0;
 
 /// The public key clients pin (`client::ServerKey::Pinned`) for a server's `secret_key`.
 pub fn public_key(secret_key: &[u8; 32]) -> [u8; 32] {
@@ -270,6 +273,7 @@ impl<R: AuthResult, A: Authenticator<R>> Server<R, A> {
                 latency_discovery_interval,
 
                 siphasher: SipHasher::new_with_key(&rand::random()),
+                client_hellos: RateLimiter::new(CLIENT_HELLOS_PER_SECOND, CLIENT_HELLO_BURST),
                 connection_requests: RateLimiter::new(
                     CONNECTION_REQUESTS_PER_SECOND,
                     CONNECTION_REQUEST_BURST,

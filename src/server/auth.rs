@@ -13,6 +13,11 @@ use crate::common::packets::login_response::MAX_FAILURE_DATA_SIZE;
 pub trait AuthResult: Send + 'static {}
 impl<T> AuthResult for T where T: Send + 'static {}
 
+/// Runs on its own thread, one login at a time.
+///
+/// Every login attempt needs a key exchange, and the server allows at most 10 per second (burst
+/// 20) per IPv4 address or IPv6 /64. Limit failed attempts per account here when `auth_data` is
+/// a password.
 pub trait Authenticator<R: AuthResult>: Send + 'static {
     /// Authenticate the client with the given authentication data.
     /// The error value is sent to the client if the authentication fails.

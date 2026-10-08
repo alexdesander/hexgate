@@ -123,7 +123,8 @@ pub struct ServerThreadState<R: AuthResult> {
     pub is_checking_for_timeouts: bool,
     pub latency_discovery_interval: Duration,
 
-    /// Limits new key exchanges per client IP.
+    /// Limit answered ClientHellos and new key exchanges per client IP.
+    pub client_hellos: RateLimiter,
     pub connection_requests: RateLimiter,
     pub auth_cmd_tx: Sender<AuthCmd>,
     pub expecting_login_requests: HashMap<LoginAttempt, PendingLogin>,
@@ -272,7 +273,9 @@ impl<R: AuthResult> ServerThreadState<R> {
                     self.finish_close(socket_addr);
                 }
                 TimedEventKey::PruneRateLimits => {
-                    self.connection_requests.prune(Instant::now());
+                    let now = Instant::now();
+                    self.client_hellos.prune(now);
+                    self.connection_requests.prune(now);
                 }
             }
         }
@@ -429,6 +432,14 @@ impl<R: AuthResult> ServerThreadState<R> {
         );
     }
 
+    fn schedule_rate_limit_prune(&mut self, now: Instant) {
+        self.timed_events.push(
+            TimedEventKey::PruneRateLimits,
+            now + RATE_LIMIT_PRUNE_INTERVAL,
+            TimedEventData::Nothing,
+        );
+    }
+
     /// A client reconnecting from a connected address replaces its old connection.
     fn is_full_for(&self, client: SocketAddr) -> bool {
         self.max_connections
@@ -563,6 +574,11 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Ok(client_hello) = ClientHello::deserialize(&self.buf[..size]) else {
             return;
         };
+        let now = Instant::now();
+        if !self.client_hellos.allow(from.ip(), now) {
+            return;
+        }
+        self.schedule_rate_limit_prune(now);
         let server_hello = match (self.allowed_client_versions)(client_hello.client_version) {
             Ok(()) if self.is_full_for(from) => ServerHello::ServerFull {
                 salt: client_hello.salt,
@@ -627,11 +643,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         if !self.connection_requests.allow(from.ip(), now) {
             return;
         }
-        self.timed_events.push(
-            TimedEventKey::PruneRateLimits,
-            now + RATE_LIMIT_PRUNE_INTERVAL,
-            TimedEventData::Nothing,
-        );
+        self.schedule_rate_limit_prune(now);
         let x25519_secret_key = EphemeralSecret::random_from_rng(thread_rng());
         let x25519_public_key = PublicKey::from(&x25519_secret_key);
         let shared_secret =
