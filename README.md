@@ -2,14 +2,7 @@
 
 **Hexgate is an efficient and easy to use UDP client-server game networking crate supporting encryption, reliability, authentication, and network simulation.**
 
----
-⚠️ HEXGATE IS USABLE BUT NOT PRODUCTION READY ⚠️
-
-API MAY CHANGE QUITE A BIT.
-
-CHECK OUT THE [ISSUES](https://github.com/alexdesander/hexgate/issues) FOR MORE INFORMATION
-
----
+> Early release: the API and the wire protocol may still change.
 
 Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
 
