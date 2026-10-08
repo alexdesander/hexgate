@@ -7,6 +7,9 @@ use x25519_dalek::PublicKey;
 
 use super::*;
 
+/// Padded to the response size, so the server never answers with more bytes than it received.
+pub const SIZE: usize = super::connection_response::SIZE;
+
 pub struct ConnectionRequest {
     pub salt: [u8; 4],
     pub timestamp: [u8; 8],
@@ -25,11 +28,12 @@ impl ConnectionRequest {
         buf[45..53].copy_from_slice(&self.siphash);
         buf[53..85].copy_from_slice(self.client_x25519_pubkey.as_bytes());
         buf[85..117].copy_from_slice(&self.hkdf_salt);
-        117
+        buf[117..SIZE].fill(0);
+        SIZE
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<Self, &'static str> {
-        if buf.len() != 117 {
+        if buf.len() != SIZE {
             return Err(ERROR_INVALID_BUFFER_SIZE);
         }
 

@@ -15,6 +15,8 @@ pub struct ConnectionResponse {
     pub auth_salt: [u8; 16],
 }
 
+pub const SIZE: usize = 133;
+
 const NONCE: [u8; 12] = [0xff; 12];
 impl ConnectionResponse {
     pub fn serialize(
@@ -32,8 +34,8 @@ impl ConnectionResponse {
         buf[53..69].copy_from_slice(&tag);
 
         let signature = server_ed25519_key.sign(&buf[..69]);
-        buf[69..133].copy_from_slice(&signature.to_bytes());
-        133
+        buf[69..SIZE].copy_from_slice(&signature.to_bytes());
+        SIZE
     }
 
     pub fn deserialize(
@@ -43,7 +45,7 @@ impl ConnectionResponse {
         hkdf_salt: [u8; 32],
         cipher: Cipher,
     ) -> Result<(Self, Crypto), &'static str> {
-        if buf.len() != 133 {
+        if buf.len() != SIZE {
             return Err(ERROR_INVALID_BUFFER_SIZE);
         }
 
@@ -51,7 +53,7 @@ impl ConnectionResponse {
             return Err(ERROR_INVALID_PACKET_IDENTIFIER);
         }
 
-        let signature = buf[69..133].try_into().unwrap();
+        let signature = buf[69..SIZE].try_into().unwrap();
         if served_ed25519_pub_key
             .verify_strict(&buf[..69], &signature)
             .is_err()
