@@ -207,9 +207,9 @@ impl Bursts {
             (next.start, bytes)
         };
         let period = next.saturating_duration_since(burst.start);
-        let spread = ((burst.last_recv - burst.first_recv) as f64 / 1e6).max(MIN_SPREAD);
         let packets = burst.recv_packets;
         let delivery_rate = (packets >= 2 && !burst.reordered).then(|| {
+            let spread = ((burst.last_recv - burst.first_recv) as f64 / 1e6).max(MIN_SPREAD);
             burst.recv_bytes as f64 * f64::from(packets - 1) / f64::from(packets) / spread
         });
         let sample = Sample {
