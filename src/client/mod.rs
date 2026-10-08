@@ -4,7 +4,7 @@
 
 use std::{
     io::{self, ErrorKind},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     panic::{self, AssertUnwindSafe},
     sync::{mpsc, Arc},
     thread::JoinHandle,
@@ -241,7 +241,9 @@ impl Client {
     pub fn prepare(
         /// Defaults to any address of the server's IP version, with a random port.
         bind_addr: Option<SocketAddr>,
-        server_socket_addr: SocketAddr,
+        /// An address or a host name with port, e.g. `"example.com:44444"`. The first resolved
+        /// address (of `bind_addr`'s IP version, if set) is used.
+        server_socket_addr: impl ToSocketAddrs,
         server_key: ServerKey,
         /// At most 1177 bytes unless hashed.
         auth_data: Vec<u8>,
@@ -283,6 +285,15 @@ impl Client {
         }
         let send_limits = SendLimits::new(&channel_config, max_send_msg_size);
 
+        let server_socket_addr = server_socket_addr
+            .to_socket_addrs()?
+            .find(|addr| bind_addr.is_none_or(|bind_addr| bind_addr.is_ipv4() == addr.is_ipv4()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "the server address resolved to no address of bind_addr's IP version",
+                )
+            })?;
         let bind_addr = bind_addr.unwrap_or(match server_socket_addr {
             SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
             SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
