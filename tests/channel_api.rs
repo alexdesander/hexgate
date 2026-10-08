@@ -2,11 +2,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{AcceptAll, SECRET_KEY};
-use hexgate::{
-    client, server, Channel, Client, ClientVersion, CongestionConfig, SendOptions, SendOutcome,
-    Server, ServerKey,
-};
+use common::{client_builder, server_builder, AcceptAll};
+use hexgate::{client, server, Channel, CongestionConfig, SendOptions, SendOutcome};
 
 #[test]
 fn socket_threads_preserve_channel_stats_resets_priorities_and_receipts() {
@@ -16,24 +13,13 @@ fn socket_threads_preserve_channel_stats_resets_priorities_and_receipts() {
         max_rate: 32_000,
         ..CongestionConfig::default()
     };
-    let server = Server::prepare()
-        .bind_addr("127.0.0.1:0".parse().unwrap())
-        .info(vec![])
-        .allowed_client_versions(|_| Ok(()))
-        .secret_key(SECRET_KEY)
-        .auth_salt([0; 16])
-        .authenticator(AcceptAll)
+    let server = server_builder!(AcceptAll)
         .channel_config(common::channel_config())
         .congestion_config(rate)
         .close_linger(Duration::ZERO)
         .run()
         .unwrap();
-    let client = Client::prepare()
-        .server_socket_addr(server.local_addr())
-        .server_key(ServerKey::Pinned(server::public_key(&SECRET_KEY)))
-        .auth_data(vec![])
-        .hash_auth_data(false)
-        .client_version(ClientVersion::ZERO)
+    let client = client_builder!(server.local_addr())
         .channel_config(common::channel_config())
         .congestion_config(rate)
         .close_linger(Duration::ZERO)

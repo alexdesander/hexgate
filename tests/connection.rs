@@ -11,39 +11,18 @@ use std::{
 };
 
 use common::{
-    channel_config, client, connected, next_event, server, AcceptAll, Blackhole, DropNth, OKAY,
-    SECRET_KEY, TIMEOUT,
+    channel_config, client, client_builder, connected, next_event, server, server_builder,
+    AcceptAll, Blackhole, DropNth, OKAY, SECRET_KEY, TIMEOUT,
 };
 use hexgate::{
     client::{self as hexclient, ConnectError},
     error::SendError,
-    server as hexserver, AllowedClientVersions, Authenticator, Channel, ChannelConfiguration,
-    Client, ClientVersion, Server, ServerKey, Simulator,
+    server as hexserver, AllowedClientVersions, Authenticator, Channel, Client, ClientVersion,
+    Server, ServerKey, Simulator,
 };
 use rand::Rng;
 
 const WAIT: Duration = Duration::from_secs(5);
-
-fn client_with(
-    server_addr: SocketAddr,
-    server_key: ServerKey,
-    channel_config: ChannelConfiguration,
-    simulator: Option<Simulator>,
-) -> Result<Client, ConnectError> {
-    Client::prepare()
-        .client_version(ClientVersion::ZERO)
-        .server_socket_addr(server_addr)
-        .server_key(server_key)
-        .auth_data(vec![])
-        .hash_auth_data(false)
-        .channel_config(channel_config)
-        .maybe_simulator(simulator)
-        .connect()
-}
-
-fn pinned() -> ServerKey {
-    ServerKey::Pinned(hexserver::public_key(&SECRET_KEY))
-}
 
 #[test]
 fn connect_repeatedly() {
@@ -59,21 +38,18 @@ fn connect_repeatedly() {
 fn handshake_survives_a_lost_packet_at_each_step() {
     for lost in 0..3 {
         for client_side in [true, false] {
-            let server = Server::prepare()
-                .bind_addr("127.0.0.1:0".parse().unwrap())
-                .info(vec![])
-                .allowed_client_versions(|_| Ok(()))
-                .secret_key(SECRET_KEY)
-                .auth_salt([0; 16])
-                .authenticator(AcceptAll)
+            let server = server_builder!(AcceptAll)
                 .channel_config(channel_config())
                 .maybe_simulator((!client_side).then(|| Simulator::sending(DropNth::new(lost))))
                 .run()
                 .unwrap();
             let start = Instant::now();
             let simulator = client_side.then(|| Simulator::sending(DropNth::new(lost)));
-            let _client =
-                client_with(server.local_addr(), pinned(), channel_config(), simulator).unwrap();
+            let _client = client_builder!(server.local_addr())
+                .channel_config(channel_config())
+                .maybe_simulator(simulator)
+                .connect()
+                .unwrap();
             let elapsed = start.elapsed();
             assert!(
                 elapsed < Duration::from_secs(2),
@@ -113,7 +89,9 @@ fn rejects_unsupported_client_version() {
         .channel_config(channel_config())
         .run()
         .unwrap();
-    let result = client_with(server.local_addr(), pinned(), channel_config(), None);
+    let result = client_builder!(server.local_addr())
+        .channel_config(channel_config())
+        .connect();
     assert!(
         matches!(result, Err(ConnectError::VersionNotSupported(allowed)) if allowed == ALLOWED)
     );
@@ -122,8 +100,14 @@ fn rejects_unsupported_client_version() {
 #[test]
 fn rejects_wrong_server_key() {
     let server = server(TIMEOUT);
-    let wrong = ServerKey::Pinned(hexserver::public_key(&[8; 32]));
-    let result = client_with(server.local_addr(), wrong, channel_config(), None);
+    let result = Client::prepare()
+        .client_version(ClientVersion::ZERO)
+        .server_socket_addr(server.local_addr())
+        .server_key(ServerKey::Pinned(hexserver::public_key(&[8; 32])))
+        .auth_data(vec![])
+        .hash_auth_data(false)
+        .channel_config(channel_config())
+        .connect();
     assert!(matches!(
         result,
         Err(ConnectError::ServerKeyMismatch { received_key }) if received_key == hexserver::public_key(&SECRET_KEY)
@@ -138,17 +122,13 @@ fn reports_authentication_failure() {
             Err(b"wrong password".to_vec())
         }
     }
-    let server = Server::prepare()
-        .bind_addr("127.0.0.1:0".parse().unwrap())
-        .info(vec![])
-        .allowed_client_versions(|_| Ok(()))
-        .secret_key(SECRET_KEY)
-        .auth_salt([0; 16])
-        .authenticator(RejectAll)
+    let server = server_builder!(RejectAll)
         .channel_config(channel_config())
         .run()
         .unwrap();
-    let result = client_with(server.local_addr(), pinned(), channel_config(), None);
+    let result = client_builder!(server.local_addr())
+        .channel_config(channel_config())
+        .connect();
     assert!(
         matches!(result, Err(ConnectError::ServerDeniedLogin(data)) if data == b"wrong password")
     );
@@ -159,7 +139,9 @@ fn rejects_mismatched_channels() {
     let server = server(TIMEOUT);
     let mut config = channel_config();
     config.weights_reliable.push(1);
-    let result = client_with(server.local_addr(), pinned(), config, None);
+    let result = client_builder!(server.local_addr())
+        .channel_config(config)
+        .connect();
     assert!(matches!(
         result,
         Err(ConnectError::ChannelMismatch {
@@ -171,19 +153,15 @@ fn rejects_mismatched_channels() {
 
 #[test]
 fn rejects_clients_when_full() {
-    let server = Server::prepare()
-        .bind_addr("127.0.0.1:0".parse().unwrap())
-        .info(vec![])
-        .allowed_client_versions(|_| Ok(()))
-        .secret_key(SECRET_KEY)
-        .auth_salt([0; 16])
-        .authenticator(AcceptAll)
+    let server = server_builder!(AcceptAll)
         .channel_config(channel_config())
         .max_connections(1)
         .run()
         .unwrap();
     let _first = client(server.local_addr(), TIMEOUT);
-    let result = client_with(server.local_addr(), pinned(), channel_config(), None);
+    let result = client_builder!(server.local_addr())
+        .channel_config(channel_config())
+        .connect();
     assert!(matches!(result, Err(ConnectError::ServerFull)));
 }
 

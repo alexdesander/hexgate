@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use std::{
     net::SocketAddr,
@@ -14,8 +14,7 @@ use hexgate::{
     error::RecvError,
     server,
     sim::{Fate, NetworkSimulator},
-    Authenticator, ChannelConfiguration, Client, ClientVersion, SendQueueLimits, Server, ServerKey,
-    Simulator,
+    Authenticator, ChannelConfiguration, Client, SendQueueLimits, Server, ServerKey, Simulator,
 };
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -139,14 +138,39 @@ pub fn next_event<E>(
     None
 }
 
+/// `Server::prepare()` on a free loopback port, accepting every client version.
+macro_rules! server_builder {
+    ($authenticator:expr) => {
+        hexgate::Server::prepare()
+            .bind_addr("127.0.0.1:0".parse().unwrap())
+            .info(vec![])
+            .allowed_client_versions(|_| Ok(()))
+            .secret_key($crate::common::SECRET_KEY)
+            .auth_salt([0; 16])
+            .authenticator($authenticator)
+    };
+}
+pub(crate) use server_builder;
+
+/// `Client::prepare()` without auth data, pinning the test server's key.
+macro_rules! client_builder {
+    ($server_addr:expr) => {
+        hexgate::Client::prepare()
+            .client_version(hexgate::ClientVersion::ZERO)
+            .server_socket_addr($server_addr)
+            .server_key($crate::common::pinned())
+            .auth_data(vec![])
+            .hash_auth_data(false)
+    };
+}
+pub(crate) use client_builder;
+
+pub fn pinned() -> ServerKey {
+    ServerKey::Pinned(server::public_key(&SECRET_KEY))
+}
+
 pub fn server(timeout_dur: Duration) -> TestServer {
-    Server::prepare()
-        .bind_addr("127.0.0.1:0".parse().unwrap())
-        .info(b"test server".to_vec())
-        .allowed_client_versions(|_| Ok(()))
-        .secret_key(SECRET_KEY)
-        .auth_salt([0u8; 16])
-        .authenticator(AcceptAll)
+    server_builder!(AcceptAll)
         .channel_config(channel_config())
         .timeout_dur(timeout_dur)
         .max_events(MAX_EVENTS)
@@ -156,12 +180,7 @@ pub fn server(timeout_dur: Duration) -> TestServer {
 }
 
 pub fn client(server_addr: SocketAddr, timeout_dur: Duration) -> Client {
-    Client::prepare()
-        .client_version(ClientVersion::ZERO)
-        .server_socket_addr(server_addr)
-        .server_key(ServerKey::Pinned(server::public_key(&SECRET_KEY)))
-        .auth_data(vec![])
-        .hash_auth_data(false)
+    client_builder!(server_addr)
         .channel_config(channel_config())
         .timeout_dur(timeout_dur)
         .max_events(MAX_EVENTS)

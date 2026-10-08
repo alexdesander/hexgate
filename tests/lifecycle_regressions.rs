@@ -10,10 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{next_event, AcceptAll, SECRET_KEY};
+use common::{client_builder, next_event, server_builder, AcceptAll};
 use hexgate::{
-    client, server, Authenticator, Channel, ChannelConfiguration, Client, ClientVersion, Server,
-    ServerKey, Simulator,
+    client, server, Authenticator, Channel, ChannelConfiguration, Client, Server, Simulator,
 };
 
 const WAIT: Duration = Duration::from_secs(3);
@@ -37,31 +36,20 @@ fn paused_server() -> (Server<()>, Receiver<()>, Sender<()>, Receiver<()>) {
     let (entered_tx, entered) = mpsc::channel();
     let (release, release_rx) = mpsc::channel();
     let (finished_tx, finished) = mpsc::channel();
-    let server = Server::prepare()
-        .bind_addr("127.0.0.1:0".parse().unwrap())
-        .info(vec![])
-        .allowed_client_versions(|_| Ok(()))
-        .secret_key(SECRET_KEY)
-        .auth_salt([0; 16])
-        .authenticator(PausedAuth {
-            entered: entered_tx,
-            release: release_rx,
-            finished: finished_tx,
-        })
-        .channel_config(ChannelConfiguration::default())
-        .close_linger(Duration::ZERO)
-        .run()
-        .unwrap();
+    let server = server_builder!(PausedAuth {
+        entered: entered_tx,
+        release: release_rx,
+        finished: finished_tx,
+    })
+    .channel_config(ChannelConfiguration::default())
+    .close_linger(Duration::ZERO)
+    .run()
+    .unwrap();
     (server, entered, release, finished)
 }
 
 fn start_client(addr: SocketAddr) -> Client {
-    Client::prepare()
-        .client_version(ClientVersion::ZERO)
-        .server_socket_addr(addr)
-        .server_key(ServerKey::Pinned(server::public_key(&SECRET_KEY)))
-        .auth_data(vec![])
-        .hash_auth_data(false)
+    client_builder!(addr)
         .channel_config(ChannelConfiguration::default())
         .close_linger(Duration::ZERO)
         .start()
@@ -138,13 +126,7 @@ fn unreliable_age_includes_time_waiting_for_authentication() {
 
 #[test]
 fn polling_resumes_reliable_delivery_with_a_single_event_slot() {
-    let server = Server::prepare()
-        .bind_addr("127.0.0.1:0".parse().unwrap())
-        .info(vec![])
-        .allowed_client_versions(|_| Ok(()))
-        .secret_key(SECRET_KEY)
-        .auth_salt([0; 16])
-        .authenticator(AcceptAll)
+    let server = server_builder!(AcceptAll)
         .channel_config(ChannelConfiguration::default())
         .max_events(1)
         .close_linger(Duration::ZERO)
@@ -181,12 +163,7 @@ fn polling_resumes_reliable_delivery_with_a_single_event_slot() {
 #[test]
 fn command_flood_does_not_postpone_connection_timeout() {
     let server = common::server(Duration::from_secs(10));
-    let client = Client::prepare()
-        .client_version(ClientVersion::ZERO)
-        .server_socket_addr(server.local_addr())
-        .server_key(ServerKey::Pinned(server::public_key(&SECRET_KEY)))
-        .auth_data(vec![])
-        .hash_auth_data(false)
+    let client = client_builder!(server.local_addr())
         .channel_config(common::channel_config())
         .timeout_dur(Duration::from_millis(200))
         .close_linger(Duration::ZERO)

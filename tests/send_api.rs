@@ -7,10 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{AcceptAll, Blackhole, SECRET_KEY, TIMEOUT};
+use common::{client_builder, server_builder, AcceptAll, Blackhole, TIMEOUT};
 use hexgate::{
     client, error::SendError, server, Channel, ChannelConfiguration, Client, ClientVersion,
-    SendOptions, SendQueueLimits, Server, ServerKey, Simulator,
+    SendOptions, SendQueueLimits, ServerKey, Simulator,
 };
 
 struct Resolver {
@@ -108,13 +108,7 @@ fn oversized_capacity_is_charged_and_reliable_deadlines_are_rejected() {
 
 #[test]
 fn slow_peer_admission_isolated_and_broadcast_rolls_back_all_reservations() {
-    let server = Server::prepare()
-        .bind_addr("127.0.0.1:0".parse().unwrap())
-        .info(vec![])
-        .allowed_client_versions(|_| Ok(()))
-        .secret_key(SECRET_KEY)
-        .auth_salt([0; 16])
-        .authenticator(AcceptAll)
+    let server = server_builder!(AcceptAll)
         .channel_config(common::channel_config())
         .send_queue_limits(limits())
         .close_linger(Duration::ZERO)
@@ -173,20 +167,15 @@ impl ToSocketAddrs for Addresses {
 fn startup_falls_back_after_an_unreachable_resolved_address() {
     let server = common::server(TIMEOUT);
     let blackhole = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let client = Client::prepare()
-        .server_socket_addr(Addresses(vec![
-            blackhole.local_addr().unwrap(),
-            server.local_addr(),
-        ]))
-        .server_key(ServerKey::Pinned(server::public_key(&SECRET_KEY)))
-        .auth_data(vec![])
-        .hash_auth_data(false)
-        .client_version(ClientVersion::ZERO)
-        .channel_config(common::channel_config())
-        .handshake_timeout(Duration::from_millis(50))
-        .handshake_tries(1)
-        .connect()
-        .unwrap();
+    let client = client_builder!(Addresses(vec![
+        blackhole.local_addr().unwrap(),
+        server.local_addr(),
+    ]))
+    .channel_config(common::channel_config())
+    .handshake_timeout(Duration::from_millis(50))
+    .handshake_tries(1)
+    .connect()
+    .unwrap();
     client
         .send(Channel::Reliable(0), b"fallback".to_vec())
         .unwrap();

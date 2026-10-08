@@ -650,32 +650,26 @@ impl<R: AuthResult> ServerThreadState<R> {
         self.dirty.push(addr);
     }
 
-    fn take_auth(&mut self, exchange: Exchange) -> Option<PendingLogin> {
+    /// The keys and LoginRequest hash of the authenticated attempt, `None` if it is gone or the
+    /// server is shutting down.
+    fn take_auth(&mut self, exchange: Exchange) -> Option<(Crypto, [u8; 32])> {
         let pending = self.expecting_auth_result.get(&exchange.attempt)?;
         if pending.generation != exchange.generation {
             return None;
         }
-        self.expecting_auth_result.remove(&exchange.attempt)
+        let pending = self.expecting_auth_result.remove(&exchange.attempt)?;
+        (!self.shutting_down).then(|| (pending.crypto, pending.login_request.unwrap()))
     }
 
     fn handle_cmd_auth_success(&mut self, exchange: Exchange, auth_result: R) {
         let attempt = exchange.attempt;
-        let Some(pending) = self.take_auth(exchange) else {
+        let Some((crypto, request)) = self.take_auth(exchange) else {
             return;
         };
-        if self.shutting_down {
-            return;
-        }
-        let crypto = pending.crypto;
-        let request = pending.login_request.unwrap();
         // The server filled up while authenticating.
         if self.is_full_for(attempt.0) {
             log!(debug, from = %attempt.0, "server full after login");
-            let login_response = LoginResponse::Failure {
-                failure_data: b"Server full",
-            };
-            let size = login_response.serialize(&crypto, &mut self.buf);
-            self.answer_login(exchange, request, size);
+            self.refuse_login(exchange, request, &crypto, b"Server full");
             return;
         }
         let from = attempt.0;
@@ -703,19 +697,21 @@ impl<R: AuthResult> ServerThreadState<R> {
     }
 
     fn handle_cmd_auth_failure(&mut self, exchange: Exchange, failure_data: Vec<u8>) {
-        let Some(pending) = self.take_auth(exchange) else {
+        let Some((crypto, request)) = self.take_auth(exchange) else {
             return;
         };
-        if self.shutting_down {
-            return;
-        }
-        let crypto = pending.crypto;
-        let request = pending.login_request.unwrap();
         log!(debug, from = %exchange.attempt.0, "login denied");
-        let login_response = LoginResponse::Failure {
-            failure_data: &failure_data,
-        };
-        let size = login_response.serialize(&crypto, &mut self.buf);
+        self.refuse_login(exchange, request, &crypto, &failure_data);
+    }
+
+    fn refuse_login(
+        &mut self,
+        exchange: Exchange,
+        request: [u8; 32],
+        crypto: &Crypto,
+        failure_data: &[u8],
+    ) {
+        let size = LoginResponse::Failure { failure_data }.serialize(crypto, &mut self.buf);
         self.answer_login(exchange, request, size);
     }
 
@@ -935,11 +931,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             .remove(&TimedEventKey::RemoveExpectingLoginRequest(exchange));
         if self.auth_cmd_tx.try_send(auth_cmd).is_err() {
             log!(warn, %from, "authenticator busy, login refused");
-            let login_response = LoginResponse::Failure {
-                failure_data: b"Server busy",
-            };
-            let size = login_response.serialize(&pending.crypto, &mut self.buf);
-            self.answer_login(exchange, request, size);
+            self.refuse_login(exchange, request, &pending.crypto, b"Server busy");
             return;
         }
         log!(debug, %from, "authenticating");
