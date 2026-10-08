@@ -9,12 +9,9 @@ use std::{
 
 use ahash::HashMap;
 use hexgate::{
-    common::{
-        channel::{scheduler::ChannelConfiguration, Channel},
-        fingerprint, keys,
-        socket::net_sym::NetworkSimulator,
-    },
-    server::{self, auth::Authenticator, Event, Server},
+    fingerprint, keys,
+    server::{self, Event},
+    Authenticator, Channel, ChannelConfiguration, NetworkSimulator, Server,
 };
 use rand::{thread_rng, Rng};
 

@@ -8,7 +8,8 @@ use std::{
 };
 
 use reliable::ReliableChannel;
-use scheduler::{ChannelConfiguration, Scheduler};
+pub use scheduler::ChannelConfiguration;
+use scheduler::Scheduler;
 use unreliable::UnreliableChannel;
 use unreliable_ordered::UnreliableOrderedChannel;
 
@@ -23,7 +24,7 @@ use super::{
 
 mod fragments;
 mod reliable;
-pub mod scheduler;
+pub(crate) mod scheduler;
 mod unreliable;
 mod unreliable_ordered;
 

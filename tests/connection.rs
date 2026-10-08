@@ -15,14 +15,10 @@ use common::{
     SECRET_KEY, TIMEOUT,
 };
 use hexgate::{
-    client::{self as hexclient, Client, ConnectError, ServerKey},
-    common::{
-        channel::{scheduler::ChannelConfiguration, Channel},
-        error::SendError,
-        socket::net_sym::NetworkSimulator,
-        AllowedClientVersions, ClientVersion,
-    },
-    server::{self as hexserver, auth::Authenticator, Server},
+    client::{self as hexclient, ConnectError},
+    error::SendError,
+    server as hexserver, AllowedClientVersions, Authenticator, Channel, ChannelConfiguration,
+    Client, ClientVersion, NetworkSimulator, Server, ServerKey,
 };
 use rand::Rng;
 

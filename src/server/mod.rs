@@ -12,7 +12,8 @@ use std::{
 };
 
 use ahash::HashSet;
-use auth::{AuthResult, AuthThreadState, Authenticator};
+use auth::AuthThreadState;
+pub use auth::{AuthResult, Authenticator};
 use bon::bon;
 use crossbeam::channel::{bounded, unbounded};
 use ed25519_dalek::SigningKey;
@@ -34,7 +35,7 @@ use crate::common::{
     AllowedClientVersions, Cipher, ClientVersion, WAKE_TOKEN,
 };
 
-pub mod auth;
+mod auth;
 mod connection;
 mod rate_limit;
 mod thread;

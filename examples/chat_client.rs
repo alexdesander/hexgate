@@ -8,13 +8,8 @@ use std::{
 };
 
 use hexgate::{
-    client::{Client, Event, ServerKey},
-    common::{
-        channel::{scheduler::ChannelConfiguration, Channel},
-        fingerprint, keys,
-        socket::net_sym::NetworkSimulator,
-        ClientVersion,
-    },
+    client::Event, fingerprint, keys, Channel, ChannelConfiguration, Client, ClientVersion,
+    NetworkSimulator, ServerKey,
 };
 use rand::{thread_rng, Rng};
 use text_io::read;

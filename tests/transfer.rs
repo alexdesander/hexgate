@@ -7,7 +7,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{connected, Network, BAD, OKAY, TERRIBLE, TIMEOUT};
-use hexgate::{common::channel::Channel, server::Event};
+use hexgate::{server::Event, Channel};
 
 /// All messages arrive, in order.
 fn reliable_transfer(network: Option<Network>, amount: u32, timeout_dur: Duration) {

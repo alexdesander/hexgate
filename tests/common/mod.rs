@@ -11,12 +11,8 @@ use std::{
 };
 
 use hexgate::{
-    client::{Client, ServerKey},
-    common::{
-        channel::scheduler::ChannelConfiguration, error::RecvError,
-        socket::net_sym::NetworkSimulator, ClientVersion,
-    },
-    server::{self, auth::Authenticator, Server},
+    error::RecvError, server, Authenticator, ChannelConfiguration, Client, ClientVersion,
+    NetworkSimulator, Server, ServerKey,
 };
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;

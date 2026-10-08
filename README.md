@@ -77,7 +77,7 @@ match server.next() {
 
 Creating a hexgate client and connecting to a server. The client pins the server's public key
 (`hexgate::server::public_key(&secret_key)`, shipped with the game), so nobody else can pose as the
-server (`hexgate::common::fingerprint` formats it for comparing). `ServerKey::Unverified` turns this off explicitly; for
+server (`hexgate::fingerprint` formats it for comparing). `ServerKey::Unverified` turns this off explicitly; for
 trust on first use, connect unverified once and store `client.get_server_key()` with `keys::save`.
 ```rust
 let client = Client::prepare()
