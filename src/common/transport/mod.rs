@@ -227,8 +227,7 @@ impl Connection {
 
     pub fn take_send_results(&mut self, budget: &mut DeliveryBudget, out: &mut Vec<Output>) {
         self.channels.take_results(&mut self.send_results);
-        let take = budget.messages.min(self.send_results.len());
-        budget.messages -= take;
+        let take = budget.take_many(self.send_results.len());
         out.extend(
             self.send_results
                 .drain(..take)
@@ -382,7 +381,7 @@ impl Connection {
                     .on_unreliable(now, channel, msg_id, fragment, data)
                     .map(|message| {
                         if let Some(message) = message
-                            && budget.take(message.len())
+                            && budget.admit(message.len())
                         {
                             out.push(Output::Message(
                                 channel.map_or(Channel::Unreliable, Channel::UnreliableOrdered),
@@ -434,6 +433,7 @@ impl Connection {
     ) -> Result<(), PacketError> {
         let mut budget = DeliveryBudget::unlimited();
         if !accept {
+            budget.room = 0;
             budget.messages = 0;
         }
         self.handle_with_budget(now, datagram, &mut budget, out)
@@ -862,6 +862,7 @@ mod tests {
         let mut output = Vec::new();
         client.take_send_results(
             &mut DeliveryBudget {
+                room: 0,
                 messages: 0,
                 bytes: 0,
                 work: 0,

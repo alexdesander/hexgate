@@ -115,10 +115,12 @@ pub fn channels(inputs: &[Vec<u8>]) {
     for input in inputs.iter().take(512) {
         let mut input = input.clone();
         now += Duration::from_millis(1);
+        let room = input
+            .first()
+            .map_or(256, |byte| usize::from(byte % 3) * 128);
         let mut budget = DeliveryBudget {
-            messages: input
-                .first()
-                .map_or(256, |byte| usize::from(byte % 3) * 128),
+            room,
+            messages: room,
             bytes: MAX_MESSAGE_SIZE,
             work: 64 << 10,
         };
@@ -247,6 +249,7 @@ pub fn progress(input: &[u8]) {
         }
         if round >= 32 || round % 8 == 0 {
             let mut budget = DeliveryBudget {
+                room: 2,
                 messages: 2,
                 bytes: MAX_MESSAGE_SIZE,
                 work: 64 << 10,

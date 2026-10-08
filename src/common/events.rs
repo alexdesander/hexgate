@@ -13,7 +13,11 @@ use super::error::RecvError;
 
 const MAX_QUEUED_BYTES: usize = 64 << 20;
 
+/// `room` and `bytes` are what the event queue can take. `messages` (at most `room`) caps the
+/// buffered messages and send results one loop iteration delivers; unreliable messages decoded
+/// from a datagram cannot wait for a later iteration, so only the queue limits them (`admit`).
 pub(crate) struct DeliveryBudget {
+    pub room: usize,
     pub messages: usize,
     pub bytes: usize,
     pub work: usize,
@@ -23,6 +27,7 @@ impl DeliveryBudget {
     #[cfg(any(test, feature = "bench"))]
     pub fn unlimited() -> Self {
         Self {
+            room: usize::MAX,
             messages: usize::MAX,
             bytes: usize::MAX,
             work: usize::MAX,
@@ -34,8 +39,27 @@ impl DeliveryBudget {
             return false;
         }
         self.messages -= 1;
+        self.room -= 1;
         self.bytes -= bytes;
         true
+    }
+
+    pub fn admit(&mut self, bytes: usize) -> bool {
+        if self.room == 0 || bytes > self.bytes {
+            return false;
+        }
+        self.room -= 1;
+        self.messages = self.messages.min(self.room);
+        self.bytes -= bytes;
+        true
+    }
+
+    /// Takes up to `count` messages, returns how many.
+    pub fn take_many(&mut self, count: usize) -> usize {
+        let count = count.min(self.messages);
+        self.messages -= count;
+        self.room -= count;
+        count
     }
 }
 
@@ -86,8 +110,10 @@ impl<E: Payload> EventSender<E> {
     }
 
     pub fn budget(&self) -> DeliveryBudget {
+        let room = self.max_events.saturating_sub(self.tx.len());
         DeliveryBudget {
-            messages: self.max_events.saturating_sub(self.tx.len()).min(256),
+            room,
+            messages: room.min(256),
             bytes: self
                 .max_bytes
                 .saturating_sub(self.bytes.load(Ordering::Relaxed)),

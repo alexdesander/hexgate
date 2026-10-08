@@ -610,6 +610,7 @@ mod tests {
         recv.receive(0, &[0]).unwrap();
         let mut delivered = 0;
         let mut budget = DeliveryBudget {
+            room: usize::MAX,
             messages: 17,
             bytes: 0,
             work: 1024,
@@ -623,6 +624,7 @@ mod tests {
         assert!(recv.has_pending_delivery());
         assert!(recv.delivered <= 18);
         let mut budget = DeliveryBudget {
+            room: usize::MAX,
             messages: 100,
             bytes: 0,
             work: 7,
@@ -653,6 +655,7 @@ mod tests {
         assert_eq!(send.sent, WINDOW);
         assert!(send.queued_bytes() > 0);
         let mut budget = DeliveryBudget {
+            room: usize::MAX,
             messages: 0,
             bytes: 0,
             work: 1 << 20,
@@ -766,6 +769,7 @@ mod tests {
         let mut messages = Vec::new();
         while recv.has_pending_delivery() {
             let mut budget = DeliveryBudget {
+                room: usize::MAX,
                 messages: 1,
                 bytes: 1 << 20,
                 work: 997,
