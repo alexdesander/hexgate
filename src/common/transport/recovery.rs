@@ -342,7 +342,7 @@ mod tests {
     fn sent(time: Instant) -> SentPacket {
         let mut frames = StreamFrames::default();
         frames.push(crate::common::channel::StreamRange {
-            channel: 0,
+            stream: 0,
             start: 0,
             len: 100,
         });

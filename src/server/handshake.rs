@@ -38,7 +38,7 @@ pub(crate) struct HandshakeThreadState {
     pub signing_key: SigningKey,
     pub cipher: Cipher,
     pub auth_salt: [u8; 16],
-    pub channel_counts: [u16; 2],
+    pub channel_counts: [u16; 3],
     pub requests: Receiver<KeyExchange>,
     pub results: Sender<KeyExchanged>,
     pub waker: Arc<Waker>,

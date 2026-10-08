@@ -41,6 +41,7 @@ pub fn channel_config() -> ChannelConfiguration {
         weight_unreliable: 10,
         weights_unreliable_ordered: vec![10; 5],
         weights_reliable: vec![10; 5],
+        weights_reliable_unordered: vec![10; 5],
         unreliable_max_age: Duration::from_secs(60),
     }
 }

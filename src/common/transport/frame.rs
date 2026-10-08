@@ -10,11 +10,19 @@
 //! ACK         0x02 largest, ack_delay_us, range_count, first_range, (gap, len)*,
 //!                  ts_count, [largest - pn, recv_us, (pn gap - 1, zigzag recv_us delta)*]
 //! CLOSE       0x03 len, reason
+//! CREDIT      0x04 | UNORDERED_STREAM 0x02: channel, limit
+//! RESET       0x05 | UNORDERED_STREAM 0x02: channel, offset
 //! UNRELIABLE  0x08 | LEN 0x01 | ORDERED 0x02 | FRAG 0x04:
 //!                  [channel if ORDERED] [msg_id if ORDERED or FRAG] [offset, total if FRAG]
 //!                  [len if LEN] data
 //! RELIABLE    0x10 | LEN 0x01: channel, offset, [len if LEN] data
+//! UNORDERED   0x20 | LEN 0x01 | FRAG 0x04: channel, start, [offset, total if FRAG],
+//!                  [len if LEN] data
 //! ```
+//!
+//! CREDIT and RESET address `Channel::Reliable` or, with `UNORDERED_STREAM`,
+//! `Channel::ReliableUnordered`. An UNORDERED frame carries a whole message, or with `FRAG` the
+//! bytes at `offset` of a message of `total` bytes; `start` is the message's stream offset.
 //!
 //! ACK ranges follow QUIC: the first covers `largest - first_range..=largest`, each further
 //! range ends `gap + 2` below the previous start and spans `len + 1` packets. Receive
@@ -34,9 +42,12 @@ const CREDIT: u8 = 0x04;
 const RESET: u8 = 0x05;
 const UNRELIABLE: u8 = 0x08;
 const RELIABLE: u8 = 0x10;
+const UNORDERED: u8 = 0x20;
 const LEN: u8 = 0x01;
 const ORDERED: u8 = 0x02;
 const FRAG: u8 = 0x04;
+/// Marks CREDIT and RESET frames of reliable unordered channels.
+const UNORDERED_STREAM: u8 = 0x02;
 const MAX_RANGES: u64 = 256;
 const MAX_TIMESTAMPS: u64 = 64;
 
@@ -49,10 +60,12 @@ pub struct Fragment {
 pub enum Frame<'a> {
     Ping,
     Credit {
+        unordered: bool,
         channel: u8,
         limit: u64,
     },
     Reset {
+        unordered: bool,
         channel: u8,
         offset: u64,
     },
@@ -68,6 +81,12 @@ pub enum Frame<'a> {
     Reliable {
         channel: u8,
         offset: u64,
+        data: &'a [u8],
+    },
+    Unordered {
+        channel: u8,
+        start: u64,
+        fragment: Option<Fragment>,
         data: &'a [u8],
     },
 }
@@ -156,11 +175,13 @@ pub fn parse<'a>(r: &mut Reader<'a>) -> Result<Option<Frame<'a>>, PacketError> {
     };
     let frame = match kind {
         PING => Frame::Ping,
-        CREDIT => Frame::Credit {
+        kind if kind & !UNORDERED_STREAM == CREDIT => Frame::Credit {
+            unordered: kind & UNORDERED_STREAM != 0,
             channel: malformed(r.u8())?,
             limit: malformed(r.varint())?,
         },
-        RESET => Frame::Reset {
+        kind if kind & !UNORDERED_STREAM == RESET => Frame::Reset {
+            unordered: kind & UNORDERED_STREAM != 0,
             channel: malformed(r.u8())?,
             offset: malformed(r.varint())?,
         },
@@ -192,6 +213,18 @@ pub fn parse<'a>(r: &mut Reader<'a>) -> Result<Option<Frame<'a>>, PacketError> {
         kind if kind & !LEN == RELIABLE => Frame::Reliable {
             channel: malformed(r.u8())?,
             offset: malformed(r.varint())?,
+            data: data(r, kind & LEN != 0)?,
+        },
+        kind if kind & !(LEN | FRAG) == UNORDERED => Frame::Unordered {
+            channel: malformed(r.u8())?,
+            start: malformed(r.varint())?,
+            fragment: match kind & FRAG {
+                0 => None,
+                _ => Some(Fragment {
+                    offset: malformed(r.varint())?,
+                    total: malformed(r.varint())?,
+                }),
+            },
             data: data(r, kind & LEN != 0)?,
         },
         _ => return Err(PacketError::Malformed),
@@ -393,23 +426,48 @@ pub fn write_reliable_header(w: &mut Writer, channel: u8, offset: u64, len: usiz
     }
 }
 
-pub fn write_credit(w: &mut Writer, channel: u8, limit: u64) -> bool {
-    if w.remaining() < 2 + varint_len(limit) {
-        return false;
-    }
-    w.u8(CREDIT);
-    w.u8(channel);
-    w.varint(limit);
-    true
+/// The header size of an unordered frame without `LEN`.
+pub fn unordered_header(start: u64, fragment: Option<Fragment>) -> usize {
+    2 + varint_len(start) + fragment.map_or(0, |f| varint_len(f.offset) + varint_len(f.total))
 }
 
-pub fn write_reset(w: &mut Writer, channel: u8, offset: u64) -> bool {
-    if w.remaining() < 2 + varint_len(offset) {
+/// Writes an unordered frame with all of `data`, which must fit.
+pub fn write_unordered(
+    w: &mut Writer,
+    channel: u8,
+    start: u64,
+    fragment: Option<Fragment>,
+    data: &[u8],
+) {
+    let with_len = unordered_header(start, fragment) + data.len() < w.remaining();
+    w.u8(UNORDERED | if with_len { LEN } else { 0 } | fragment.map_or(0, |_| FRAG));
+    w.u8(channel);
+    w.varint(start);
+    if let Some(fragment) = fragment {
+        w.varint(fragment.offset);
+        w.varint(fragment.total);
+    }
+    if with_len {
+        w.varint(data.len() as u64);
+    }
+    w.bytes(data);
+}
+
+pub fn write_credit(w: &mut Writer, unordered: bool, channel: u8, limit: u64) -> bool {
+    write_stream_limit(w, CREDIT, unordered, channel, limit)
+}
+
+pub fn write_reset(w: &mut Writer, unordered: bool, channel: u8, offset: u64) -> bool {
+    write_stream_limit(w, RESET, unordered, channel, offset)
+}
+
+fn write_stream_limit(w: &mut Writer, kind: u8, unordered: bool, channel: u8, value: u64) -> bool {
+    if w.remaining() < 2 + varint_len(value) {
         return false;
     }
-    w.u8(RESET);
+    w.u8(kind | if unordered { UNORDERED_STREAM } else { 0 });
     w.u8(channel);
-    w.varint(offset);
+    w.varint(value);
     true
 }
 

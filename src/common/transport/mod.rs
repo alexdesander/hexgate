@@ -192,9 +192,9 @@ impl Connection {
         }
     }
 
-    pub fn reset_channel(&mut self, channel: u8) {
+    pub fn reset_channel(&mut self, channel: Channel) {
         self.staged.retain(|(queued_channel, message)| {
-            if *queued_channel != Channel::Reliable(channel) {
+            if *queued_channel != channel {
                 return true;
             }
             if let Some(receipt) = message.options.receipt {
@@ -335,7 +335,10 @@ impl Connection {
         let mut r = Reader::new(payload);
         while let Some(frame) = frame::parse(&mut r)? {
             eliciting |= !matches!(frame, Frame::Ack(_));
-            data |= matches!(frame, Frame::Unreliable { .. } | Frame::Reliable { .. });
+            data |= matches!(
+                frame,
+                Frame::Unreliable { .. } | Frame::Reliable { .. } | Frame::Unordered { .. }
+            );
             close |= matches!(frame, Frame::Close(_));
         }
         let accept = self.close.is_none();
@@ -354,8 +357,16 @@ impl Connection {
         while let Some(frame) = frame::parse(&mut r)? {
             let result = match frame {
                 Frame::Ping => Ok(()),
-                Frame::Credit { channel, limit } => self.channels.on_credit(channel, limit),
-                Frame::Reset { channel, offset } => self.channels.on_reset(channel, offset),
+                Frame::Credit {
+                    unordered,
+                    channel,
+                    limit,
+                } => self.channels.on_credit(unordered, channel, limit),
+                Frame::Reset {
+                    unordered,
+                    channel,
+                    offset,
+                } => self.channels.on_reset(unordered, channel, offset),
                 Frame::Ack(ack) => {
                     if ack.largest >= self.history.next_pn() {
                         Err(ProtocolViolation::Malformed)
@@ -394,6 +405,12 @@ impl Connection {
                     offset,
                     data,
                 } => self.channels.on_reliable(channel, offset, data),
+                Frame::Unordered {
+                    channel,
+                    start,
+                    fragment,
+                    data,
+                } => self.channels.on_unordered(channel, start, fragment, data),
             };
             if let Err(violation) = result {
                 out.push(Output::Violation(violation));

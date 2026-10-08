@@ -118,7 +118,7 @@ fn channel_reset_cancels_a_partial_transfer_and_delivers_its_successor() {
     pairs.run(now + Duration::from_millis(5), &mut |_, _, _, delivery| {
         panic!("{delivery:?}")
     });
-    pairs.reset_channel(0, Side::Client, 0);
+    pairs.reset_channel(0, Side::Client, Channel::Reliable(0));
     pairs.send_with(
         0,
         Side::Client,

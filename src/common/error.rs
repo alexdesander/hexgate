@@ -86,6 +86,9 @@ pub enum SendError {
     /// The channel id is beyond the channel configuration.
     #[error("channel {0:?} is not configured")]
     UnknownChannel(Channel),
+    /// Only reliable channels can be reset.
+    #[error("channel {0:?} is not reliable")]
+    NotReliable(Channel),
     /// The client isn't connected (see `Server::connections`). A client disconnecting at the
     /// same time can still drop the message without this error.
     #[error("{0} is not connected")]
@@ -104,7 +107,7 @@ pub enum ConfigError {
     /// A `ChannelConfiguration` weight is 0.
     #[error("channel weights must be greater than zero")]
     ZeroChannelWeight,
-    /// More than 256 unreliable ordered or reliable channels.
+    /// More than 256 channels of one kind.
     #[error("{0} channels of one kind configured, at most 256 are supported")]
     TooManyChannels(usize),
     /// The server info exceeds 256 bytes.

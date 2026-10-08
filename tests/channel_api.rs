@@ -56,8 +56,8 @@ fn socket_threads_preserve_channel_stats_resets_priorities_and_receipts() {
                 .is_some_and(|delay| delay > Duration::from_secs(20))
         );
     }
-    client.reset_channel(0).unwrap();
-    server.reset_channel(peer, 0).unwrap();
+    client.reset_channel(Channel::Reliable(0)).unwrap();
+    server.reset_channel(peer, Channel::Reliable(0)).unwrap();
     client
         .send_with(Channel::Reliable(0), vec![9], receipt(2))
         .unwrap();

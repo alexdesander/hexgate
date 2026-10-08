@@ -43,7 +43,7 @@ pub(super) struct Handshake {
     #[cfg(feature = "argon2")]
     pub hash_auth_data: bool,
     pub client_version: ClientVersion,
-    pub channel_counts: [u16; 2],
+    pub channel_counts: [u16; 3],
     pub timeout: Duration,
     pub tries: u8,
 }
@@ -278,22 +278,30 @@ impl Link<'_> {
                 Cmd::Stats(_) | Cmd::ChannelStats(_, _) => {}
                 #[cfg(feature = "sim")]
                 Cmd::SetSimulator(simulator) => {
-                    self.pending.retain(|cmd| !matches!(cmd, Cmd::SetSimulator(_)));
+                    self.pending
+                        .retain(|cmd| !matches!(cmd, Cmd::SetSimulator(_)));
                     self.pending.push(Cmd::SetSimulator(simulator));
                 }
                 Cmd::Flush => {
-                    if !self.pending.iter().rev().take_while(|cmd| !matches!(cmd, Cmd::Send(..)))
-                        .any(|cmd| matches!(cmd, Cmd::Flush)) {
+                    if !self
+                        .pending
+                        .iter()
+                        .rev()
+                        .take_while(|cmd| !matches!(cmd, Cmd::Send(..)))
+                        .any(|cmd| matches!(cmd, Cmd::Flush))
+                    {
                         self.pending.push(Cmd::Flush);
                     }
                 }
                 Cmd::SetPriority(channel, priority) => {
-                    self.pending.retain(|cmd| !matches!(cmd, Cmd::SetPriority(previous, _) if *previous == channel));
+                    self.pending.retain(
+                        |cmd| !matches!(cmd, Cmd::SetPriority(previous, _) if *previous == channel),
+                    );
                     self.pending.push(Cmd::SetPriority(channel, priority));
                 }
                 Cmd::ResetChannel(channel) => {
                     if !self.pending.iter().rev()
-                        .take_while(|cmd| !matches!(cmd, Cmd::Send(crate::common::channel::Channel::Reliable(previous), _) if *previous == channel))
+                        .take_while(|cmd| !matches!(cmd, Cmd::Send(previous, _) if *previous == channel))
                         .any(|cmd| matches!(cmd, Cmd::ResetChannel(previous) if *previous == channel)) {
                         self.pending.push(Cmd::ResetChannel(channel));
                     }

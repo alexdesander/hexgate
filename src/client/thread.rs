@@ -38,7 +38,7 @@ pub enum Cmd {
     Flush,
     Stats(Sender<Stats>),
     ChannelStats(Channel, Sender<Option<ChannelStats>>),
-    ResetChannel(u8),
+    ResetChannel(Channel),
     SetPriority(Channel, i8),
 }
 

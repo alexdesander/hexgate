@@ -86,7 +86,7 @@ pub enum Cmd<R: AuthResult> {
     Flush,
     Stats(SocketAddr, Sender<Option<Stats>>),
     ChannelStats(SocketAddr, Channel, Sender<Option<ChannelStats>>),
-    ResetChannel(SocketAddr, Arc<PeerState>, u8),
+    ResetChannel(SocketAddr, Arc<PeerState>, Channel),
     SetPriority(SocketAddr, Arc<PeerState>, Channel, i8),
     /// The authenticator panicked, the server shuts down and reports this.
     Failed(RecvError),

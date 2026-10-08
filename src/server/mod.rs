@@ -337,8 +337,8 @@ impl<R: AuthResult> Server<R> {
 
     /// Abandons queued transfers on this reliable channel and starts a new generation
     /// Data received before the reset reaches the peer may still be delivered
-    pub fn reset_channel(&self, client: SocketAddr, channel: u8) -> Result<(), SendError> {
-        self.send_limits.check(Channel::Reliable(channel), 0)?;
+    pub fn reset_channel(&self, client: SocketAddr, channel: Channel) -> Result<(), SendError> {
+        self.send_limits.check_reset(channel)?;
         let peer = self
             .connected()
             .get(&client)

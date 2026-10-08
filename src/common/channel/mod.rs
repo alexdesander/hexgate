@@ -6,9 +6,10 @@
 use std::rc::Rc;
 use std::{sync::Arc, time::Instant};
 
-use reliable::{RecvStream, SendStream};
+use reliable::{Credit, RecvStream, SendStream};
 pub use scheduler::ChannelConfiguration;
 use scheduler::Scheduler;
+use unordered::UnorderedRecv;
 use unreliable::{AssemblyBudget, UnreliableRecv, UnreliableSend, Write};
 
 use super::{
@@ -23,6 +24,7 @@ use super::{
 mod ranges;
 mod reliable;
 pub(crate) mod scheduler;
+mod unordered;
 mod unreliable;
 
 pub(crate) type SendResult = (u64, SendOutcome, Option<Arc<Reservation>>);
@@ -43,6 +45,15 @@ pub enum Channel {
     UnreliableOrdered(u8),
     /// Messages arrive exactly once and in the order they were sent on this channel.
     Reliable(u8),
+    /// Messages arrive exactly once, in any order: each one is delivered as soon as all of it
+    /// arrived, without waiting for messages sent before it.
+    ReliableUnordered(u8),
+}
+
+impl Channel {
+    pub(crate) fn is_reliable(self) -> bool {
+        matches!(self, Channel::Reliable(_) | Channel::ReliableUnordered(_))
+    }
 }
 
 /// What `send` validates before a message is handed to the network thread.
@@ -51,6 +62,7 @@ pub(crate) struct SendLimits {
     max_msg_size: usize,
     unreliable_ordered_channels: usize,
     reliable_channels: usize,
+    reliable_unordered_channels: usize,
 }
 
 impl SendLimits {
@@ -59,6 +71,7 @@ impl SendLimits {
             max_msg_size,
             unreliable_ordered_channels: config.weights_unreliable_ordered.len(),
             reliable_channels: config.weights_reliable.len(),
+            reliable_unordered_channels: config.weights_reliable_unordered.len(),
         }
     }
 
@@ -67,18 +80,29 @@ impl SendLimits {
             Channel::Unreliable => true,
             Channel::UnreliableOrdered(id) => (id as usize) < self.unreliable_ordered_channels,
             Channel::Reliable(id) => (id as usize) < self.reliable_channels,
+            Channel::ReliableUnordered(id) => (id as usize) < self.reliable_unordered_channels,
         };
         if !configured {
             return Err(SendError::UnknownChannel(channel));
         }
         TooLarge::check(size, self.max_msg_size).map_err(SendError::MessageTooLarge)
     }
+
+    /// Checks that `channel` is configured and can be reset.
+    pub fn check_reset(&self, channel: Channel) -> Result<(), SendError> {
+        self.check(channel, 0)?;
+        match channel.is_reliable() {
+            true => Ok(()),
+            false => Err(SendError::NotReliable(channel)),
+        }
+    }
 }
 
-/// Reliable stream bytes a packet carried.
+/// Stream bytes a packet carried.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StreamRange {
-    pub channel: u8,
+    /// Index into `Channels::streams`.
+    pub stream: u16,
     pub start: u64,
     pub len: u32,
 }
@@ -94,9 +118,9 @@ impl StreamRange {
 pub(crate) struct StreamFrames {
     ranges: [StreamRange; 4],
     len: u8,
-    credits: [(u8, u64); 4],
+    credits: [(u16, u64); 4],
     credits_len: usize,
-    resets: [(u8, u64); 4],
+    resets: [(u16, u64); 4],
     resets_len: usize,
     receipts: [(u16, u64); 4],
     receipts_len: usize,
@@ -111,7 +135,16 @@ impl StreamFrames {
         self.len as usize == self.ranges.len()
     }
 
+    /// Adds a range, merged into one of the same stream that it continues.
     pub fn push(&mut self, range: StreamRange) {
+        let ranges = &mut self.ranges[..self.len as usize];
+        if let Some(previous) = ranges
+            .iter_mut()
+            .find(|previous| previous.stream == range.stream && previous.range().end == range.start)
+        {
+            previous.len += range.len;
+            return;
+        }
         self.ranges[self.len as usize] = range;
         self.len += 1;
     }
@@ -121,12 +154,72 @@ impl StreamFrames {
     }
 }
 
+enum Recv {
+    Ordered(RecvStream),
+    Unordered(UnorderedRecv),
+}
+
+impl Recv {
+    fn credit(&mut self) -> &mut Credit {
+        match self {
+            Recv::Ordered(recv) => &mut recv.credit,
+            Recv::Unordered(recv) => &mut recv.credit,
+        }
+    }
+
+    fn credit_pending(&self) -> Option<u64> {
+        match self {
+            Recv::Ordered(recv) => recv.credit_pending(),
+            Recv::Unordered(recv) => recv.credit_pending(),
+        }
+    }
+
+    fn has_pending_delivery(&self) -> bool {
+        match self {
+            Recv::Ordered(recv) => recv.has_pending_delivery(),
+            Recv::Unordered(recv) => recv.has_pending_delivery(),
+        }
+    }
+
+    fn reset(&mut self, offset: u64) {
+        match self {
+            Recv::Ordered(recv) => recv.reset(offset),
+            Recv::Unordered(recv) => recv.reset(offset),
+        }
+    }
+
+    fn drain(
+        &mut self,
+        budget: &mut DeliveryBudget,
+        out: &mut impl FnMut(Vec<u8>),
+    ) -> Result<(), ProtocolViolation> {
+        match self {
+            Recv::Ordered(recv) => recv.drain(budget, out),
+            Recv::Unordered(recv) => {
+                recv.drain(budget, out);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The channel of a stream: whether it is unordered, and its id.
+fn stream_channel(ordered: usize, stream: usize) -> (bool, u8) {
+    match stream.checked_sub(ordered) {
+        Some(id) => (true, id as u8),
+        None => (false, stream as u8),
+    }
+}
+
 pub(crate) struct Channels {
     max_recv_msg_size: usize,
     scheduler: Scheduler,
     /// `Channel::Unreliable` first, then the ordered ones.
     unreliable: Vec<(UnreliableSend, UnreliableRecv)>,
-    reliable: Vec<(SendStream, RecvStream)>,
+    /// `Channel::Reliable` first, then `Channel::ReliableUnordered`.
+    streams: Vec<(SendStream, Recv)>,
+    /// The number of `Channel::Reliable` streams.
+    ordered: usize,
     budget: AssemblyBudget,
     /// Slots whose next frame didn't fit into the packet being written.
     no_room: Vec<bool>,
@@ -135,7 +228,7 @@ pub(crate) struct Channels {
 
 impl Channels {
     pub fn exhausted(&self) -> bool {
-        self.reliable.iter().any(|(send, _)| send.exhausted())
+        self.streams.iter().any(|(send, _)| send.exhausted())
     }
 
     pub fn new(config: &ChannelConfiguration, max_recv_msg_size: usize) -> Self {
@@ -151,8 +244,19 @@ impl Channels {
             )
         }))
         .collect();
-        let reliable = (0..config.weights_reliable.len())
-            .map(|_| (SendStream::default(), RecvStream::new(max_recv_msg_size)))
+        let streams = (0..config.weights_reliable.len())
+            .map(|_| {
+                (
+                    SendStream::new(false),
+                    Recv::Ordered(RecvStream::new(max_recv_msg_size)),
+                )
+            })
+            .chain((0..config.weights_reliable_unordered.len()).map(|_| {
+                (
+                    SendStream::new(true),
+                    Recv::Unordered(UnorderedRecv::new(max_recv_msg_size)),
+                )
+            }))
             .collect();
         let scheduler = Scheduler::new(config);
         Self {
@@ -161,7 +265,8 @@ impl Channels {
             no_room: vec![false; scheduler.slots()],
             scheduler,
             unreliable,
-            reliable,
+            streams,
+            ordered: config.weights_reliable.len(),
             budget: AssemblyBudget {
                 left: max_recv_msg_size.saturating_mul(ASSEMBLY_BUDGET),
             },
@@ -179,12 +284,34 @@ impl Channels {
             Channel::UnreliableOrdered(id) => {
                 self.unreliable[id as usize + 1].0.push_message(message)
             }
-            Channel::Reliable(id) => self.reliable[id as usize].0.push_message(message),
+            Channel::Reliable(id) => self.streams[id as usize].0.push_message(message),
+            Channel::ReliableUnordered(id) => self.streams[self.ordered + id as usize]
+                .0
+                .push_message(message),
         }
     }
 
-    pub fn reset_channel(&mut self, channel: u8) {
-        self.reliable[channel as usize].0.reset();
+    pub fn reset_channel(&mut self, channel: Channel) {
+        if let Some(stream) = self.stream_of(channel) {
+            self.streams[stream].0.reset();
+        }
+    }
+
+    /// The stream of a configured channel: `unordered` picks `Channel::ReliableUnordered`.
+    fn stream(&self, unordered: bool, channel: u8) -> Option<usize> {
+        let (first, count) = match unordered {
+            false => (0, self.ordered),
+            true => (self.ordered, self.streams.len() - self.ordered),
+        };
+        ((channel as usize) < count).then_some(first + channel as usize)
+    }
+
+    fn stream_of(&self, channel: Channel) -> Option<usize> {
+        match channel {
+            Channel::Reliable(id) => self.stream(false, id),
+            Channel::ReliableUnordered(id) => self.stream(true, id),
+            Channel::Unreliable | Channel::UnreliableOrdered(_) => None,
+        }
     }
 
     fn slot(&self, channel: Channel) -> Option<usize> {
@@ -193,9 +320,9 @@ impl Channels {
             Channel::UnreliableOrdered(id) => {
                 (id as usize + 1 < self.unreliable.len()).then_some(id as usize + 1)
             }
-            Channel::Reliable(id) => {
-                ((id as usize) < self.reliable.len()).then_some(self.unreliable.len() + id as usize)
-            }
+            Channel::Reliable(_) | Channel::ReliableUnordered(_) => self
+                .stream_of(channel)
+                .map(|stream| self.unreliable.len() + stream),
         }
     }
 
@@ -216,8 +343,8 @@ impl Channels {
                 let send = &self.unreliable[id as usize + 1].0;
                 (send.unsent_bytes(), 0, send.oldest())
             }
-            Channel::Reliable(id) => {
-                let send = &self.reliable[id as usize].0;
+            Channel::Reliable(_) | Channel::ReliableUnordered(_) => {
+                let send = &self.streams[self.stream_of(channel)?].0;
                 (send.unsent_bytes(), send.unacked_bytes(), send.oldest())
             }
         };
@@ -234,7 +361,7 @@ impl Channels {
         for (send, _) in &mut self.unreliable {
             send.take_results(out);
         }
-        for (send, _) in &mut self.reliable {
+        for (send, _) in &mut self.streams {
             send.take_results(out);
         }
     }
@@ -247,20 +374,16 @@ impl Channels {
                 false => 0,
             },
             None => {
-                (self.reliable[slot - self.unreliable.len()].0.sendable() as usize).min(capacity)
+                (self.streams[slot - self.unreliable.len()].0.sendable() as usize).min(capacity)
             }
         }
     }
 
     /// Whether a channel has something to send. Drops expired unreliable messages.
     pub fn has_data(&mut self, now: Instant) -> bool {
-        self.reliable
+        self.streams
             .iter()
-            .any(|(_, recv)| recv.credit_pending().is_some())
-            || self
-                .reliable
-                .iter()
-                .any(|(send, _)| send.reset_pending().is_some())
+            .any(|(send, recv)| recv.credit_pending().is_some() || send.reset_pending().is_some())
             || (0..self.scheduler.slots()).any(|slot| self.next_size(slot, now, 1) > 0)
     }
 
@@ -277,28 +400,30 @@ impl Channels {
         let slots = self.scheduler.slots();
         self.no_room.fill(false);
         let mut wrote = false;
-        for (channel, (send, _)) in self.reliable.iter_mut().enumerate() {
+        for (stream, (send, _)) in self.streams.iter_mut().enumerate() {
             if frames.resets_len == frames.resets.len() {
                 break;
             }
+            let (unordered, channel) = stream_channel(self.ordered, stream);
             if let Some(offset) = send.reset_pending()
-                && super::transport::frame::write_reset(w, channel as u8, offset)
+                && super::transport::frame::write_reset(w, unordered, channel, offset)
             {
                 send.reset_sent();
-                frames.resets[frames.resets_len] = (channel as u8, offset);
+                frames.resets[frames.resets_len] = (stream as u16, offset);
                 frames.resets_len += 1;
                 wrote = true;
             }
         }
-        for (channel, (_, recv)) in self.reliable.iter_mut().enumerate() {
+        for (stream, (_, recv)) in self.streams.iter_mut().enumerate() {
             if frames.credits_len == frames.credits.len() {
                 break;
             }
+            let (unordered, channel) = stream_channel(self.ordered, stream);
             if let Some(limit) = recv.credit_pending()
-                && super::transport::frame::write_credit(w, channel as u8, limit)
+                && super::transport::frame::write_credit(w, unordered, channel, limit)
             {
-                recv.credit_sent(limit);
-                frames.credits[frames.credits_len] = (channel as u8, limit);
+                recv.credit().sent(limit);
+                frames.credits[frames.credits_len] = (stream as u16, limit);
                 frames.credits_len += 1;
                 wrote = true;
             }
@@ -346,11 +471,12 @@ impl Channels {
                     written
                 }
                 None => {
-                    let channel = (slot - unreliable) as u8;
-                    let range = self.reliable[channel as usize].0.write(channel, w);
+                    let stream = slot - unreliable;
+                    let (_, channel) = stream_channel(self.ordered, stream);
+                    let range = self.streams[stream].0.write(channel, w, capacity);
                     if let Some(range) = &range {
                         frames.push(StreamRange {
-                            channel,
+                            stream: stream as u16,
                             start: range.start,
                             len: (range.end - range.start) as u32,
                         });
@@ -368,36 +494,34 @@ impl Channels {
     }
 
     pub fn on_acked(&mut self, frames: &StreamFrames) {
-        for &(channel, offset) in &frames.resets[..frames.resets_len] {
-            self.reliable[channel as usize].0.reset_acked(offset);
+        for &(stream, offset) in &frames.resets[..frames.resets_len] {
+            self.streams[stream as usize].0.reset_acked(offset);
         }
         for &(slot, id) in &frames.receipts[..frames.receipts_len] {
             self.unreliable[slot as usize].0.on_acked(id);
         }
-        for &(channel, limit) in &frames.credits[..frames.credits_len] {
-            self.reliable[channel as usize].1.credit_acked(limit);
+        for &(stream, limit) in &frames.credits[..frames.credits_len] {
+            self.streams[stream as usize].1.credit().acked(limit);
         }
         for range in frames.iter() {
-            self.reliable[range.channel as usize]
+            self.streams[range.stream as usize]
                 .0
                 .on_acked(range.range());
         }
     }
 
     pub fn on_lost(&mut self, frames: &StreamFrames) {
-        for &(channel, offset) in &frames.resets[..frames.resets_len] {
-            self.reliable[channel as usize].0.reset_lost(offset);
+        for &(stream, offset) in &frames.resets[..frames.resets_len] {
+            self.streams[stream as usize].0.reset_lost(offset);
         }
         for &(slot, id) in &frames.receipts[..frames.receipts_len] {
             self.unreliable[slot as usize].0.on_lost(id);
         }
-        for &(channel, _) in &frames.credits[..frames.credits_len] {
-            self.reliable[channel as usize].1.credit_lost();
+        for &(stream, _) in &frames.credits[..frames.credits_len] {
+            self.streams[stream as usize].1.credit().lost();
         }
         for range in frames.iter() {
-            self.reliable[range.channel as usize]
-                .0
-                .on_lost(range.range());
+            self.streams[range.stream as usize].0.on_lost(range.range());
         }
     }
 
@@ -464,15 +588,29 @@ impl Channels {
     }
 
     pub fn has_pending_delivery(&self) -> bool {
-        self.reliable
+        self.streams
             .iter()
             .any(|(_, recv)| recv.has_pending_delivery())
     }
 
-    pub fn on_credit(&mut self, channel: u8, limit: u64) -> Result<(), ProtocolViolation> {
-        let Some((send, _)) = self.reliable.get_mut(channel as usize) else {
-            return Err(ProtocolViolation::Malformed);
-        };
+    fn stream_mut(
+        &mut self,
+        unordered: bool,
+        channel: u8,
+    ) -> Result<&mut (SendStream, Recv), ProtocolViolation> {
+        let stream = self
+            .stream(unordered, channel)
+            .ok_or(ProtocolViolation::Malformed)?;
+        Ok(&mut self.streams[stream])
+    }
+
+    pub fn on_credit(
+        &mut self,
+        unordered: bool,
+        channel: u8,
+        limit: u64,
+    ) -> Result<(), ProtocolViolation> {
+        let (send, _) = self.stream_mut(unordered, channel)?;
         if limit > super::transport::packet::MAX_PACKET_NUMBER {
             return Err(ProtocolViolation::Malformed);
         }
@@ -480,10 +618,13 @@ impl Channels {
         Ok(())
     }
 
-    pub fn on_reset(&mut self, channel: u8, offset: u64) -> Result<(), ProtocolViolation> {
-        let Some((_, recv)) = self.reliable.get_mut(channel as usize) else {
-            return Err(ProtocolViolation::Malformed);
-        };
+    pub fn on_reset(
+        &mut self,
+        unordered: bool,
+        channel: u8,
+        offset: u64,
+    ) -> Result<(), ProtocolViolation> {
+        let (_, recv) = self.stream_mut(unordered, channel)?;
         if offset > super::transport::packet::MAX_PACKET_NUMBER - reliable::WINDOW {
             return Err(ProtocolViolation::Malformed);
         }
@@ -497,9 +638,22 @@ impl Channels {
         offset: u64,
         data: &[u8],
     ) -> Result<(), ProtocolViolation> {
-        match self.reliable.get_mut(channel as usize) {
-            Some((_, recv)) => recv.receive(offset, data),
-            None => Err(ProtocolViolation::Malformed),
+        match self.stream_mut(false, channel)? {
+            (_, Recv::Ordered(recv)) => recv.receive(offset, data),
+            (_, Recv::Unordered(_)) => Err(ProtocolViolation::Malformed),
+        }
+    }
+
+    pub fn on_unordered(
+        &mut self,
+        channel: u8,
+        start: u64,
+        fragment: Option<Fragment>,
+        data: &[u8],
+    ) -> Result<(), ProtocolViolation> {
+        match self.stream_mut(true, channel)? {
+            (_, Recv::Unordered(recv)) => recv.receive(start, fragment, data),
+            (_, Recv::Ordered(_)) => Err(ProtocolViolation::Malformed),
         }
     }
 
@@ -508,13 +662,17 @@ impl Channels {
         budget: &mut DeliveryBudget,
         out: &mut impl FnMut(Channel, Vec<u8>),
     ) -> Result<(), ProtocolViolation> {
-        let count = self.reliable.len();
+        let count = self.streams.len();
         for _ in 0..count {
-            let channel = self.drain_next;
-            self.drain_next = (channel + 1) % count;
-            self.reliable[channel]
+            let stream = self.drain_next;
+            self.drain_next = (stream + 1) % count;
+            let channel = match stream_channel(self.ordered, stream) {
+                (false, id) => Channel::Reliable(id),
+                (true, id) => Channel::ReliableUnordered(id),
+            };
+            self.streams[stream]
                 .1
-                .drain(budget, &mut |m| out(Channel::Reliable(channel as u8), m))?;
+                .drain(budget, &mut |m| out(channel, m))?;
             if budget.messages == 0 || budget.work == 0 {
                 break;
             }
@@ -529,7 +687,7 @@ impl Channels {
             .map(|(send, _)| send.queued_bytes())
             .sum::<usize>()
             + self
-                .reliable
+                .streams
                 .iter()
                 .map(|(send, _)| send.queued_bytes() as usize)
                 .sum::<usize>()

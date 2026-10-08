@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
         if frame == 60 {
-            client.reset_channel(1)?;
+            client.reset_channel(Channel::Reliable(1))?;
             client.send(Channel::Reliable(1), vec![8; 96 << 10])?;
         }
         client.flush()?;

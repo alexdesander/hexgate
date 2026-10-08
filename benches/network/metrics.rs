@@ -140,6 +140,7 @@ pub fn channel_name(channel: Channel) -> String {
         Channel::Unreliable => "unrel".into(),
         Channel::UnreliableOrdered(id) => format!("ord{id}"),
         Channel::Reliable(id) => format!("rel{id}"),
+        Channel::ReliableUnordered(id) => format!("unord{id}"),
     }
 }
 

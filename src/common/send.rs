@@ -72,7 +72,7 @@ pub enum SendOutcome {
 
 impl SendOptions {
     pub(crate) fn validate(self, channel: Channel) -> Result<(), SendError> {
-        if matches!(channel, Channel::Reliable(_)) && (self.deadline.is_some() || self.replace) {
+        if channel.is_reliable() && (self.deadline.is_some() || self.replace) {
             return Err(SendError::InvalidOptions);
         }
         Ok(())

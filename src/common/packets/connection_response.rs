@@ -29,7 +29,7 @@ pub const SIGNED_REQUEST: Range<usize> = 1..117;
 pub struct Transcript<'a> {
     pub request: &'a [u8],
     pub cipher: Cipher,
-    pub channel_counts: [u16; 2],
+    pub channel_counts: [u16; 3],
 }
 
 impl Transcript<'_> {
@@ -40,6 +40,7 @@ impl Transcript<'_> {
             .chain_update([self.cipher as u8])
             .chain_update(self.channel_counts[0].to_le_bytes())
             .chain_update(self.channel_counts[1].to_le_bytes())
+            .chain_update(self.channel_counts[2].to_le_bytes())
             .chain_update(response)
             .finalize()
             .into()

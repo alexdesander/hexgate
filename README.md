@@ -21,6 +21,7 @@ Documentation: [docs.rs/hexgate](https://docs.rs/hexgate)
     - Unreliable
     - UnreliableOrdered (sequenced, up to 256 channels)
     - Reliable (ordered, up to 256 channels)
+    - ReliableUnordered (each message delivered once complete, up to 256 channels)
 - Channel priorities with weighted byte fairness and periodic service for lower priorities
 - Bounded send admission, receiver flow control, reliable channel reset, per-channel queue statistics
 - Unreliable deadlines and replacement; optional transport acknowledgments through send receipts

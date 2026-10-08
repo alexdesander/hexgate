@@ -4,6 +4,8 @@
 
 //! A reliable channel is a byte stream of varint-length-prefixed messages, sent in RELIABLE
 //! frames addressed by stream offset (like QUIC STREAM frames) and acknowledged per packet.
+//! A reliable unordered channel lays its messages out in the same offset space, each taking
+//! `MESSAGE_COST` plus its length, and sends each in UNORDERED frames of its own.
 
 #[cfg(test)]
 use std::rc::Rc;
@@ -19,7 +21,7 @@ use crate::common::{
     error::ProtocolViolation,
     events::DeliveryBudget,
     send::{Message, SendOutcome},
-    transport::frame,
+    transport::frame::{self, Fragment},
 };
 
 /// Stream bytes beyond the receiver's delivered position that may be in flight, the same on
@@ -31,6 +33,9 @@ pub const WINDOW: u64 = 1 << 20;
 const MAX_SEGMENTS: usize = 4096;
 /// A reliable frame is only started with at least this many data bytes (or the rest).
 const MIN_FRAME_DATA: u64 = 32;
+/// Stream offsets an unordered message takes besides its bytes: its first frame covers them.
+/// Keeps empty messages apart and bounds the messages a receiver holds to `WINDOW / 64`.
+pub const MESSAGE_COST: u64 = 64;
 
 struct Queued {
     start: u64,
@@ -64,6 +69,7 @@ impl Queued {
 
 #[derive(Default)]
 pub struct SendStream {
+    unordered: bool,
     messages: VecDeque<Queued>,
     end: u64,
     /// Everything below was sent at least once.
@@ -81,6 +87,13 @@ pub struct SendStream {
 }
 
 impl SendStream {
+    pub fn new(unordered: bool) -> Self {
+        Self {
+            unordered,
+            ..Self::default()
+        }
+    }
+
     #[cfg(test)]
     pub fn push(&mut self, message: Rc<Vec<u8>>) {
         self.push_message(Message::untracked(message, Instant::now()));
@@ -88,7 +101,10 @@ impl SendStream {
 
     pub fn push_message(&mut self, message: Message) {
         let mut header = [0; 10];
-        let header_len = write_varint(&mut header, message.len() as u64) as u8;
+        let header_len = match self.unordered {
+            true => MESSAGE_COST as u8,
+            false => write_varint(&mut header, message.len() as u64) as u8,
+        };
         let next = self
             .end
             .checked_add(u64::from(header_len))
@@ -118,14 +134,44 @@ impl SendStream {
 
     /// Bytes not acknowledged yet, sent or not.
     pub fn queued_bytes(&self) -> u64 {
-        self.end - self.acked_until
+        self.bytes(self.acked_until..self.end)
     }
 
+    /// The bytes in a stream range, without the `MESSAGE_COST` of unordered messages starting
+    /// in it.
+    fn bytes(&self, range: Range<u64>) -> u64 {
+        let len = range.end - range.start;
+        if !self.unordered {
+            return len;
+        }
+        let starts = self
+            .messages
+            .partition_point(|queued| queued.start < range.end)
+            - self
+                .messages
+                .partition_point(|queued| queued.start < range.start);
+        len.saturating_sub(starts as u64 * MESSAGE_COST)
+    }
+
+    /// Unordered messages only need to start within the credit, so ones larger than `WINDOW`
+    /// can complete.
     fn new_data(&self) -> Range<u64> {
         if self.reset.is_some() {
             return self.sent..self.sent;
         }
-        self.sent..self.end.min(self.credit.max(WINDOW))
+        let mut limit = self.credit.max(WINDOW);
+        if self.unordered
+            && let Some(queued) = self
+                .messages
+                .get(
+                    self.messages
+                        .partition_point(|queued| queued.end() <= limit),
+                )
+                .filter(|queued| queued.start < limit)
+        {
+            limit = queued.end();
+        }
+        self.sent..self.end.min(limit)
     }
 
     pub fn reset(&mut self) {
@@ -177,12 +223,13 @@ impl SendStream {
     }
 
     pub fn unsent_bytes(&self) -> usize {
-        (self.end - self.sent) as usize
+        self.bytes(self.sent..self.end) as usize
     }
 
     pub fn unacked_bytes(&self) -> usize {
-        let acked: u64 = self.acked.iter().map(|range| range.end - range.start).sum();
-        (self.sent - self.acked_until).saturating_sub(acked) as usize
+        let acked: u64 = self.acked.iter().map(|range| self.bytes(range)).sum();
+        self.bytes(self.acked_until..self.sent)
+            .saturating_sub(acked) as usize
     }
 
     pub fn oldest(&self) -> Option<Instant> {
@@ -199,12 +246,16 @@ impl SendStream {
             + self.new_data().end.saturating_sub(self.sent)
     }
 
-    /// Writes one frame of lost or new data into `w`, returns its stream range.
-    pub fn write(&mut self, channel: u8, w: &mut Writer) -> Option<Range<u64>> {
+    /// Writes one frame of lost or new data into `w`, returns its stream range. `capacity` is
+    /// the room of an empty packet.
+    pub fn write(&mut self, channel: u8, w: &mut Writer, capacity: usize) -> Option<Range<u64>> {
         let lost = self.lost.first();
         let next = lost.clone().unwrap_or_else(|| self.new_data());
         if next.is_empty() {
             return None;
+        }
+        if self.unordered {
+            return self.write_unordered(channel, w, capacity, next, lost.is_some());
         }
         let available = next.end - next.start;
         let header = frame::reliable_header(next.start);
@@ -235,9 +286,60 @@ impl SendStream {
         Some(range)
     }
 
+    /// Writes the message at `next.start` or a fragment of it. Frame ranges start at a message
+    /// or after at least one of its bytes, and so does `next`. Messages that fit into an empty
+    /// packet of `capacity` are never fragmented.
+    fn write_unordered(
+        &mut self,
+        channel: u8,
+        w: &mut Writer,
+        capacity: usize,
+        next: Range<u64>,
+        lost: bool,
+    ) -> Option<Range<u64>> {
+        let queued = &self.messages[self
+            .messages
+            .partition_point(|queued| queued.end() <= next.start)];
+        let data_start = queued.start + MESSAGE_COST;
+        let from = next.start.saturating_sub(data_start);
+        let available = next.end.min(queued.end()).saturating_sub(data_start + from) as usize;
+        let total = queued.message.len();
+        let mut fragment = Some(Fragment {
+            offset: from,
+            total: total as u64,
+        });
+        if from == 0 && available == total {
+            let header = frame::unordered_header(queued.start, None);
+            if w.remaining() >= header && frame::fit(header, total, w.remaining()) == total {
+                fragment = None;
+            } else if frame::fit(header, total, capacity) == total {
+                return None;
+            }
+        }
+        let header = frame::unordered_header(queued.start, fragment);
+        let take = match fragment {
+            None => total,
+            Some(_) => frame::fit(header, available, w.remaining()),
+        };
+        if fragment.is_some() && (take == 0 || (take < available && take < MIN_FRAME_DATA as usize))
+        {
+            return None;
+        }
+        let from = from as usize;
+        let data = &queued.message[from..from + take];
+        frame::write_unordered(w, channel, queued.start, fragment, data);
+        let range = next.start..data_start + (from + take) as u64;
+        if lost {
+            self.lost.remove(range.clone());
+        } else {
+            self.sent = range.end;
+        }
+        Some(range)
+    }
+
     pub fn on_acked(&mut self, range: Range<u64>) {
         self.lost.remove(range.clone());
-        self.acked.insert(range);
+        self.acked.insert(range.clone());
         if let Some(first) = self
             .acked
             .first()
@@ -259,6 +361,32 @@ impl SendStream {
                         queued.message.reservation.clone(),
                     ));
                 }
+            }
+        }
+        if self.unordered {
+            self.unordered_receipts(range);
+        }
+    }
+
+    /// Reports unordered messages in `range` that are acknowledged before the ones ahead.
+    fn unordered_receipts(&mut self, range: Range<u64>) {
+        let first = self
+            .messages
+            .partition_point(|queued| queued.end() <= range.start);
+        for queued in self.messages.range_mut(first..) {
+            if queued.start >= range.end {
+                break;
+            }
+            if self
+                .acked
+                .contains(queued.start.max(self.acked_until)..queued.end())
+                && let Some(receipt) = queued.message.options.receipt.take()
+            {
+                self.results.push((
+                    receipt,
+                    SendOutcome::Acked,
+                    queued.message.reservation.clone(),
+                ));
             }
         }
     }
@@ -339,11 +467,60 @@ impl Assembler {
     }
 }
 
+/// Receive credit: the sender may use stream offsets below the limit, `delivered + WINDOW`.
+pub struct Credit {
+    /// The highest limit sent.
+    sent: u64,
+    acked: u64,
+    pending: bool,
+}
+
+impl Default for Credit {
+    fn default() -> Self {
+        Self {
+            sent: WINDOW,
+            acked: WINDOW,
+            pending: false,
+        }
+    }
+}
+
+impl Credit {
+    /// The highest limit sent: the peer must stay below it.
+    pub fn limit(&self) -> u64 {
+        self.sent
+    }
+
+    pub fn pending(&self, delivered: u64) -> Option<u64> {
+        (self.pending || delivered + WINDOW > self.sent).then_some(delivered + WINDOW)
+    }
+
+    pub fn sent(&mut self, limit: u64) {
+        self.sent = self.sent.max(limit);
+        self.pending = false;
+    }
+
+    pub fn acked(&mut self, limit: u64) {
+        self.acked = self.acked.max(limit);
+        if self.acked >= self.sent {
+            self.pending = false;
+        }
+    }
+
+    pub fn lost(&mut self) {
+        self.pending = self.acked < self.sent;
+    }
+
+    /// The peer skipped to `offset`.
+    pub fn reset(&mut self, offset: u64) {
+        self.sent = self.sent.max(offset.saturating_add(WINDOW));
+        self.pending = true;
+    }
+}
+
 pub struct RecvStream {
     delivered: u64,
-    credit_sent: u64,
-    credit_acked: u64,
-    credit_pending: bool,
+    pub credit: Credit,
     /// Data beyond `delivered`, merged where adjacent.
     pending: BTreeMap<u64, VecDeque<u8>>,
     assembler: Assembler,
@@ -359,8 +536,11 @@ impl RecvStream {
             .retain(|&start, data| start + data.len() as u64 > offset);
         self.assembler.prefix = (0, 0);
         self.assembler.body = None;
-        self.credit_sent = self.credit_sent.max(offset.saturating_add(WINDOW));
-        self.credit_pending = true;
+        self.credit.reset(offset);
+    }
+
+    pub fn credit_pending(&self) -> Option<u64> {
+        self.credit.pending(self.delivered)
     }
 
     pub fn has_pending_delivery(&self) -> bool {
@@ -377,9 +557,7 @@ impl RecvStream {
     pub fn new(max_recv_msg_size: usize) -> Self {
         Self {
             delivered: 0,
-            credit_sent: WINDOW,
-            credit_acked: WINDOW,
-            credit_pending: false,
+            credit: Credit::default(),
             pending: BTreeMap::new(),
             assembler: Assembler {
                 max_size: max_recv_msg_size,
@@ -389,31 +567,10 @@ impl RecvStream {
         }
     }
 
-    pub fn credit_pending(&self) -> Option<u64> {
-        (self.credit_pending || self.delivered + WINDOW > self.credit_sent)
-            .then_some(self.delivered + WINDOW)
-    }
-
-    pub fn credit_sent(&mut self, limit: u64) {
-        self.credit_sent = self.credit_sent.max(limit);
-        self.credit_pending = false;
-    }
-
-    pub fn credit_acked(&mut self, limit: u64) {
-        self.credit_acked = self.credit_acked.max(limit);
-        if self.credit_acked >= self.credit_sent {
-            self.credit_pending = false;
-        }
-    }
-
-    pub fn credit_lost(&mut self) {
-        self.credit_pending = self.credit_acked < self.credit_sent;
-    }
-
     pub fn receive(&mut self, offset: u64, data: &[u8]) -> Result<(), ProtocolViolation> {
         let end = offset
             .checked_add(data.len() as u64)
-            .filter(|&end| end <= self.credit_sent)
+            .filter(|&end| end <= self.credit.limit())
             .ok_or(ProtocolViolation::Malformed)?;
         if end <= self.delivered {
             return Ok(());
@@ -461,7 +618,7 @@ impl RecvStream {
     ) -> Result<(), ProtocolViolation> {
         self.receive(offset, data)?;
         self.drain(&mut DeliveryBudget::unlimited(), out)?;
-        self.credit_sent = self.delivered + WINDOW;
+        self.credit.sent(self.delivered + WINDOW);
         Ok(())
     }
 
@@ -560,7 +717,7 @@ mod tests {
             while send.sendable() > 0 {
                 let mut buf = vec![0u8; room];
                 let mut w = Writer::new(&mut buf);
-                let range = send.write(0, &mut w).unwrap();
+                let range = send.write(0, &mut w, 1200).unwrap();
                 let len = w.len();
                 buf.truncate(len);
                 sent += 1;
@@ -642,7 +799,7 @@ mod tests {
         while send.sendable() > 0 {
             let mut buf = [0; 1200];
             let mut w = Writer::new(&mut buf);
-            let range = send.write(0, &mut w).unwrap();
+            let range = send.write(0, &mut w, 1200).unwrap();
             let len = w.len();
             let Some(frame::Frame::Reliable { offset, data, .. }) =
                 frame::parse(&mut crate::common::codec::Reader::new(&buf[..len])).unwrap()
@@ -668,10 +825,10 @@ mod tests {
         })
         .unwrap();
         let limit = recv.credit_pending().unwrap();
-        recv.credit_sent(limit);
+        recv.credit.sent(limit);
         send.grant(limit);
         assert!(send.sendable() > 0);
-        recv.credit_lost();
+        recv.credit.lost();
         assert_eq!(recv.credit_pending(), Some(limit));
         recv.receive(WINDOW, &[1; 3]).unwrap();
     }
@@ -681,9 +838,9 @@ mod tests {
         let mut send = SendStream::default();
         send.push(Rc::new(vec![1; 100]));
         let mut buf = [0; 1200];
-        let original = send.write(0, &mut Writer::new(&mut buf)).unwrap();
+        let original = send.write(0, &mut Writer::new(&mut buf), 1200).unwrap();
         send.on_lost(original.clone());
-        let resent = send.write(0, &mut Writer::new(&mut buf)).unwrap();
+        let resent = send.write(0, &mut Writer::new(&mut buf), 1200).unwrap();
         send.on_acked(original);
         send.on_lost(resent);
         assert_eq!(send.queued_bytes(), 0);
@@ -697,7 +854,7 @@ mod tests {
         send.push(Rc::new(vec![1; 2000]));
         let mut old = [0; 1200];
         let mut w = Writer::new(&mut old);
-        let old_range = send.write(0, &mut w).unwrap();
+        let old_range = send.write(0, &mut w, 1200).unwrap();
         let old_len = w.len();
         let Some(frame::Frame::Reliable { offset, data, .. }) =
             frame::parse(&mut crate::common::codec::Reader::new(&old[..old_len])).unwrap()
@@ -721,7 +878,7 @@ mod tests {
         assert_eq!(send.sendable(), 2);
         let mut buf = [0; 1200];
         let mut w = Writer::new(&mut buf);
-        let range = send.write(0, &mut w).unwrap();
+        let range = send.write(0, &mut w, 1200).unwrap();
         let len = w.len();
         let Some(frame::Frame::Reliable { offset, data, .. }) =
             frame::parse(&mut crate::common::codec::Reader::new(&buf[..len])).unwrap()

@@ -82,15 +82,15 @@ pub enum ConnectError {
     /// `auth_data` exceeds 1177 bytes without `hash_auth_data`.
     #[error("Auth data too large: {0}")]
     AuthDataTooLarge(TooLarge),
-    /// Counts of unreliable ordered and reliable channels.
+    /// Counts of unreliable ordered, reliable and reliable unordered channels.
     #[error(
-        "Channel configuration differs from the server's (client: {client:?}, server: {server:?} unreliable ordered and reliable channels)"
+        "Channel configuration differs from the server's (client: {client:?}, server: {server:?} unreliable ordered, reliable and reliable unordered channels)"
     )]
     ChannelMismatch {
         /// This client's counts.
-        client: [u16; 2],
+        client: [u16; 3],
         /// The server's counts.
-        server: [u16; 2],
+        server: [u16; 3],
     },
     /// `disconnect()` was called, or the client dropped, during the handshake.
     #[error("The client was disconnected during the handshake")]
@@ -269,8 +269,8 @@ impl Client {
 
     /// Abandons queued transfers on this reliable channel and starts a new generation
     /// Data received before the reset reaches the peer may still be delivered
-    pub fn reset_channel(&self, channel: u8) -> Result<(), SendError> {
-        self.send_limits.check(Channel::Reliable(channel), 0)?;
+    pub fn reset_channel(&self, channel: Channel) -> Result<(), SendError> {
+        self.send_limits.check_reset(channel)?;
         self.command(Cmd::ResetChannel(channel))
     }
 

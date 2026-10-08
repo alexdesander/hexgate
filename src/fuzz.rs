@@ -102,6 +102,7 @@ pub fn channels(inputs: &[Vec<u8>]) {
             weight_unreliable: 1,
             weights_unreliable_ordered: vec![1, 2],
             weights_reliable: vec![1, 2],
+            weights_reliable_unordered: vec![1, 2],
             ..ChannelConfiguration::default()
         },
         congestion: CongestionConfig::default(),
@@ -135,10 +136,11 @@ pub fn channels(inputs: &[Vec<u8>]) {
                 }
             }
         } else {
-            let channel = match input.first().map_or(0, |byte| byte % 5) {
+            let channel = match input.first().map_or(0, |byte| byte % 7) {
                 0 => Channel::Unreliable,
                 id @ (1 | 2) => Channel::UnreliableOrdered(id - 1),
-                id => Channel::Reliable(id - 3),
+                id @ (3 | 4) => Channel::Reliable(id - 3),
+                id => Channel::ReliableUnordered(id - 5),
             };
             let message = if input.get(1) == Some(&255) {
                 let boundaries = [0, 1, 127, 128, 1180, 65_536, 80_000, MAX_MESSAGE_SIZE];
@@ -159,8 +161,8 @@ pub fn channels(inputs: &[Vec<u8>]) {
             if connection.stats().queued_bytes > 4 * MAX_MESSAGE_SIZE {
                 continue;
             }
-            if input.get(3) == Some(&254) {
-                connection.reset_channel(0);
+            if input.get(3) == Some(&254) && channel.is_reliable() {
+                connection.reset_channel(channel);
             }
             if input.get(3) == Some(&253) {
                 connection.flush();
@@ -209,7 +211,7 @@ pub fn progress(input: &[u8]) {
     for round in 0..20_000 {
         now += Duration::from_millis(1);
         if round == 16 && input.first().is_some_and(|byte| byte & 128 != 0) {
-            sender.reset_channel(0);
+            sender.reset_channel(Channel::Reliable(0));
         }
         if round == 32 {
             let sentinel = b"resumed".to_vec();
@@ -292,11 +294,17 @@ pub fn progress(input: &[u8]) {
                     offset,
                     data,
                 } => channels.on_reliable(channel, offset, data).unwrap(),
-                frame::Frame::Credit { channel, limit } => {
-                    channels.on_credit(channel, limit).unwrap()
-                }
-                frame::Frame::Reset { channel, offset } => {
-                    channels.on_reset(channel, offset).unwrap();
+                frame::Frame::Credit {
+                    unordered,
+                    channel,
+                    limit,
+                } => channels.on_credit(unordered, channel, limit).unwrap(),
+                frame::Frame::Reset {
+                    unordered,
+                    channel,
+                    offset,
+                } => {
+                    channels.on_reset(unordered, channel, offset).unwrap();
                     if let Some(expected) = &mut expected {
                         expected[channel as usize].retain(|&(end, _)| end > offset);
                     }

@@ -145,8 +145,8 @@ fn rejects_mismatched_channels() {
     assert!(matches!(
         result,
         Err(ConnectError::ChannelMismatch {
-            client: [5, 6],
-            server: [5, 5]
+            client: [5, 6, 5],
+            server: [5, 5, 5]
         })
     ));
 }

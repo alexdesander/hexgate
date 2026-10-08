@@ -248,7 +248,7 @@ impl Pairs {
         );
     }
 
-    pub fn reset_channel(&mut self, pair: usize, side: Side, channel: u8) {
+    pub fn reset_channel(&mut self, pair: usize, side: Side, channel: Channel) {
         self.end(pair, side).connection.reset_channel(channel);
     }
 
@@ -424,7 +424,7 @@ impl Link {
                     delivered += message.len();
                 }
             });
-            if !matches!(channel, Channel::Reliable(_)) && self.pairs.wire.is_empty() {
+            if !channel.is_reliable() && self.pairs.wire.is_empty() {
                 break;
             }
         }

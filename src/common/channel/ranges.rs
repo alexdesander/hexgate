@@ -64,6 +64,22 @@ impl RangeSet {
         }
     }
 
+    /// Whether all of `range` is in the set.
+    pub fn contains(&self, range: Range<u64>) -> bool {
+        self.ranges
+            .range(..=range.start)
+            .next_back()
+            .is_some_and(|(_, &end)| end >= range.end)
+    }
+
+    /// Whether any of `range` is in the set.
+    pub fn intersects(&self, range: Range<u64>) -> bool {
+        self.ranges
+            .range(..range.end)
+            .next_back()
+            .is_some_and(|(_, &end)| end > range.start)
+    }
+
     /// Removes everything below `value`.
     pub fn remove_below(&mut self, value: u64) {
         self.remove(0..value);

@@ -25,8 +25,9 @@ pub enum ServerHello {
         cipher: Cipher,
         server_ed25519_pubkey: VerifyingKey,
         siphash: Option<u64>,
-        /// Unreliable ordered and reliable channel counts, the client's must match.
-        channel_counts: [u16; 2],
+        /// Unreliable ordered, reliable and reliable unordered channel counts, the client's
+        /// must match.
+        channel_counts: [u16; 3],
     },
     VersionNotSupported {
         salt: [u8; 4],
@@ -75,7 +76,8 @@ impl ServerHello {
                 buf[53] = *cipher as u8;
                 buf[54..56].copy_from_slice(&channel_counts[0].to_le_bytes());
                 buf[56..58].copy_from_slice(&channel_counts[1].to_le_bytes());
-                58
+                buf[58..60].copy_from_slice(&channel_counts[2].to_le_bytes());
+                60
             }
             ServerHello::VersionNotSupported {
                 salt,
@@ -113,7 +115,7 @@ impl ServerHello {
             return Err(PacketError::Size);
         }
         if buf[0] == PacketIdentifier::ServerHelloVersionSupported as u8 {
-            if buf.len() != 58 {
+            if buf.len() != 60 {
                 return Err(PacketError::Size);
             }
             let salt = buf[1..5].try_into().unwrap();
@@ -136,6 +138,7 @@ impl ServerHello {
                 channel_counts: [
                     u16::from_le_bytes(buf[54..56].try_into().unwrap()),
                     u16::from_le_bytes(buf[56..58].try_into().unwrap()),
+                    u16::from_le_bytes(buf[58..60].try_into().unwrap()),
                 ],
             });
         }

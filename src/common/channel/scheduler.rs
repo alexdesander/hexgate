@@ -15,29 +15,34 @@ pub struct ChannelConfiguration {
     pub weights_unreliable_ordered: Vec<u16>,
     /// One weight per `Channel::Reliable` channel (at most 256).
     pub weights_reliable: Vec<u16>,
+    /// One weight per `Channel::ReliableUnordered` channel (at most 256).
+    pub weights_reliable_unordered: Vec<u16>,
     /// Unreliable messages that waited this long for the send rate are dropped instead of
     /// sent late (100 ms by default). A message that started to go out as fragments is finished
     pub unreliable_max_age: Duration,
 }
 
-/// One channel of each kind, with equal weights.
+/// One unreliable, unreliable ordered and reliable channel, with equal weights.
 impl Default for ChannelConfiguration {
     fn default() -> Self {
         Self {
             weight_unreliable: 1,
             weights_unreliable_ordered: vec![1],
             weights_reliable: vec![1],
+            weights_reliable_unordered: Vec::new(),
             unreliable_max_age: Duration::from_millis(100),
         }
     }
 }
 
 impl ChannelConfiguration {
-    /// Unreliable ordered and reliable channel counts (at most 256 each once validated).
-    pub(crate) fn counts(&self) -> [u16; 2] {
+    /// Unreliable ordered, reliable and reliable unordered channel counts (at most 256 each
+    /// once validated).
+    pub(crate) fn counts(&self) -> [u16; 3] {
         [
             self.weights_unreliable_ordered.len() as u16,
             self.weights_reliable.len() as u16,
+            self.weights_reliable_unordered.len() as u16,
         ]
     }
 
@@ -45,13 +50,15 @@ impl ChannelConfiguration {
         let channels = self
             .weights_unreliable_ordered
             .len()
-            .max(self.weights_reliable.len());
+            .max(self.weights_reliable.len())
+            .max(self.weights_reliable_unordered.len());
         if channels > 256 {
             return Err(ConfigError::TooManyChannels(channels));
         }
         let mut weights = std::iter::once(&self.weight_unreliable)
             .chain(&self.weights_unreliable_ordered)
-            .chain(&self.weights_reliable);
+            .chain(&self.weights_reliable)
+            .chain(&self.weights_reliable_unordered);
         if weights.any(|&weight| weight == 0) {
             return Err(ConfigError::ZeroChannelWeight);
         }
@@ -73,6 +80,7 @@ impl Scheduler {
         let weights: Vec<u16> = std::iter::once(config.weight_unreliable)
             .chain(config.weights_unreliable_ordered.iter().copied())
             .chain(config.weights_reliable.iter().copied())
+            .chain(config.weights_reliable_unordered.iter().copied())
             .collect();
         Self {
             tags: vec![None; weights.len()],
