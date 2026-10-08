@@ -141,7 +141,9 @@ fn spawn_simulator(
 ) -> Result<Sender<SimulatorThreadCmd>, io::Error> {
     let socket = socket.try_clone()?;
     let (sim_cmd_tx, sim_cmd_rx) = crossbeam::channel::unbounded();
-    std::thread::spawn(move || net_sym::simulator_thread(sim_cmd_rx, socket, simulator));
+    std::thread::Builder::new()
+        .name("hexgate-sim".into())
+        .spawn(move || net_sym::simulator_thread(sim_cmd_rx, socket, simulator))?;
     Ok(sim_cmd_tx)
 }
 

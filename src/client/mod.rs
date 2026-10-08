@@ -449,37 +449,39 @@ impl Client {
             let (cmd_tx, cmd_rx) = unbounded();
             let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
             let _waker = waker.clone();
-            let thread = std::thread::spawn(move || {
-                let mut state = ClientThreadState {
-                    cmds: cmd_rx,
-                    event_tx,
-                    poll,
-                    _waker,
-                    socket,
-                    buf: [0u8; 1201],
+            let thread = std::thread::Builder::new()
+                .name("hexgate-client".into())
+                .spawn(move || {
+                    let mut state = ClientThreadState {
+                        cmds: cmd_rx,
+                        event_tx,
+                        poll,
+                        _waker,
+                        socket,
+                        buf: [0u8; 1201],
 
-                    timed_events: TimedEventQueue::new(),
-                    crypto,
+                        timed_events: TimedEventQueue::new(),
+                        crypto,
 
-                    latency_discoveries: Default::default(),
-                    latencies: Default::default(),
-                    probe_loss: Default::default(),
+                        latency_discoveries: Default::default(),
+                        latencies: Default::default(),
+                        probe_loss: Default::default(),
 
-                    last_received: Instant::now(),
-                    timeout_dur,
+                        last_received: Instant::now(),
+                        timeout_dur,
 
-                    channels: Channels::new(&channel_config, max_recv_msg_size),
-                    channel_config,
-                    congestion: CongestionController::new(congestion_config),
-                    last_sent: Instant::now(),
+                        channels: Channels::new(&channel_config, max_recv_msg_size),
+                        channel_config,
+                        congestion: CongestionController::new(congestion_config),
+                        last_sent: Instant::now(),
 
-                    close_linger,
-                    closing: None,
-                };
-                if let Err(e) = state.run() {
-                    state.event_tx.fail(e);
-                }
-            });
+                        close_linger,
+                        closing: None,
+                    };
+                    if let Err(e) = state.run() {
+                        state.event_tx.fail(e);
+                    }
+                })?;
 
             return Ok(Client {
                 send_limits,

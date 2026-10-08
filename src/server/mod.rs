@@ -240,60 +240,64 @@ impl<R: AuthResult> Server<R> {
             cmds: auth_cmd_rx,
             waker: waker.clone(),
         };
-        let auth_thread = std::thread::spawn(move || auth::auth_thread(auth_state));
+        let auth_thread = std::thread::Builder::new()
+            .name("hexgate-auth".into())
+            .spawn(move || auth::auth_thread(auth_state))?;
 
         let signing_key = SigningKey::from_bytes(&secret_key);
         let _waker = waker.clone();
-        let thread = std::thread::spawn(move || {
-            let mut state = ServerThreadState {
-                event_tx,
-                cmds: cmd_rx,
-                socket,
-                poll,
-                _waker,
-                timed_events: TimedEventQueue::new(),
-                buf: [0; 1201],
+        let thread = std::thread::Builder::new()
+            .name("hexgate-server".into())
+            .spawn(move || {
+                let mut state = ServerThreadState {
+                    event_tx,
+                    cmds: cmd_rx,
+                    socket,
+                    poll,
+                    _waker,
+                    timed_events: TimedEventQueue::new(),
+                    buf: [0; 1201],
 
-                info,
-                allowed_client_versions,
-                cipher,
-                veryifying_key: signing_key.verifying_key(),
-                signing_key,
-                auth_salt,
+                    info,
+                    allowed_client_versions,
+                    cipher,
+                    veryifying_key: signing_key.verifying_key(),
+                    signing_key,
+                    auth_salt,
 
-                connection_request_max_timestamp_age,
-                disable_timestamp_age_check,
-                timeout_dur,
-                max_connections,
-                max_recv_msg_size,
-                is_checking_for_timeouts: false,
-                latency_discovery_interval,
+                    connection_request_max_timestamp_age,
+                    disable_timestamp_age_check,
+                    timeout_dur,
+                    max_connections,
+                    max_recv_msg_size,
+                    is_checking_for_timeouts: false,
+                    latency_discovery_interval,
 
-                siphasher: SipHasher::new_with_key(&rand::random()),
-                client_hellos: RateLimiter::new(CLIENT_HELLOS_PER_SECOND, CLIENT_HELLO_BURST),
-                connection_requests: RateLimiter::new(
-                    CONNECTION_REQUESTS_PER_SECOND,
-                    CONNECTION_REQUEST_BURST,
-                ),
-                expecting_login_requests: Default::default(),
-                auth_cmd_tx,
-                expecting_auth_result: Default::default(),
-                answered_logins: Default::default(),
-                connections: Default::default(),
+                    siphasher: SipHasher::new_with_key(&rand::random()),
+                    client_hellos: RateLimiter::new(CLIENT_HELLOS_PER_SECOND, CLIENT_HELLO_BURST),
+                    connection_requests: RateLimiter::new(
+                        CONNECTION_REQUESTS_PER_SECOND,
+                        CONNECTION_REQUEST_BURST,
+                    ),
+                    expecting_login_requests: Default::default(),
+                    auth_cmd_tx,
+                    expecting_auth_result: Default::default(),
+                    answered_logins: Default::default(),
+                    connections: Default::default(),
 
-                latency_discoveries_sent: Default::default(),
-                is_discovering_latencies: false,
+                    latency_discoveries_sent: Default::default(),
+                    is_discovering_latencies: false,
 
-                channel_config,
-                congestion_config,
+                    channel_config,
+                    congestion_config,
 
-                close_linger,
-                shutting_down: false,
-            };
-            if let Err(e) = state.run() {
-                state.event_tx.fail(e);
-            }
-        });
+                    close_linger,
+                    shutting_down: false,
+                };
+                if let Err(e) = state.run() {
+                    state.event_tx.fail(e);
+                }
+            })?;
 
         Ok(Server {
             send_limits,
