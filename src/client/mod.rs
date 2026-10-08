@@ -5,6 +5,7 @@
 use std::{
     io::{self, ErrorKind},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    panic::{self, AssertUnwindSafe},
     sync::{mpsc, Arc},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -478,7 +479,9 @@ impl Client {
                         close_linger,
                         closing: None,
                     };
-                    if let Err(e) = state.run() {
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| state.run()))
+                        .unwrap_or_else(|payload| Err(RecvError::panicked(payload)));
+                    if let Err(e) = result {
                         state.event_tx.fail(e);
                     }
                 })?;

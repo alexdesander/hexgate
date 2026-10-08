@@ -17,7 +17,7 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, Channels, Pop, IDS_EXHAUSTED},
     congestion::CongestionController,
     crypto::Crypto,
-    error::ProtocolViolation,
+    error::{ProtocolViolation, RecvError},
     events::EventSender,
     packets::{
         acks::Acks,
@@ -89,7 +89,7 @@ pub struct ClientThreadState {
 }
 
 impl ClientThreadState {
-    pub fn run(&mut self) -> Result<(), io::Error> {
+    pub fn run(&mut self) -> Result<(), RecvError> {
         self.timed_events.push(
             TimedEventKey::CheckForTimeout,
             Instant::now() + self.timeout_dur / TIMEOUT_CHECKS,

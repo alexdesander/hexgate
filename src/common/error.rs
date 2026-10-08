@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::io;
+use std::{any::Any, io};
 
 use super::channel::Channel;
 
@@ -14,6 +14,22 @@ pub enum RecvError {
     /// Returned once, later calls return `Stopped`.
     #[error("the network thread failed: {0}")]
     Io(#[from] io::Error),
+    /// The network thread or the authenticator panicked, with this message.
+    /// Returned once, later calls return `Stopped`.
+    #[error("hexgate panicked: {0}")]
+    Panicked(String),
+}
+
+impl RecvError {
+    pub(crate) fn panicked(payload: Box<dyn Any + Send>) -> Self {
+        let message = match payload.downcast::<String>() {
+            Ok(message) => *message,
+            Err(payload) => payload
+                .downcast_ref::<&str>()
+                .map_or_else(String::new, |message| message.to_string()),
+        };
+        Self::Panicked(message)
+    }
 }
 
 /// The peer broke the protocol and was disconnected.
@@ -45,6 +61,7 @@ pub enum SendError {
     MessageTooLarge(TooLarge),
     #[error("channel {0:?} is not configured")]
     UnknownChannel(Channel),
+    /// `next`/`try_next` report why.
     #[error("the network thread has stopped")]
     Stopped,
 }

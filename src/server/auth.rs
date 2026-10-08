@@ -2,13 +2,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    panic::{self, AssertUnwindSafe},
+    sync::Arc,
+};
 
 use crossbeam::channel::{Receiver, Sender};
 use mio::Waker;
 
 use super::thread::Cmd;
-use crate::common::packets::login_response::MAX_FAILURE_DATA_SIZE;
+use crate::common::{error::RecvError, packets::login_response::MAX_FAILURE_DATA_SIZE};
 
 pub trait AuthResult: Send + 'static {}
 impl<T> AuthResult for T where T: Send + 'static {}
@@ -47,7 +51,16 @@ impl<R: AuthResult, A: Authenticator<R>> Drop for AuthThreadState<A, R> {
     }
 }
 
+/// A panicking authenticator stops the server (see `Drop`) with `RecvError::Panicked`.
 pub(crate) fn auth_thread<R: AuthResult, A: Authenticator<R>>(mut state: AuthThreadState<A, R>) {
+    if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| serve(&mut state))) {
+        let _ = state
+            .main_cmds
+            .send(Cmd::Failed(RecvError::panicked(payload)));
+    }
+}
+
+fn serve<R: AuthResult, A: Authenticator<R>>(state: &mut AuthThreadState<A, R>) {
     while let Ok(cmd) = state.cmds.recv() {
         match cmd {
             AuthCmd::Authenticate(attempt, auth_data) => {

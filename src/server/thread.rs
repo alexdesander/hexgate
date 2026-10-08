@@ -23,7 +23,7 @@ use crate::common::{
     channel::{scheduler::ChannelConfiguration, Channel, Pop, IDS_EXHAUSTED},
     congestion::CongestionConfiguration,
     crypto::Crypto,
-    error::ProtocolViolation,
+    error::{ProtocolViolation, RecvError},
     events::EventSender,
     packets::{
         acks::Acks,
@@ -79,6 +79,8 @@ pub enum Cmd<R: AuthResult> {
     AuthFailed(LoginAttempt, Vec<u8>),
     Send(SocketAddr, Channel, Vec<u8>),
     Stats(SocketAddr, Sender<Option<Stats>>),
+    /// The authenticator panicked, the server shuts down and reports this.
+    Failed(RecvError),
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -141,10 +143,12 @@ pub struct ServerThreadState<R: AuthResult> {
 
     pub close_linger: Duration,
     pub shutting_down: bool,
+    /// Reported once the network thread stops.
+    pub failure: Option<RecvError>,
 }
 
 impl<R: AuthResult> ServerThreadState<R> {
-    pub fn run(&mut self) -> Result<(), io::Error> {
+    pub fn run(&mut self) -> Result<(), RecvError> {
         let mut events = Events::with_capacity(16);
         self.poll
             .registry()
@@ -176,7 +180,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                 }
             }
         }
-        Ok(())
+        self.failure.take().map_or(Ok(()), Err)
     }
 
     fn handle_all_cmds(&mut self) -> Result<bool, io::Error> {
@@ -197,6 +201,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                     }
                 }
                 Cmd::Disconnect(addr, reason) => self.start_close(addr, reason.into()),
+                Cmd::Failed(error) => self.failure = Some(error),
                 Cmd::SetInfo(info) => {
                     self.info = info;
                 }

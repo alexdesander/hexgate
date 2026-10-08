@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::io;
-
 use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 
 use super::error::RecvError;
@@ -16,7 +14,7 @@ pub(crate) fn channel<E>(max_events: usize) -> (EventSender<E>, EventReceiver<E>
 }
 
 pub(crate) struct EventSender<E> {
-    tx: Sender<Result<E, io::Error>>,
+    tx: Sender<Result<E, RecvError>>,
     max_events: usize,
 }
 
@@ -31,27 +29,24 @@ impl<E> EventSender<E> {
         self.tx.len() < self.max_events
     }
 
-    /// Reports the fatal error that stopped the network thread.
-    pub fn fail(&self, error: io::Error) {
+    /// Reports why the network thread stopped.
+    pub fn fail(&self, error: RecvError) {
         let _ = self.tx.send(Err(error));
     }
 }
 
 pub(crate) struct EventReceiver<E> {
-    rx: Receiver<Result<E, io::Error>>,
+    rx: Receiver<Result<E, RecvError>>,
 }
 
 impl<E> EventReceiver<E> {
     pub fn next(&self) -> Result<E, RecvError> {
-        self.rx
-            .recv()
-            .map_err(|_| RecvError::Stopped)?
-            .map_err(RecvError::Io)
+        self.rx.recv().map_err(|_| RecvError::Stopped)?
     }
 
     pub fn try_next(&self) -> Result<Option<E>, RecvError> {
         match self.rx.try_recv() {
-            Ok(event) => event.map(Some).map_err(RecvError::Io),
+            Ok(event) => event.map(Some),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(RecvError::Stopped),
         }

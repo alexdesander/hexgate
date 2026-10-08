@@ -2,7 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{io, net::SocketAddr, sync::Arc, thread::JoinHandle, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    panic::{self, AssertUnwindSafe},
+    sync::Arc,
+    thread::JoinHandle,
+    time::Duration,
+};
 
 use auth::{AuthResult, AuthThreadState, Authenticator};
 use bon::bon;
@@ -293,8 +300,11 @@ impl<R: AuthResult> Server<R> {
 
                     close_linger,
                     shutting_down: false,
+                    failure: None,
                 };
-                if let Err(e) = state.run() {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| state.run()))
+                    .unwrap_or_else(|payload| Err(RecvError::panicked(payload)));
+                if let Err(e) = result {
                     state.event_tx.fail(e);
                 }
             })?;
