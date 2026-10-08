@@ -62,6 +62,10 @@ impl Crypto {
         to_decrypt: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<(), ()> {
+        // Fuzzing must reach the code behind authentication, see `crate::fuzz`.
+        if cfg!(fuzzing) {
+            return Ok(());
+        }
         self.sym_in.decrypt(nonce, aad, to_decrypt, tag)
     }
 
@@ -70,6 +74,9 @@ impl Crypto {
     }
 
     pub fn hash_in(&self, data: &[u8]) -> u64 {
+        if cfg!(fuzzing) {
+            return 0;
+        }
         self.siphash_in.hash(data)
     }
 }

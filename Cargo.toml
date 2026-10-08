@@ -39,6 +39,9 @@ rand_xoshiro = "0.6.0"
 bitvec = "1.0.1"
 priority-queue = "2.1.1"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 [dev-dependencies]
 anyhow = "1.0.93"
 text_io = "0.1.12"

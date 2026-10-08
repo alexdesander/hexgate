@@ -1,0 +1,30 @@
+[package]
+name = "hexgate-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hexgate = { path = ".." }
+
+# Not part of the hexgate workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "packets"
+path = "fuzz_targets/packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channels"
+path = "fuzz_targets/channels.rs"
+test = false
+doc = false
+bench = false
