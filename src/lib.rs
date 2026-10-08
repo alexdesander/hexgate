@@ -2,6 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+/// A `tracing` event with the `tracing` feature, nothing otherwise.
+macro_rules! log {
+    ($level:ident, $($arg:tt)+) => {{
+        #[cfg(feature = "tracing")]
+        tracing::$level!($($arg)+);
+    }};
+}
+
 pub mod client;
 mod common;
 #[cfg(fuzzing)]

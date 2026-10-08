@@ -18,9 +18,17 @@ pub mod reliable_payload;
 pub mod server_hello;
 pub mod unreliable_payload;
 
+use std::fmt::Display;
+
 use integer_encoding::VarInt;
 
 const MAGIC: &str = "HEXGATE";
+
+/// Logs a datagram that was dropped because it isn't a valid `packet`.
+#[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
+pub(crate) fn rejected(packet: &str, from: impl Display, error: PacketError) {
+    log!(trace, %from, %error, "dropped {packet}");
+}
 
 /// Why a datagram was not accepted as a packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

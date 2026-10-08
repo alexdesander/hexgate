@@ -38,6 +38,11 @@ x25519-dalek = { version = "2.0.1", features = ["reusable_secrets"] }
 rand_xoshiro = "0.6.0"
 bitvec = "1.0.1"
 priority-queue = "2.1.1"
+tracing = { version = "0.1.44", optional = true }
+
+[features]
+# Debug and trace events for handshakes, connection changes and rejected packets.
+tracing = ["dep:tracing"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

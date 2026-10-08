@@ -25,6 +25,7 @@ use crate::common::{
         latency_discovery::LatencyDiscovery,
         latency_discovery_response::LatencyDiscoveryResponse,
         latency_discovery_response_2::LatencyDiscoveryResponse2,
+        rejected,
         reliable_payload::ReliablePayload,
         unreliable_payload::UnreliablePayload,
         PacketIdentifier,
@@ -207,6 +208,7 @@ impl ClientThreadState {
                         let disconnect = Disconnect { data: b"Timeout" };
                         let size = disconnect.serialize(&self.crypto, &mut self.buf);
                         self.socket.send(&self.buf[..size]);
+                        log!(debug, "timed out");
                         self.event_tx.send(Event::TimedOut);
                         return true;
                     } else {
@@ -225,9 +227,12 @@ impl ClientThreadState {
     fn handle_all_recvs(&mut self) -> Result<bool, io::Error> {
         while let Some((size, _)) = self.socket.recv_from(&mut self.buf)? {
             if size == 0 || size > 1200 {
+                log!(trace, size, "dropped datagram of invalid size");
                 continue;
             }
-            let Ok(packet_identifier) = PacketIdentifier::try_from(self.buf[0]) else {
+            let Ok(packet_identifier) = PacketIdentifier::try_from(self.buf[0])
+                .inspect_err(|e| rejected("datagram", "server", *e))
+            else {
                 continue;
             };
             let shutdown = match packet_identifier {
@@ -290,6 +295,7 @@ impl ClientThreadState {
                     self.socket.send(&self.buf[..size]);
                     self.event_tx
                         .send(Event::Disconnected(IDS_EXHAUSTED.to_vec()));
+                    log!(warn, "message ids exhausted");
                     return true;
                 }
             }
@@ -307,6 +313,7 @@ impl ClientThreadState {
         let Some(reason) = &self.closing else {
             return;
         };
+        log!(debug, "closed");
         let size = Disconnect { data: reason }.serialize(&self.crypto, &mut self.buf);
         for _ in 0..disconnect::REPEATS {
             self.socket.send(&self.buf[..size]);
@@ -320,16 +327,20 @@ impl ClientThreadState {
     }
 
     fn handle_packet_disconnect(&mut self, size: usize) -> bool {
-        let Ok(disconnect) = Disconnect::deserialize(&self.crypto, &mut self.buf[..size]) else {
+        let Ok(disconnect) = Disconnect::deserialize(&self.crypto, &mut self.buf[..size])
+            .inspect_err(|e| rejected("Disconnect", "server", *e))
+        else {
             return false;
         };
         self.event_tx
             .send(Event::Disconnected(disconnect.data.to_vec()));
+        log!(debug, "disconnected by server");
         true
     }
 
     fn handle_packet_latency_discovery(&mut self, size: usize) -> bool {
         let Ok(latency_discovery) = LatencyDiscovery::deserialize(&self.crypto, &self.buf[..size])
+            .inspect_err(|e| rejected("LatencyDiscovery", "server", *e))
         else {
             return false;
         };
@@ -360,6 +371,7 @@ impl ClientThreadState {
     fn handle_packet_latency_response_2(&mut self, size: usize) -> bool {
         let Ok(latency_discovery_response_2) =
             LatencyDiscoveryResponse2::deserialize(&self.crypto, &self.buf[..size])
+                .inspect_err(|e| rejected("LatencyDiscoveryResponse2", "server", *e))
         else {
             return false;
         };
@@ -395,6 +407,7 @@ impl ClientThreadState {
             return false;
         }
         let Ok(packet) = UnreliablePayload::deserialize(&self.crypto, &mut self.buf[0..size])
+            .inspect_err(|e| rejected("UnreliablePayload", "server", *e))
         else {
             return false;
         };
@@ -411,7 +424,9 @@ impl ClientThreadState {
         if self.closing.is_some() || !self.event_tx.has_room() {
             return false;
         }
-        let Ok(packet) = ReliablePayload::deserialize(&self.crypto, &mut self.buf[..size]) else {
+        let Ok(packet) = ReliablePayload::deserialize(&self.crypto, &mut self.buf[..size])
+            .inspect_err(|e| rejected("ReliablePayload", "server", *e))
+        else {
             return false;
         };
         self.last_received = Instant::now();
@@ -435,7 +450,9 @@ impl ClientThreadState {
     }
 
     fn handle_packet_acks(&mut self, size: usize) -> bool {
-        let Ok(acks) = Acks::deserialize(&self.crypto, &self.buf[..size]) else {
+        let Ok(acks) = Acks::deserialize(&self.crypto, &self.buf[..size])
+            .inspect_err(|e| rejected("Acks", "server", *e))
+        else {
             return false;
         };
         self.last_received = Instant::now();
@@ -456,6 +473,7 @@ impl ClientThreadState {
         };
         let size = disconnect.serialize(&self.crypto, &mut self.buf);
         self.socket.send(&self.buf[..size]);
+        log!(warn, %violation, "protocol violation");
         self.event_tx.send(Event::Violation(violation));
         true
     }

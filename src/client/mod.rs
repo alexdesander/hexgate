@@ -342,12 +342,14 @@ impl Client {
                     let (crypto, key) = match handshake.run(&mut link) {
                         Ok(connected) => connected,
                         Err(e) => {
+                            log!(debug, error = %e, "connect failed");
                             event_tx.send(Event::ConnectFailed(e));
                             return Ok(());
                         }
                     };
                     let pending = link.pending;
                     let _ = thread_server_key.set(key.to_bytes());
+                    log!(debug, "connected");
                     event_tx.send(Event::Connected);
                     let mut state = ClientThreadState {
                         cmds: cmd_rx,
@@ -379,6 +381,7 @@ impl Client {
                 }))
                 .unwrap_or_else(|payload| Err(RecvError::panicked(payload)));
                 if let Err(e) = result {
+                    log!(error, error = %e, "network thread stopped");
                     fail_tx.fail(e);
                 }
             })?;

@@ -393,6 +393,7 @@ impl<R: AuthResult> Server<R> {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clear();
                 if let Err(e) = result {
+                    log!(error, error = %e, "network thread stopped");
                     state.event_tx.fail(e);
                 }
             })?;

@@ -104,6 +104,7 @@ impl Handshake {
             let Some((timestamp, cipher, server_ed25519_pubkey, siphash, channel_counts)) =
                 server_hello
             else {
+                log!(debug, "no ServerHello, restarting the handshake");
                 continue;
             };
 
@@ -150,6 +151,7 @@ impl Handshake {
                 (response.salt == real_salt).then_some(Ok((crypto, response.auth_salt)))
             })?;
             let Some((crypto, auth_salt)) = connection_response else {
+                log!(debug, "no ConnectionResponse, restarting the handshake");
                 continue;
             };
 
@@ -193,6 +195,7 @@ impl Handshake {
             if login.is_some() {
                 return Ok((crypto, server_ed25519_pubkey));
             }
+            log!(debug, "no LoginResponse, restarting the handshake");
         }
         Err(ConnectError::IoError(io::Error::new(
             ErrorKind::TimedOut,
@@ -221,6 +224,7 @@ impl Link<'_> {
                 return Ok(None);
             }
             if now >= resend_at {
+                log!(trace, packet = packet[0], "sending handshake packet");
                 self.socket.send(packet);
                 resend_at = now + resend_interval;
                 resend_interval = (resend_interval * 2).min(MAX_HANDSHAKE_RESEND_INTERVAL);

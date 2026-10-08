@@ -38,6 +38,7 @@ use crate::common::{
         latency_discovery_response_2::LatencyDiscoveryResponse2,
         login_request::LoginRequest,
         login_response::LoginResponse,
+        rejected,
         reliable_payload::ReliablePayload,
         server_hello::{self, ServerHello},
         unreliable_payload::UnreliablePayload,
@@ -328,9 +329,12 @@ impl<R: AuthResult> ServerThreadState<R> {
     fn handle_all_recvs(&mut self) -> Result<(), io::Error> {
         while let Some((size, from)) = self.socket.recv_from(&mut self.buf)? {
             if size == 0 || size > 1200 {
+                log!(trace, %from, size, "dropped datagram of invalid size");
                 continue;
             }
-            let Ok(packet_identifier) = PacketIdentifier::try_from(self.buf[0]) else {
+            let Ok(packet_identifier) = PacketIdentifier::try_from(self.buf[0])
+                .inspect_err(|e| rejected("datagram", from, *e))
+            else {
                 continue;
             };
             match packet_identifier {
@@ -382,6 +386,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             let size = disconnect.serialize(&connection.crypto, &mut self.buf);
             self.socket.send_to(addr, &self.buf[..size]);
             self.set_connected(addr, false);
+            log!(debug, %addr, "timed out");
             self.event_tx.send(Event::TimedOut(addr));
         }
         if !self.connections.is_empty() {
@@ -465,6 +470,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                     self.socket.send_to(to, &self.buf[..size]);
                     self.connections.remove(&to);
                     self.set_connected(to, false);
+                    log!(warn, %to, "message ids exhausted");
                     self.event_tx
                         .send(Event::Disconnected(to, IDS_EXHAUSTED.to_vec()));
                     return;
@@ -517,6 +523,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         }
         connection.closing = Some(reason);
         self.set_connected(addr, false);
+        log!(debug, %addr, "closing");
         let now = Instant::now();
         self.timed_events.push(
             TimedEventKey::CloseDeadline(addr),
@@ -540,6 +547,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         let connection = self.connections.remove(&addr).unwrap();
         self.timed_events
             .remove(&TimedEventKey::CloseDeadline(addr));
+        log!(debug, %addr, "closed");
         let reason = connection.closing.as_deref().unwrap_or_default();
         let size = Disconnect { data: reason }.serialize(&connection.crypto, &mut self.buf);
         for _ in 0..disconnect::REPEATS {
@@ -565,6 +573,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         }
         // The server filled up while authenticating.
         if self.is_full_for(attempt.0) {
+            log!(debug, from = %attempt.0, "server full after login");
             let login_response = LoginResponse::Failure {
                 failure_data: b"Server full",
             };
@@ -589,6 +598,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         if self.connections.insert(from, connection).is_some() {
             self.event_tx.send(Event::Disconnected(from, Vec::new()));
         }
+        log!(debug, %from, "connected");
         self.event_tx.send(Event::Connected(from, auth_result));
 
         self.timed_events.push(
@@ -608,6 +618,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Some(crypto) = self.expecting_auth_result.remove(&attempt) else {
             return;
         };
+        log!(debug, from = %attempt.0, "login denied");
         let login_response = LoginResponse::Failure {
             failure_data: &failure_data,
         };
@@ -628,7 +639,9 @@ impl<R: AuthResult> ServerThreadState<R> {
     }
 
     fn handle_packet_info_request(&mut self, size: usize, from: SocketAddr) {
-        let Ok(_) = InfoRequest::deserialize(&self.buf[..size]) else {
+        let Ok(_) = InfoRequest::deserialize(&self.buf[..size])
+            .inspect_err(|e| rejected("InfoRequest", from, *e))
+        else {
             return;
         };
         let info_response = InfoResponse::new(&self.info);
@@ -639,19 +652,24 @@ impl<R: AuthResult> ServerThreadState<R> {
     fn handle_packet_client_hello(&mut self, size: usize, from: SocketAddr) {
         let client_hello = match ClientHello::deserialize(&self.buf[..size]) {
             Ok(client_hello) => Ok(client_hello),
-            Err(_) => match ClientHello::other_protocol_salt(&self.buf[..size]) {
+            Err(e) => match ClientHello::other_protocol_salt(&self.buf[..size]) {
                 Some(salt) => Err(salt),
-                None => return,
+                None => {
+                    rejected("ClientHello", from, e);
+                    return;
+                }
             },
         };
         let now = Instant::now();
         if !self.client_hellos.allow(from.ip(), now) {
+            log!(trace, %from, "rate-limited ClientHello");
             return;
         }
         self.schedule_rate_limit_prune(now);
         let client_hello = match client_hello {
             Ok(client_hello) => client_hello,
             Err(salt) => {
+                log!(debug, %from, "protocol version mismatch");
                 let mismatch = ServerHello::ProtocolMismatch {
                     salt,
                     server_version: PROTOCOL_VERSION,
@@ -662,9 +680,12 @@ impl<R: AuthResult> ServerThreadState<R> {
             }
         };
         let server_hello = match (self.allowed_client_versions)(client_hello.client_version) {
-            Ok(()) if self.is_full_for(from) => ServerHello::ServerFull {
-                salt: client_hello.salt,
-            },
+            Ok(()) if self.is_full_for(from) => {
+                log!(debug, %from, "server full");
+                ServerHello::ServerFull {
+                    salt: client_hello.salt,
+                }
+            }
             Ok(()) => {
                 let time_stamp = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -679,22 +700,28 @@ impl<R: AuthResult> ServerThreadState<R> {
                     channel_counts: self.channel_config.counts(),
                 }
             }
-            Err(allowed_versions) => ServerHello::VersionNotSupported {
-                salt: client_hello.salt,
-                allowed_versions,
-            },
+            Err(allowed_versions) => {
+                log!(debug, %from, version = %client_hello.client_version, "client version not allowed");
+                ServerHello::VersionNotSupported {
+                    salt: client_hello.salt,
+                    allowed_versions,
+                }
+            }
         };
         let size = server_hello.serialize(&self.siphasher, from, &mut self.buf);
         self.socket.send_to(from, &self.buf[..size]);
     }
 
     fn handle_packet_connection_request(&mut self, size: usize, from: SocketAddr) {
-        let Ok(connection_request) = ConnectionRequest::deserialize(&self.buf[..size]) else {
+        let Ok(connection_request) = ConnectionRequest::deserialize(&self.buf[..size])
+            .inspect_err(|e| rejected("ConnectionRequest", from, *e))
+        else {
             return;
         };
         if connection_request.siphash
             != server_hello::cookie(&self.siphasher, &self.buf[1..45], from).to_le_bytes()
         {
+            log!(debug, %from, "invalid handshake cookie");
             return;
         }
         if !self.disable_timestamp_age_check {
@@ -705,6 +732,7 @@ impl<R: AuthResult> ServerThreadState<R> {
                 .as_secs();
             let time_stamp = u64::from_le_bytes(connection_request.timestamp);
             if time_stamp < min_time_stamp {
+                log!(debug, %from, "expired handshake cookie");
                 return;
             }
         }
@@ -723,9 +751,11 @@ impl<R: AuthResult> ServerThreadState<R> {
         // Each new request costs a key exchange and a signature.
         let now = Instant::now();
         if !self.connection_requests.allow(from.ip(), now) {
+            log!(debug, %from, "rate-limited key exchange");
             return;
         }
         self.schedule_rate_limit_prune(now);
+        log!(debug, %from, "key exchange");
         let x25519_secret_key = EphemeralSecret::random_from_rng(thread_rng());
         let x25519_public_key = PublicKey::from(&x25519_secret_key);
         let shared_secret =
@@ -778,6 +808,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         let Ok(login_request) = LoginRequest::deserialize(&pending.crypto, &mut self.buf[..size])
+            .inspect_err(|e| rejected("LoginRequest", from, *e))
         else {
             return;
         };
@@ -788,6 +819,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             .unwrap()
             .crypto;
         if self.auth_cmd_tx.try_send(auth_cmd).is_err() {
+            log!(warn, %from, "authenticator busy, login refused");
             let login_response = LoginResponse::Failure {
                 failure_data: b"Server busy",
             };
@@ -795,6 +827,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             self.answer_login(attempt, size);
             return;
         }
+        log!(debug, %from, "authenticating");
         self.expecting_auth_result.insert(attempt, crypto);
     }
 
@@ -803,10 +836,12 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         let Ok(disconnect) = Disconnect::deserialize(&connection.crypto, &mut self.buf[..size])
+            .inspect_err(|e| rejected("Disconnect", from, *e))
         else {
             return;
         };
         let data = disconnect.data.to_vec();
+        log!(debug, %from, "disconnected by client");
         self.connections.remove(&from);
         self.set_connected(from, false);
         self.event_tx.send(Event::Disconnected(from, data));
@@ -818,6 +853,7 @@ impl<R: AuthResult> ServerThreadState<R> {
         };
         let Ok(latency_discovery_response) =
             LatencyDiscoveryResponse::deserialize(&connection.crypto, &self.buf[..size])
+                .inspect_err(|e| rejected("LatencyDiscoveryResponse", from, *e))
         else {
             return;
         };
@@ -861,6 +897,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         let Ok(packet) = UnreliablePayload::deserialize(&connection.crypto, &mut self.buf[0..size])
+            .inspect_err(|e| rejected("UnreliablePayload", from, *e))
         else {
             return;
         };
@@ -884,6 +921,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         let Ok(packet) = ReliablePayload::deserialize(&connection.crypto, &mut self.buf[..size])
+            .inspect_err(|e| rejected("ReliablePayload", from, *e))
         else {
             return;
         };
@@ -910,7 +948,9 @@ impl<R: AuthResult> ServerThreadState<R> {
         let Some(connection) = self.connections.get_mut(&from) else {
             return;
         };
-        let Ok(packet) = Acks::deserialize(&connection.crypto, &self.buf[..size]) else {
+        let Ok(packet) = Acks::deserialize(&connection.crypto, &self.buf[..size])
+            .inspect_err(|e| rejected("Acks", from, *e))
+        else {
             return;
         };
         connection.last_received = Instant::now();
@@ -930,6 +970,7 @@ impl<R: AuthResult> ServerThreadState<R> {
             return;
         };
         self.set_connected(addr, false);
+        log!(warn, %addr, %violation, "protocol violation");
         let reason = violation.to_string();
         let disconnect = Disconnect {
             data: reason.as_bytes(),

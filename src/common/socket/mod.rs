@@ -103,10 +103,13 @@ impl Socket {
             let _ = sim_cmd_tx.send(SimulatorThreadCmd::Send(to, data.to_vec()));
         } else {
             // BSD-derived stacks reject send_to on connected sockets (EISCONN).
-            let _ = match self.inner.connected_to {
+            let sent = match self.inner.connected_to {
                 Some(_) => self.inner.socket.send(data),
                 None => self.inner.socket.send_to(data, to),
             };
+            if let Err(_e) = sent {
+                log!(trace, %to, error = %_e, "send failed");
+            }
         }
     }
 
@@ -128,7 +131,10 @@ impl Socket {
                 {
                     return Ok(None)
                 }
-                Err(e) if is_transient(&e) => continue,
+                Err(e) if is_transient(&e) => {
+                    log!(trace, error = %e, "transient socket error");
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
