@@ -1,4 +1,6 @@
-# Hexgate
+<p align="center">
+  <img src="hexgate.svg" alt="Hexgate" width="480">
+</p>
 
 **Hexgate is an efficient and easy to use UDP client-server game networking crate supporting encryption, reliability, authentication, and network simulation.**
 
