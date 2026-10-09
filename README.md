@@ -144,6 +144,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 See `examples/game_loop.rs` for tick flushing, fresh snapshots and cancellable bulk transfers.
 Send receipts acknowledge transport packets; they do not guarantee application delivery or processing.
 
+## AI Usage
+
+Hexgate's foundation was written by hand: the architecture, the public API, the handshake and encryption scheme,
+server authentication, the packet formats, the channel types with their weighted fair scheduler, the network thread
+and the first network simulator. That version was released as 0.0.1.
+
+Starting with 0.0.2, Claude (Anthropic) was used to build on that foundation, with every API and protocol decision
+made by the author. It audited the code and fixed what it found, hardened the handshake against DoS, filled in
+missing features (non-blocking connect, reliable unordered channels, send receipts, broadcast, key file helpers),
+rewrote the network simulator and added fuzzing, benchmarks and documentation. Its largest contribution is the
+congestion controller: a Copa-derived, paced design tuned against simulated game traffic to keep latency low while
+still filling the link.
+
 ## Inspiration
 
 Hexgate draws inspiration from the following projects and resources:
